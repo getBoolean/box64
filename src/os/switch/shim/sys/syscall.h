@@ -1,6 +1,19 @@
 // KurokoNX shim — flat aarch64 __NR_*/SYS_* numbers (generated from the Arm toolchain).
 #pragma once
 #ifdef __SWITCH__
+// asm-generic 32/64 base numbers the __NR_* aliases below resolve through (the flat
+// generation dropped these). Values from the aarch64 asm-generic/unistd.h.
+#define __NR3264_fcntl 25
+#define __NR3264_statfs 43
+#define __NR3264_fstatfs 44
+#define __NR3264_truncate 45
+#define __NR3264_ftruncate 46
+#define __NR3264_lseek 62
+#define __NR3264_sendfile 71
+#define __NR3264_fstatat 79
+#define __NR3264_fstat 80
+#define __NR3264_mmap 222
+#define __NR3264_fadvise64 223
 #define SYS_accept __NR_accept
 #define SYS_accept4 __NR_accept4
 #define SYS_acct __NR_acct

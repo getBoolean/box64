@@ -44,6 +44,9 @@ int   madvise(void *addr, size_t length, int advice);
 int   msync(void *addr, size_t length, int flags);
 int   mlock(const void *addr, size_t len);
 int   munlock(const void *addr, size_t len);
+// POSIX shared memory (Horizon is single-process; stubbed in kuro_posix.c).
+int   shm_open(const char *name, int oflag, mode_t mode);
+int   shm_unlink(const char *name);
 
 #ifdef __cplusplus
 }

@@ -47,8 +47,10 @@ typedef struct emuthread_s emuthread_t;
 static vFppp_t real_pthread_cleanup_push_defer = NULL;
 static vFpi_t real_pthread_cleanup_pop_restore = NULL;
 static iFppip_t real_pthread_cond_clockwait = NULL;
+#ifndef __SWITCH__
 void _pthread_cleanup_push(void* buffer, void* routine, void* arg);	// declare hidden functions
 void _pthread_cleanup_pop(void* buffer, int exec);
+#endif
 // with glibc 2.34+, pthread_kill changed behaviour and might break some program, so using old version if possible
 // it will be pthread_kill@GLIBC_2.17 on aarch64, but it's GLIBC_2.2.5 on x86_64
 static iFli_t real_phtread_kill_old = NULL;
@@ -960,12 +962,12 @@ EXPORT int my_pthread_kill_old(x64emu_t* emu, void* thread, int sig)
 	sig = signal_from_x64(sig);
     // check for old "is everything ok?"
     if((thread==NULL) && (sig==0))
-        return real_phtread_kill_old(pthread_self(), 0);
+        return real_phtread_kill_old((unsigned long)(uintptr_t)pthread_self(), 0);
 	#ifdef BAD_PKILL
 	if(sig==0 && thread!=(void*)pthread_self())
 		return get_thread(thread)?0:ESRCH;
 	#endif
-    return real_phtread_kill_old((pthread_t)thread, sig);
+    return real_phtread_kill_old((unsigned long)(uintptr_t)thread, sig);
 }
 
 //EXPORT void my_pthread_exit(x64emu_t* emu, void* retval)

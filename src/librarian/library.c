@@ -291,6 +291,10 @@ static void initWrappedLib(library_t *lib, box64context_t* context) {
                 printf_dlsym_dump(LOG_DEBUG, "Failure to add lib %s linkmap\n", lib->name);
                 break;
             }
+            #ifdef __SWITCH__
+            // No host dynamic linker on Horizon (native libs never load under STATICBUILD).
+            lm->l_name = lib->path;
+            #else
             struct link_map *real_lm = NULL;
             #ifndef ANDROID
             if(dlinfo(lib->w.lib, RTLD_DI_LINKMAP, &real_lm)) {
@@ -304,6 +308,7 @@ static void initWrappedLib(library_t *lib, box64context_t* context) {
             } else {
                 lm->l_name = lib->path;
             }
+            #endif
             break;
         }
     }

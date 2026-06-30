@@ -79,7 +79,7 @@ void my_cpuid(x64emu_t* emu)
                         0 ; // family and all, simulating Haswell type of cpu
             }
             R_RBX = 0 | (8<<0x8) /*| ((BOX64ENV(cputype)?0:ncluster)<<16)*/;          // Brand index, CLFlush (8), Max APIC ID (16-23), Local APIC ID (24-31)
-            #ifndef WIN32
+            #if !defined(WIN32) && !defined(__SWITCH__)
             if(!BOX64ENV(cputype)) {
                 int cpu = sched_getcpu();
                 if(cpu<0) cpu=0;
@@ -237,7 +237,7 @@ void my_cpuid(x64emu_t* emu)
                 R_RAX = 0;
                 R_RBX = (subleaf==0)?1:((subleaf==1)?ncpu:0);
                 R_RCX |= (subleaf==0)?0x100:((subleaf==1)?0x200:0);
-                #ifdef WIN32
+                #if defined(WIN32) || defined(__SWITCH__)
                 int cpu = 0;
                 #else
                 int cpu = sched_getcpu();

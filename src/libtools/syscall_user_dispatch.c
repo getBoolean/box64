@@ -45,6 +45,12 @@ int my_sigactionhandler_oldcode_32(x64emu_t* emu, int32_t sig, int simple, sigin
 
 static void sud_emit_sigsys(x64emu_t* emu, uintptr_t call_addr, long syscall_nr, int is32bits)
 {
+#ifdef __SWITCH__
+    // Delivering SIGSYS needs the host signal machinery (newlib lacks the rich
+    // siginfo fields, and signals.c is stubbed on Horizon). SUD is effectively
+    // inert here — a static guest never enables it.
+    (void)emu; (void)call_addr; (void)syscall_nr; (void)is32bits;
+#else
     siginfo_t info = {0};
 
     info.si_signo = X64_SIGSYS;
@@ -63,6 +69,7 @@ static void sud_emit_sigsys(x64emu_t* emu, uintptr_t call_addr, long syscall_nr,
     (void)is32bits;
 #endif
     my_sigactionhandler_oldcode_64(emu, X64_SIGSYS, 0, &info, NULL, NULL, NULL);
+#endif // __SWITCH__
 }
 
 long my_syscall_user_dispatch_prctl(x64emu_t* emu, unsigned long op, unsigned long offset, unsigned long len, void* selector)

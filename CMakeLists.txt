@@ -409,6 +409,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch"
         "${BOX64_ROOT}/src/os/switch/shim"
     )
+    # newlib libc aliases (fseeko64, ...) needed in every TU; force-include.
+    add_compile_options("-include" "${BOX64_ROOT}/src/os/switch/shim/static_compat.h")
 endif()
 
 set(DYNACACHE_HASH_HEADER "${BOX64_ROOT}/src/dynacache_hashes.h")
@@ -455,6 +457,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     list(APPEND OS_LINUX_SRC
         "${BOX64_ROOT}/src/os/os_switch.c"
         "${BOX64_ROOT}/src/os/switch/kuro_posix.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_signals.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_obstack.c"
         "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
         "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
         "${BOX64_ROOT}/src/os/switch/random_switch.c"
@@ -521,6 +525,9 @@ set(ELFLOADER_SRC
 # stubbed in kuro_posix.c so core.c still links.
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/test.c")
+    # host-signal-backed signals.c can't compile against newlib (minimal siginfo_t /
+    # no sa_sigaction); replaced by src/os/switch/kuro_signals.c stubs.
+    list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/libtools/signals.c")
 endif()
 if(NOT STATICBUILD)
     list(APPEND ELFLOADER_SRC

@@ -64,8 +64,20 @@ const char* GetBridgeName(void* p);
 
 #ifndef _WIN32
 #include <setjmp.h>
+#ifdef __SWITCH__
+// newlib provides setjmp/longjmp + jmp_buf, but not glibc's sigsetjmp/struct
+// __jmp_buf_tag. Emulate glibc's tag struct over newlib's jmp_buf so box64's
+// (non-ANDROID) jmpbuf code compiles unchanged. Single-threaded interpreter
+// needs no signal-mask save/restore, so sig* collapse to plain setjmp/longjmp.
+typedef struct __kuro_jmp_buf_tag { jmp_buf __jb; } __kuro_jmp_buf_tag;
+#define LongJmp(env, val)        longjmp(((__kuro_jmp_buf_tag*)(env))->__jb, (val))
+#define SigSetJmp(env, savemask) setjmp(((__kuro_jmp_buf_tag*)(env))->__jb)
+#define sigsetjmp(env, savemask) setjmp(((__kuro_jmp_buf_tag*)(env))->__jb)
+#define siglongjmp(env, val)     longjmp(((__kuro_jmp_buf_tag*)(env))->__jb, (val))
+#else
 #define LongJmp longjmp
 #define SigSetJmp sigsetjmp
+#endif
 #else
 #define LongJmp(a, b)
 #define SigSetJmp(a, b) 0
@@ -75,9 +87,12 @@ const char* GetBridgeName(void* p);
 #include <setjmp.h>
 #define NEW_JUMPBUFF(name) \
     static __thread JUMPBUFF name
-#ifdef ANDROID
+#if defined(ANDROID)
 #define JUMPBUFF sigjmp_buf
 #define GET_JUMPBUFF(name) name
+#elif defined(__SWITCH__)
+#define JUMPBUFF __kuro_jmp_buf_tag
+#define GET_JUMPBUFF(name) &name
 #else
 #define JUMPBUFF struct __jmp_buf_tag
 #define GET_JUMPBUFF(name) &name

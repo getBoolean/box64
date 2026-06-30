@@ -1811,7 +1811,11 @@ void CreateMemorymapFile(box64context_t* context, int fd)
     // by anotating anonymous entry that belong to emulated elf
     // also anonymising current stack
     // and setting emulated stack as the current one
-
+#ifdef __SWITCH__
+    // Horizon has no /proc/self/maps; nothing to transform.
+    (void)context; (void)fd;
+    return;
+#else
     char* line = NULL;
     size_t len = 0;
     char buff[1024];
@@ -1845,6 +1849,7 @@ void CreateMemorymapFile(box64context_t* context, int fd)
     }
     fclose(f);
     (void)dummy;
+#endif // __SWITCH__
 }
 
 void ElfAttachLib(elfheader_t* head, library_t* lib)

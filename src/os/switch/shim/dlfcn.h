@@ -23,11 +23,15 @@ typedef struct {
 extern "C" {
 #endif
 
+#define RTLD_DI_LINKMAP 2
+
 void *dlopen(const char *filename, int flags);
 int   dlclose(void *handle);
 void *dlsym(void *handle, const char *symbol);
+void *dlvsym(void *handle, const char *symbol, const char *version);
 char *dlerror(void);
 int   dladdr(const void *addr, Dl_info *info);
+int   dlinfo(void *handle, int request, void *info);
 
 #ifdef __cplusplus
 }
