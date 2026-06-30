@@ -1,0 +1,43 @@
+// KurokoNX shim — <resolv.h> (DNS resolver; box64 only forwards these, stubbed for link).
+#pragma once
+#ifdef __SWITCH__
+// res_nsearch is declared via the generated glibc decls.
+int ns_datetosecs();
+int ns_format_ttl();
+int ns_initparse();
+int ns_makecanon();
+int ns_msg_getflag();
+int ns_name_compress();
+int ns_name_ntol();
+int ns_name_ntop();
+int ns_name_pack();
+int ns_name_pton();
+int ns_name_rollback();
+int ns_name_skip();
+int ns_name_uncompress();
+int ns_parse_ttl();
+int ns_parserr();
+int ns_samedomain();
+int ns_samename();
+int ns_skiprr();
+int ns_sprintrr();
+int ns_sprintrrf();
+int ns_subdomain();
+int res_dnok();
+int res_gethostbyaddr();
+int res_gethostbyname();
+int res_hnok();
+int res_mailok();
+int res_mkquery();
+int res_nmkquery();
+int res_nquery();
+int res_nquerydomain();
+int res_nsend();
+int res_ownok();
+int res_query();
+int res_querydomain();
+int res_search();
+int res_send();
+int res_send_setqhook();
+int res_send_setrhook();
+#endif // __SWITCH__

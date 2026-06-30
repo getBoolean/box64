@@ -4420,12 +4420,18 @@ struct glibc_pthread {
   pid_t tid;
 };
 pid_t getGlibcCachedTid() {
+#ifdef __SWITCH__
+  // glibc caches the TID in the mutex's __data.__owner internal field; newlib's
+  // pthread_mutex_t has no such layout. Just return the real TID.
+  return GetTID();
+#else
   pthread_mutex_t lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
   pthread_mutex_lock(&lock);
   pid_t tid = lock.__data.__owner;
   pthread_mutex_unlock(&lock);
   pthread_mutex_destroy(&lock);
   return tid;
+#endif
 }
 void updateGlibcTidCache() {
   pid_t real_tid = GetTID();

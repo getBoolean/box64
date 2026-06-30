@@ -251,7 +251,11 @@ extern ssize_t __send(int, void*, size_t, int);
 extern int __sendmmsg(int, void*, uint32_t, int);
 extern void* __setmntent(void*, void*);
 extern int __setpgid(void*, void*);
+#ifdef __SWITCH__
+int __sigaddset(void* a, int b) {sigaddset((sigset_t*)a, b); return 0;}  // newlib sigaddset returns void
+#else
 int __sigaddset(void* a, int b) {return sigaddset(a, b);}
+#endif
 extern int __signbit(double);
 extern int __signbitf(float);
 extern int __signbitl(long double);

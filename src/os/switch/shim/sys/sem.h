@@ -26,5 +26,15 @@ struct sembuf {
 #define GETZCNT  15
 #define SETVAL   16
 #define SETALL   17
+#define SEM_STAT 18
+#define SEM_INFO 19
+
+// NOTE: `union semun` is intentionally NOT defined here — per SUS it is the caller's
+// responsibility to define it, and box64 (wrappedlibc.c) does.
+
+int semget(key_t key, int nsems, int semflg);
+int semop(int semid, struct sembuf *sops, size_t nsops);
+int semctl(int semid, int semnum, int cmd, ...);
+int semtimedop(int semid, struct sembuf *sops, size_t nsops, const struct timespec *timeout);
 
 #endif // __SWITCH__

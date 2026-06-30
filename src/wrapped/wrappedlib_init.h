@@ -115,6 +115,23 @@ static const map_onesymbol2_t MAPNAME(symbol2map)[] = {
 #define DATAV(N, S) {#N, S, 1},
 #define DATAB(N, S) {#N, S, 0},
 #endif
+#ifdef __SWITCH__
+// newlib spells these libc data symbols as reentrancy-struct macros (stdin/stdout/stderr,
+// signgam, tzname, timezone, daylight) or lacks them; box64's DATA() table needs a constant
+// &N. Bind to the real globals KurokoNX provides (src/os/switch/kuro_stdio.c).
+#undef stdin
+#undef stdout
+#undef stderr
+#undef signgam
+#undef tzname
+#undef timezone
+#undef daylight
+extern FILE *stdin, *stdout, *stderr;
+extern int signgam, daylight, __daylight, _LIB_VERSION, _nl_msg_cat_cntr;
+extern void *__check_rhosts_file;
+extern long timezone, __timezone;
+extern char *tzname[2], *__tzname[2];
+#endif
 static const map_onedata_t MAPNAME(datamap)[] = {
     #include PRIVATE(LIBNAME)
 };

@@ -411,6 +411,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     )
     # newlib libc aliases (fseeko64, ...) needed in every TU; force-include.
     add_compile_options("-include" "${BOX64_ROOT}/src/os/switch/shim/static_compat.h")
+    # Horizon NROs are position-independent (switch.specs links -pie); build PIC objects.
+    add_compile_options(-fPIE)
 endif()
 
 set(DYNACACHE_HASH_HEADER "${BOX64_ROOT}/src/dynacache_hashes.h")
@@ -459,6 +461,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch/kuro_posix.c"
         "${BOX64_ROOT}/src/os/switch/kuro_signals.c"
         "${BOX64_ROOT}/src/os/switch/kuro_obstack.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_glibc_stubs.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_link_stubs.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_resolv_stubs.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_stdio.c"
         "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
         "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
         "${BOX64_ROOT}/src/os/switch/random_switch.c"
@@ -941,7 +947,7 @@ if(NOT CI)
         OUTPUT "${BOX64_ROOT}/src/wrapped/generated/functions_list.txt"
         COMMAND "${PYTHON_EXECUTABLE}" "${BOX64_ROOT}/rebuild_wrappers.py"
         "${BOX64_ROOT}"
-        "PANDORA" "HAVE_LD80BITS" "NOALIGN" "HAVE_TRACE" "ANDROID" "TERMUX" "STATICBUILD" "LA64" "PPC64LE" "--"
+        "PANDORA" "HAVE_LD80BITS" "NOALIGN" "HAVE_TRACE" "ANDROID" "TERMUX" "STATICBUILD" "LA64" "PPC64LE" "__SWITCH__" "--"
         ${WRAPPEDS_HEAD}
         MAIN_DEPENDENCY "${BOX64_ROOT}/rebuild_wrappers.py"
         DEPENDS ${WRAPPEDS} ${WRAPPEDS_HEAD}
@@ -1376,7 +1382,13 @@ if(BOX32)
 endif()
 #add_dependencies(${BOX64} PRINTER)
 #target_link_libraries(${BOX64} c m dl rt pthread resolv)
-if(STATICBUILD)
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # Horizon: link the homebrew runtime (libnx) via the switch specs (crt0 + linker
+    # script). newlib provides c/m/pthread; dl/resolv/util don't exist (their few symbols
+    # are stubbed in kuro_posix.c / kuro_glibc_stubs.c).
+    set_property(TARGET ${BOX64} APPEND_STRING PROPERTY LINK_FLAGS " -specs=$ENV{DEVKITPRO}/libnx/switch.specs -L$ENV{DEVKITPRO}/libnx/lib -Wl,-z,notext ")
+    target_link_libraries(${BOX64} m nx)
+elseif(STATICBUILD)
     #set_target_properties(${BOX64} PROPERTIES LINK_FLAGS "-fuse-ld=gold -static -Wl,--no-relax -Wl,--allow-multiple-definition -ldl -lrt -lpthread -lresolv -lc -lutil -lm -Wl,-defsym,_DYNAMIC=0 -pthread")
     target_link_libraries(${BOX64} c m dl pthread resolv util c)
 else()
@@ -1395,6 +1407,21 @@ if(DYNAREC)
     target_link_libraries(${BOX64} dynarec)
 endif()
 target_link_libraries(${BOX64} interpreter)
+
+# KurokoNX: package the linked ELF into a Horizon homebrew NRO (elf2nro + a NACP/ASET
+# section — Ryujinx silently rejects an NRO that has none).
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    find_program(NACPTOOL nacptool PATHS "$ENV{DEVKITPRO}/tools/bin")
+    find_program(ELF2NRO  elf2nro  PATHS "$ENV{DEVKITPRO}/tools/bin")
+    set(KURO_ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
+    add_custom_command(TARGET ${BOX64} POST_BUILD
+        COMMAND "${NACPTOOL}" --create "box64" "KurokoNX" "0.1.0" "${CMAKE_BINARY_DIR}/box64.nacp"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:${BOX64}>" "${CMAKE_BINARY_DIR}/box64.nro"
+                "--nacp=${CMAKE_BINARY_DIR}/box64.nacp" "--icon=${KURO_ICON}"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/box64.nro" "${CMAKE_BINARY_DIR}/box64.nacp"
+        COMMENT "Packaging box64.nro (Horizon homebrew)"
+        VERBATIM)
+endif()
 
 if(${CMAKE_VERSION} VERSION_LESS "3.13")
     if(NOT NOLOADADDR)

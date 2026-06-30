@@ -23,7 +23,15 @@ typedef struct {
 extern "C" {
 #endif
 
-#define RTLD_DI_LINKMAP 2
+#define RTLD_DI_LINKMAP   2
+#define RTLD_DL_SYMENT    1
+#define RTLD_DL_LINKMAP   2
+#define RTLD_DI_LMID      1
+#define RTLD_DI_SERINFO   4
+#define RTLD_DI_SERINFOSIZE 5
+#define RTLD_DI_ORIGIN    6
+#define RTLD_DI_TLS_MODID 9
+#define RTLD_DI_TLS_DATA  10
 
 void *dlopen(const char *filename, int flags);
 int   dlclose(void *handle);

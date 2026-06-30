@@ -77,4 +77,8 @@ void my_sigactionhandler(int32_t sig, siginfo_t* info, void* ucntx) { (void)sig;
 void init_signal_helper(box64context_t* context) { (void)context; }  // no host signal handlers installed
 void fini_signal_helper(void) {}
 
+// x86-64 and aarch64/newlib signal numbers mostly coincide for the common signals; identity
+// is sufficient for M1 (signals are not delivered to the emulator on Horizon anyway).
+int signal_from_x64(int sig) { return sig; }
+
 #endif // __SWITCH__

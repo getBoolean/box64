@@ -77,6 +77,12 @@ int unittest(int argc, const char **argv) { (void)argc; (void)argv; return 0; }
 #include <math.h>
 void sincos(double x, double *s, double *c)  { *s = sin(x);  *c = cos(x);  }
 void sincosf(float x, float *s, float *c)    { *s = sinf(x); *c = cosf(x); }
+double      exp10(double x)      { return pow(10.0, x); }
+float       exp10f(float x)      { return powf(10.0f, x); }
+long double exp10l(long double x){ return powl(10.0L, x); }
+double      pow10(double x)      { return pow(10.0, x); }
+float       pow10f(float x)      { return powf(10.0f, x); }
+long double pow10l(long double x){ return powl(10.0L, x); }
 
 // --- Linux syscall functions newlib lacks ----------------------------------------------------
 // Reached only via box64's guest x86-64 syscall table for fd-multiplexing / eventing syscalls,
@@ -89,8 +95,7 @@ void sincosf(float x, float *s, float *c)    { *s = sinf(x); *c = cosf(x); }
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
 
-int poll(struct pollfd *fds, nfds_t nfds, int timeout) { (void)fds;(void)nfds;(void)timeout; errno=ENOSYS; return -1; }
-int ioctl(int fd, unsigned long request, ...) { (void)fd;(void)request; errno=ENOSYS; return -1; }
+// poll() and ioctl() are provided by libnx (BSD sockets); we only declare them.
 int signalfd(int fd, const sigset_t *mask, int flags) { (void)fd;(void)mask;(void)flags; errno=ENOSYS; return -1; }
 int eventfd(unsigned int initval, int flags) { (void)initval;(void)flags; errno=ENOSYS; return -1; }
 int eventfd_read(int fd, eventfd_t *value) { (void)fd;(void)value; errno=ENOSYS; return -1; }
@@ -169,6 +174,65 @@ void error_at_line(int status, int errnum, const char *filename, unsigned int li
     if (status) exit(status);
 }
 
+// --- glibc large-file (*64) wrappers (declared in shim/largefile64.h) -------------------------
+#include <largefile64.h>
+#include <stdarg.h>
+#include <ctype.h>
+int stat64(const char *p, struct stat64 *b)  { return stat(p, (struct stat *)b); }
+int fstat64(int fd, struct stat64 *b)         { return fstat(fd, (struct stat *)b); }
+int lstat64(const char *p, struct stat64 *b)  { return lstat(p, (struct stat *)b); }
+int fstatat64(int d, const char *p, struct stat64 *b, int f) { return fstatat(d, p, (struct stat *)b, f); }
+int open64(const char *p, int fl, ...) { va_list a; va_start(a, fl); mode_t m = (mode_t)va_arg(a, int); va_end(a); return open(p, fl, m); }
+int openat64(int d, const char *p, int fl, ...) { va_list a; va_start(a, fl); mode_t m = (mode_t)va_arg(a, int); va_end(a); return openat(d, p, fl, m); }
+int creat64(const char *p, mode_t m) { return creat(p, m); }
+FILE *fopen64(const char *p, const char *m) { return fopen(p, m); }
+FILE *freopen64(const char *p, const char *m, FILE *s) { return freopen(p, m, s); }
+FILE *tmpfile64(void) { return tmpfile(); }
+int mknod(const char *p, mode_t m, dev_t d) { (void)p;(void)m;(void)d; errno = ENOSYS; return -1; }
+// Directory/glob/tree *64 variants — stubbed (a static guest never enumerates host dirs).
+struct dirent64 *readdir64(DIR *d) { (void)d; return NULL; }
+int scandir64(const char *d, struct dirent64 ***n, int (*f)(const struct dirent64 *), int (*c)(const struct dirent64 **, const struct dirent64 **)) { (void)d;(void)n;(void)f;(void)c; errno = ENOSYS; return -1; }
+int scandirat64(int fd, const char *d, struct dirent64 ***n, int (*f)(const struct dirent64 *), int (*c)(const struct dirent64 **, const struct dirent64 **)) { (void)fd;(void)d;(void)n;(void)f;(void)c; errno = ENOSYS; return -1; }
+int glob64(const char *pat, int fl, int (*ef)(const char *, int), glob64_t *pg) { return glob(pat, fl, ef, pg); }
+void globfree64(glob64_t *pg) { globfree(pg); }
+int ftw64(const char *d, int (*fn)(const char *, const struct stat64 *, int), int n) { (void)d;(void)fn;(void)n; errno = ENOSYS; return -1; }
+int nftw64(const char *d, int (*fn)(const char *, const struct stat64 *, int, struct FTW *), int n, int fl) { (void)d;(void)fn;(void)n;(void)fl; errno = ENOSYS; return -1; }
+
+// glibc ctype accessors over newlib's tables. Approximate: return pointers into a static
+// table built from newlib's ctype macros (offset by 128 for EOF, as glibc does).
+const unsigned short **__ctype_b_loc(void) {
+    static unsigned short tbl[384];
+    static const unsigned short *p;
+    if (!p) {
+        for (int i = -128; i < 256; i++) {
+            unsigned short f = 0; int c = i & 0xff;
+            if (i >= 0) {
+                if (isupper(c)) f |= 0x0100; if (islower(c)) f |= 0x0200;
+                if (isalpha(c)) f |= 0x0400; if (isdigit(c)) f |= 0x0800;
+                if (isxdigit(c)) f |= 0x1000; if (isspace(c)) f |= 0x2000;
+                if (isprint(c)) f |= 0x4000; if (isgraph(c)) f |= 0x8000;
+                if (isblank(c)) f |= 0x0001; if (iscntrl(c)) f |= 0x0002;
+                if (ispunct(c)) f |= 0x0004; if (isalnum(c)) f |= 0x0008;
+            }
+            tbl[i + 128] = f;
+        }
+        p = &tbl[128];
+    }
+    return &p;
+}
+const int **__ctype_toupper_loc(void) {
+    static int tbl[384];
+    static const int *p;
+    if (!p) { for (int i = -128; i < 256; i++) tbl[i + 128] = (i >= 0) ? toupper(i & 0xff) : (i & 0xff); p = &tbl[128]; }
+    return &p;
+}
+const int **__ctype_tolower_loc(void) {
+    static int tbl[384];
+    static const int *p;
+    if (!p) { for (int i = -128; i < 256; i++) tbl[i + 128] = (i >= 0) ? tolower(i & 0xff) : (i & 0xff); p = &tbl[128]; }
+    return &p;
+}
+
 // --- linear search (search.h omits these on newlib) -------------------------------------------
 void *lfind(const void *key, const void *base, size_t *nelp, size_t width, int (*cmp)(const void *, const void *)) {
     const char *p = (const char *)base;
@@ -192,6 +256,29 @@ FTSENT *fts_read(FTS *f) { (void)f; return NULL; }
 FTSENT *fts_children(FTS *f, int o) { (void)f;(void)o; return NULL; }
 int     fts_set(FTS *f, FTSENT *e, int o) { (void)f;(void)e;(void)o; return 0; }
 int     fts_close(FTS *f) { (void)f; return 0; }
+
+// --- rlimit / SysV sem / libc-version (wrappedlibc forwards to these) --------------------------
+#include <sys/sem.h>
+#include <gnu/libc-version.h>
+int getrlimit(int r, struct rlimit *l) { (void)r; if (l) { l->rlim_cur = RLIM_INFINITY; l->rlim_max = RLIM_INFINITY; } return 0; }
+int setrlimit(int r, const struct rlimit *l) { (void)r; (void)l; return 0; }
+int prlimit(pid_t p, int r, const struct rlimit *nl, struct rlimit *ol) { (void)p;(void)r;(void)nl; if (ol) { ol->rlim_cur = RLIM_INFINITY; ol->rlim_max = RLIM_INFINITY; } return 0; }
+int semget(key_t k, int n, int f) { (void)k;(void)n;(void)f; errno = ENOSYS; return -1; }
+int semop(int id, struct sembuf *s, size_t n) { (void)id;(void)s;(void)n; errno = ENOSYS; return -1; }
+int semctl(int id, int num, int cmd, ...) { (void)id;(void)num;(void)cmd; errno = ENOSYS; return -1; }
+int semtimedop(int id, struct sembuf *s, size_t n, const struct timespec *t) { (void)id;(void)s;(void)n;(void)t; errno = ENOSYS; return -1; }
+const char *gnu_get_libc_version(void) { return "2.39"; }      // box64 presents a glibc identity
+const char *gnu_get_libc_release(void) { return "stable"; }
+
+// pty (pty.h) — no PTYs on Horizon.
+int openpty(int *am, int *as, char *n, const struct termios *t, const struct winsize *w) { (void)am;(void)as;(void)n;(void)t;(void)w; errno = ENOSYS; return -1; }
+int forkpty(int *am, char *n, const struct termios *t, const struct winsize *w) { (void)am;(void)n;(void)t;(void)w; errno = ENOSYS; return -1; }
+
+// libutil login records (utmp.h) — no utmp database on Horizon.
+#include <sys/utmp.h>
+void login(const struct utmp *ut) { (void)ut; }
+int  logout(const char *line) { (void)line; return 0; }
+void logwtmp(const char *line, const char *name, const char *host) { (void)line; (void)name; (void)host; }
 
 long syscall(long number, ...) { (void)number; errno = ENOSYS; return -1; }
 int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
