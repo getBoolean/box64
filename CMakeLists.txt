@@ -402,6 +402,14 @@ if(BOX32)
         "${BOX64_ROOT}/src/wrapped32/generated"
     )
 endif()
+# KurokoNX: Horizon/Switch port — platform shim + missing-header stubs (newlib gaps).
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    add_definitions(-D__SWITCH__)
+    include_directories(
+        "${BOX64_ROOT}/src/os/switch"
+        "${BOX64_ROOT}/src/os/switch/shim"
+    )
+endif()
 
 set(DYNACACHE_HASH_HEADER "${BOX64_ROOT}/src/dynacache_hashes.h")
 add_custom_target(generate_dynacache_hashes
@@ -432,6 +440,28 @@ set(OS_LINUX_SRC
     "${BOX64_ROOT}/src/os/my_cpuid.c"
     "${BOX64_ROOT}/src/os/sysinfo.c"
 )
+# KurokoNX: on Horizon, swap the Linux OS files for Switch versions (+ reuse the platform-clean
+# wine variants freq_wine/symbolfuncs_wine). backtrace.c/perfmap.c stay (their #if guards now
+# exclude __SWITCH__ -> empty bodies). hostext_common.c/my_cpuid.c/sysinfo.c stay (common).
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    list(REMOVE_ITEM OS_LINUX_SRC
+        "${BOX64_ROOT}/src/os/os_linux.c"
+        "${BOX64_ROOT}/src/os/emit_signals_linux.c"
+        "${BOX64_ROOT}/src/os/hostext_linux.c"
+        "${BOX64_ROOT}/src/os/freq_linux.c"
+        "${BOX64_ROOT}/src/os/symbolfuncs_linux.c"
+        "${BOX64_ROOT}/src/os/random_linux.c"
+    )
+    list(APPEND OS_LINUX_SRC
+        "${BOX64_ROOT}/src/os/os_switch.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_posix.c"
+        "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
+        "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
+        "${BOX64_ROOT}/src/os/switch/random_switch.c"
+        "${BOX64_ROOT}/src/os/freq_wine.c"
+        "${BOX64_ROOT}/src/os/symbolfuncs_wine.c"
+    )
+endif()
 
 set(ELFLOADER_SRC
     "${BOX64_ROOT}/src/main.c"
@@ -487,6 +517,11 @@ set(ELFLOADER_SRC
     "${BOX64_ROOT}/src/tools/pe_tools.c"
     "${BOX64_ROOT}/src/wrapped/generated/wrapper.c"
 )
+# KurokoNX: exclude the self-test harness (uses getline; only reached via --test). unittest() is
+# stubbed in kuro_posix.c so core.c still links.
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/test.c")
+endif()
 if(NOT STATICBUILD)
     list(APPEND ELFLOADER_SRC
         "${BOX64_ROOT}/src/mallochook.c"

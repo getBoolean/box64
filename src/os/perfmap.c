@@ -11,7 +11,7 @@
 #include "box64context.h"
 #include "perfmap.h"
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 #include "elfloader.h"
 
 void writePerfMap(uintptr_t func_addr, uintptr_t code_addr, size_t code_size, const char* inst_name)

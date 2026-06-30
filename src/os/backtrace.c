@@ -1,6 +1,6 @@
 #include "backtrace.h"
 
-#if !defined(ANDROID) && !defined(_WIN32)
+#if !defined(ANDROID) && !defined(_WIN32) && !defined(__SWITCH__)
 
 #include <stdlib.h>
 #include <stdio.h>
