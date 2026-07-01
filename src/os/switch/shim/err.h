@@ -1,4 +1,4 @@
-// KurokoNX shim — <err.h> (BSD err/warn family; newlib lacks it). Implemented in kuro_posix.c.
+// box64-nx shim — <err.h> (BSD err/warn family; newlib lacks it). Implemented in nx_posix.c.
 #pragma once
 #ifdef __SWITCH__
 #include <stdarg.h>

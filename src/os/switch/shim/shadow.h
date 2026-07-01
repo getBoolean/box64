@@ -1,4 +1,4 @@
-// KurokoNX shim — <shadow.h> (glibc shadow passwords; stubbed for link).
+// box64-nx shim — <shadow.h> (glibc shadow passwords; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <stdio.h>

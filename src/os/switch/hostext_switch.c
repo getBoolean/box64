@@ -1,4 +1,4 @@
-// box64 Horizon port — host CPU feature detection (KurokoNX).
+// box64 Horizon port — host CPU feature detection (box64-nx).
 // Switch = Tegra X1, Cortex-A57, ARMv8.0-A: NEON + crypto (AES/SHA1/SHA2/PMULL) + CRC32.
 // No ARMv8.1+ extensions (atomics/flagm/rndr/...). Hardcoded (the interpreter doesn't depend on
 // this; the dynarec will, M1.2).

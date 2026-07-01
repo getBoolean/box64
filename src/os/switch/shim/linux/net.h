@@ -1,4 +1,4 @@
-// KurokoNX shim — <linux/net.h> (socketcall multiplexing subcall numbers).
+// box64-nx shim — <linux/net.h> (socketcall multiplexing subcall numbers).
 #pragma once
 #ifdef __SWITCH__
 #define SYS_SOCKET      1

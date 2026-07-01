@@ -1,4 +1,4 @@
-// KurokoNX shim — <fmtmsg.h> (glibc fmtmsg; stubbed for link).
+// box64-nx shim — <fmtmsg.h> (glibc fmtmsg; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #define MM_HARD     1

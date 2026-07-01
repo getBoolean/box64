@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/sysinfo.h> (Linux sysinfo; stubbed for link).
+// box64-nx shim — <sys/sysinfo.h> (Linux sysinfo; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 struct sysinfo {

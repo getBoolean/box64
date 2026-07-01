@@ -1,4 +1,4 @@
-// KurokoNX — GENERATED glibc symbol declarations (see docs/TODO.md to regen).
+// box64-nx — GENERATED glibc symbol declarations (see docs/TODO.md to regen).
 #pragma once
 #ifdef __SWITCH__
 // data globals are declared in wrappedlib_init.h __SWITCH__ block.

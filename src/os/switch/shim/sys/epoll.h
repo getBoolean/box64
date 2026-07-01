@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/epoll.h> (Horizon has no epoll; stubbed in kuro_posix.c).
+// box64-nx shim — <sys/epoll.h> (Horizon has no epoll; stubbed in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 #include <stdint.h>

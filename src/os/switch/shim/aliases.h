@@ -1,4 +1,4 @@
-// KurokoNX shim — <aliases.h> (glibc mail aliases; stubbed for link).
+// box64-nx shim — <aliases.h> (glibc mail aliases; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <stdio.h>

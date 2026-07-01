@@ -1,4 +1,4 @@
-// KurokoNX — GENERATED resolv stub definitions (-ENOSYS). See shim/resolv.h.
+// box64-nx — GENERATED resolv stub definitions (-ENOSYS). See shim/resolv.h.
 #ifdef __SWITCH__
 #include <errno.h>
 int ns_datetosecs() { errno = ENOSYS; return -1; }

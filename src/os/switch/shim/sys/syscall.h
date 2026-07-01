@@ -1,4 +1,4 @@
-// KurokoNX shim — flat aarch64 __NR_*/SYS_* numbers (generated from the Arm toolchain).
+// box64-nx shim — flat aarch64 __NR_*/SYS_* numbers (generated from the Arm toolchain).
 #pragma once
 #ifdef __SWITCH__
 // asm-generic 32/64 base numbers the __NR_* aliases below resolve through (the flat

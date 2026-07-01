@@ -1,5 +1,5 @@
-// KurokoNX shim — <dlfcn.h> for the box64 Horizon port (newlib has none; Horizon has no dlopen).
-// STATICBUILD avoids dlopen at runtime, so these are link-satisfying stubs (see kuro_posix.c).
+// box64-nx shim — <dlfcn.h> for the box64 Horizon port (newlib has none; Horizon has no dlopen).
+// STATICBUILD avoids dlopen at runtime, so these are link-satisfying stubs (see nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 

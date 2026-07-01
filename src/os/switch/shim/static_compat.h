@@ -1,4 +1,4 @@
-// KurokoNX shim — newlib libc compatibility for box64's glibc-isms.
+// box64-nx shim — newlib libc compatibility for box64's glibc-isms.
 // Force-included on the Switch target (see CMakeLists.txt NintendoSwitch branch)
 // so these aliases are visible in every translation unit.
 #pragma once
@@ -22,10 +22,10 @@
 #define ftello64 ftello
 #endif
 
-// Real Horizon system info probed via libnx (implemented in kuro_posix.c).
-void kuro_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long namelen);
+// Real Horizon system info probed via libnx (implemented in nx_posix.c).
+void nx_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long namelen);
 
-// GNU libm extensions newlib lacks; real symbols live in kuro_posix.c so the
+// GNU libm extensions newlib lacks; real symbols live in nx_posix.c so the
 // libm wrapper table (&sincos) also resolves at link time.
 void sincos(double x, double *s, double *c);
 void sincosf(float x, float *s, float *c);
@@ -139,7 +139,7 @@ void *mmap64(void *addr, unsigned long length, int prot, int flags, int fd, long
 #endif
 
 // Raw syscall passthrough and clone(); Horizon has no host syscalls, so these are
-// -ENOSYS stubs in kuro_posix.c. box64 only reaches them for un-special-cased guest
+// -ENOSYS stubs in nx_posix.c. box64 only reaches them for un-special-cased guest
 // syscalls / thread creation, which M1 static guests don't exercise.
 long syscall(long number, ...);
 int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...);
@@ -174,11 +174,11 @@ int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...);
 #include <wchar.h>       // mbstate_t/wchar_t used by some generated promo decls below
 
 // GENERATED declarations for the ~353 glibc symbols box64's wrapper tables reference
-// but newlib lacks (definitions stubbed in kuro_glibc_stubs.c).
-#include "kuro_glibc_decls.h"
+// but newlib lacks (definitions stubbed in nx_glibc_stubs.c).
+#include "nx_glibc_decls.h"
 
 // glibc qsort_r comparator type (newlib has __compar_fn_t; qsort_r itself is GNU-compatible
-// under _GNU_SOURCE) + linear-search funcs newlib's <search.h> omits (impl in kuro_posix.c).
+// under _GNU_SOURCE) + linear-search funcs newlib's <search.h> omits (impl in nx_posix.c).
 #ifndef __compar_d_fn_t_defined
 #define __compar_d_fn_t_defined
 typedef int (*__compar_d_fn_t)(const void *, const void *, void *);
@@ -186,14 +186,14 @@ typedef int (*__compar_d_fn_t)(const void *, const void *, void *);
 void *lsearch(const void *key, void *base, size_t *nelp, size_t width, int (*compar)(const void *, const void *));
 void *lfind(const void *key, const void *base, size_t *nelp, size_t width, int (*compar)(const void *, const void *));
 
-// glibc obstack <-> stdio extensions (implemented in kuro_obstack.c).
+// glibc obstack <-> stdio extensions (implemented in nx_obstack.c).
 #include <stdarg.h>
 struct obstack;
 int obstack_printf(struct obstack *obstack, const char *fmt, ...);
 int obstack_vprintf(struct obstack *obstack, const char *fmt, va_list ap);
 
 // Advanced GNU/POSIX pthread APIs that libnx's pthread doesn't implement. box64's
-// my_pthread_* wrappers call these; stubbed to -ENOSYS in kuro_posix.c (never reached
+// my_pthread_* wrappers call these; stubbed to -ENOSYS in nx_posix.c (never reached
 // by a single-threaded static guest). Declared after <pthread.h>/<sched.h> for the types.
 #include <pthread.h>
 #include <sched.h>

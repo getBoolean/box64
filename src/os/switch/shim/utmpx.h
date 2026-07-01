@@ -1,4 +1,4 @@
-// KurokoNX shim — <utmpx.h> (glibc login records; stubbed for link).
+// box64-nx shim — <utmpx.h> (glibc login records; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/time.h>

@@ -3311,7 +3311,7 @@ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ss
     void* old_addr = addr;
     #ifdef __SWITCH__
     // Horizon's heap sits above 4GB and can't be placed at box64's chosen 32-bit/47-bit addresses,
-    // so drop MAP_32BIT and let InternalMmap (kuro_mmap) pick the address. A static interpreter
+    // so drop MAP_32BIT and let InternalMmap (nx_mmap) pick the address. A static interpreter
     // guest never references the bridge via a 32-bit pointer. (Real placement waits for M1.3 virtmem.)
     new_flags &= ~MAP_32BIT;
     #elif !defined(NOALIGN)

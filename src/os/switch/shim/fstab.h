@@ -1,4 +1,4 @@
-// KurokoNX shim — <fstab.h> (glibc fstab; stubbed for link).
+// box64-nx shim — <fstab.h> (glibc fstab; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 struct fstab {

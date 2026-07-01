@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/random.h> (getrandom; backed by libnx randomGet in kuro_posix.c).
+// box64-nx shim — <sys/random.h> (getrandom; backed by libnx randomGet in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

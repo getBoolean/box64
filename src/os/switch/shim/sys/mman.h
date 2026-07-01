@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/mman.h> for the box64 Horizon port (newlib/devkitA64 has none).
+// box64-nx shim — <sys/mman.h> for the box64 Horizon port (newlib/devkitA64 has none).
 // Provides the PROT_*/MAP_* constants and mmap-family declarations box64 references. Linux
 // aarch64 values, so box64's flag handling stays consistent. Implementations live in kuro-posix.
 #pragma once
@@ -44,7 +44,7 @@ int   madvise(void *addr, size_t length, int advice);
 int   msync(void *addr, size_t length, int flags);
 int   mlock(const void *addr, size_t len);
 int   munlock(const void *addr, size_t len);
-// POSIX shared memory (Horizon is single-process; stubbed in kuro_posix.c).
+// POSIX shared memory (Horizon is single-process; stubbed in nx_posix.c).
 int   shm_open(const char *name, int oflag, mode_t mode);
 int   shm_unlink(const char *name);
 

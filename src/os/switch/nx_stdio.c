@@ -1,4 +1,4 @@
-// KurokoNX — addressable glibc-style data globals for the Switch build.
+// box64-nx — addressable glibc-style data globals for the Switch build.
 //
 // box64's wrapper DATA() table takes the address of libc data symbols (DATA(stdout) ->
 // &stdout), which must be a compile-time constant. glibc exposes these as real globals;
@@ -43,7 +43,7 @@ FILE  *_IO_2_1_stdin_ = 0;
 FILE  *_IO_2_1_stdout_ = 0;
 FILE  *_IO_2_1_stderr_ = 0;
 
-__attribute__((constructor)) static void kuro_bind_std_streams(void) {
+__attribute__((constructor)) static void nx_bind_std_streams(void) {
     stdin  = _REENT_STDIN(__getreent());
     stdout = _REENT_STDOUT(__getreent());
     stderr = _REENT_STDERR(__getreent());

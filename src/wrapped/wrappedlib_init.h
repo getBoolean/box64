@@ -118,7 +118,7 @@ static const map_onesymbol2_t MAPNAME(symbol2map)[] = {
 #ifdef __SWITCH__
 // newlib spells these libc data symbols as reentrancy-struct macros (stdin/stdout/stderr,
 // signgam, tzname, timezone, daylight) or lacks them; box64's DATA() table needs a constant
-// &N. Bind to the real globals KurokoNX provides (src/os/switch/kuro_stdio.c).
+// &N. Bind to the real globals box64-nx provides (src/os/switch/nx_stdio.c).
 #undef stdin
 #undef stdout
 #undef stderr

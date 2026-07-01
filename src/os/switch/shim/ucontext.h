@@ -1,4 +1,4 @@
-// KurokoNX shim — <ucontext.h> for the box64 Horizon port (newlib has none).
+// box64-nx shim — <ucontext.h> for the box64 Horizon port (newlib has none).
 // Provides the Linux aarch64 mcontext_t/ucontext_t layout so box64's signal code compiles.
 // Horizon delivers no POSIX signals, so this is layout-only; the handlers stay inert at runtime.
 #pragma once

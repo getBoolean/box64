@@ -1,4 +1,4 @@
-// KurokoNX shim — <syslog.h> (no syslog on Horizon; routed to stderr in kuro_posix.c).
+// box64-nx shim — <syslog.h> (no syslog on Horizon; routed to stderr in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 #include <stdarg.h>

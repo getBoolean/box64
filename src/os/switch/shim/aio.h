@@ -1,4 +1,4 @@
-// KurokoNX shim — <aio.h> (POSIX async I/O; no AIO on Horizon, stubbed for link).
+// box64-nx shim — <aio.h> (POSIX async I/O; no AIO on Horizon, stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

@@ -402,7 +402,7 @@ if(BOX32)
         "${BOX64_ROOT}/src/wrapped32/generated"
     )
 endif()
-# KurokoNX: Horizon/Switch port — platform shim + missing-header stubs (newlib gaps).
+# box64-nx: Horizon/Switch port — platform shim + missing-header stubs (newlib gaps).
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     add_definitions(-D__SWITCH__)
     include_directories(
@@ -413,6 +413,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     add_compile_options("-include" "${BOX64_ROOT}/src/os/switch/shim/static_compat.h")
     # Horizon NROs are position-independent (switch.specs links -pie); build PIC objects.
     add_compile_options(-fPIE)
+    # Baked-in default guest path for the NRO loader (nx_main.c). Empty -> the source default
+    # (sdmc:/box64/box64-guest); a downstream project sets this to its own SD layout without
+    # editing box64 source. Runtime argv[1] still overrides whatever is baked in.
+    set(NX_GUEST_PATH "" CACHE STRING "Default guest path baked into the box64-nx NRO loader")
+    if(NOT NX_GUEST_PATH STREQUAL "")
+        add_definitions("-DNX_GUEST_PATH=\"${NX_GUEST_PATH}\"")
+    endif()
 endif()
 
 set(DYNACACHE_HASH_HEADER "${BOX64_ROOT}/src/dynacache_hashes.h")
@@ -444,7 +451,7 @@ set(OS_LINUX_SRC
     "${BOX64_ROOT}/src/os/my_cpuid.c"
     "${BOX64_ROOT}/src/os/sysinfo.c"
 )
-# KurokoNX: on Horizon, swap the Linux OS files for Switch versions (+ reuse the platform-clean
+# box64-nx: on Horizon, swap the Linux OS files for Switch versions (+ reuse the platform-clean
 # wine variants freq_wine/symbolfuncs_wine). backtrace.c/perfmap.c stay (their #if guards now
 # exclude __SWITCH__ -> empty bodies). hostext_common.c/my_cpuid.c/sysinfo.c stay (common).
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
@@ -458,14 +465,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     )
     list(APPEND OS_LINUX_SRC
         "${BOX64_ROOT}/src/os/os_switch.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_posix.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_signals.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_main.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_obstack.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_glibc_stubs.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_link_stubs.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_resolv_stubs.c"
-        "${BOX64_ROOT}/src/os/switch/kuro_stdio.c"
+        "${BOX64_ROOT}/src/os/switch/nx_posix.c"
+        "${BOX64_ROOT}/src/os/switch/nx_signals.c"
+        "${BOX64_ROOT}/src/os/switch/nx_main.c"
+        "${BOX64_ROOT}/src/os/switch/nx_obstack.c"
+        "${BOX64_ROOT}/src/os/switch/nx_glibc_stubs.c"
+        "${BOX64_ROOT}/src/os/switch/nx_link_stubs.c"
+        "${BOX64_ROOT}/src/os/switch/nx_resolv_stubs.c"
+        "${BOX64_ROOT}/src/os/switch/nx_stdio.c"
         "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
         "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
         "${BOX64_ROOT}/src/os/switch/random_switch.c"
@@ -528,14 +535,14 @@ set(ELFLOADER_SRC
     "${BOX64_ROOT}/src/tools/pe_tools.c"
     "${BOX64_ROOT}/src/wrapped/generated/wrapper.c"
 )
-# KurokoNX: exclude the self-test harness (uses getline; only reached via --test). unittest() is
-# stubbed in kuro_posix.c so core.c still links.
+# box64-nx: exclude the self-test harness (uses getline; only reached via --test). unittest() is
+# stubbed in nx_posix.c so core.c still links.
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/test.c")
     # host-signal-backed signals.c can't compile against newlib (minimal siginfo_t /
-    # no sa_sigaction); replaced by src/os/switch/kuro_signals.c stubs.
+    # no sa_sigaction); replaced by src/os/switch/nx_signals.c stubs.
     list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/libtools/signals.c")
-    # box64's shell main() is replaced by the libnx NRO entry (src/os/switch/kuro_main.c).
+    # box64's shell main() is replaced by the libnx NRO entry (src/os/switch/nx_main.c).
     list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/main.c")
 endif()
 if(NOT STATICBUILD)
@@ -1388,7 +1395,7 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     # Horizon: link the homebrew runtime (libnx) via the switch specs (crt0 + linker
     # script). newlib provides c/m/pthread; dl/resolv/util don't exist (their few symbols
-    # are stubbed in kuro_posix.c / kuro_glibc_stubs.c).
+    # are stubbed in nx_posix.c / nx_glibc_stubs.c).
     set_property(TARGET ${BOX64} APPEND_STRING PROPERTY LINK_FLAGS " -specs=$ENV{DEVKITPRO}/libnx/switch.specs -L$ENV{DEVKITPRO}/libnx/lib -Wl,-z,notext ")
     target_link_libraries(${BOX64} m nx)
 elseif(STATICBUILD)
@@ -1411,16 +1418,16 @@ if(DYNAREC)
 endif()
 target_link_libraries(${BOX64} interpreter)
 
-# KurokoNX: package the linked ELF into a Horizon homebrew NRO (elf2nro + a NACP/ASET
+# box64-nx: package the linked ELF into a Horizon homebrew NRO (elf2nro + a NACP/ASET
 # section — Ryujinx silently rejects an NRO that has none).
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     find_program(NACPTOOL nacptool PATHS "$ENV{DEVKITPRO}/tools/bin")
     find_program(ELF2NRO  elf2nro  PATHS "$ENV{DEVKITPRO}/tools/bin")
-    set(KURO_ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
+    set(NX_ICON "$ENV{DEVKITPRO}/libnx/default_icon.jpg")
     add_custom_command(TARGET ${BOX64} POST_BUILD
-        COMMAND "${NACPTOOL}" --create "box64" "KurokoNX" "0.1.0" "${CMAKE_BINARY_DIR}/box64.nacp"
+        COMMAND "${NACPTOOL}" --create "box64" "box64-nx" "0.1.0" "${CMAKE_BINARY_DIR}/box64.nacp"
         COMMAND "${ELF2NRO}" "$<TARGET_FILE:${BOX64}>" "${CMAKE_BINARY_DIR}/box64.nro"
-                "--nacp=${CMAKE_BINARY_DIR}/box64.nacp" "--icon=${KURO_ICON}"
+                "--nacp=${CMAKE_BINARY_DIR}/box64.nacp" "--icon=${NX_ICON}"
         BYPRODUCTS "${CMAKE_BINARY_DIR}/box64.nro" "${CMAKE_BINARY_DIR}/box64.nacp"
         COMMENT "Packaging box64.nro (Horizon homebrew)"
         VERBATIM)

@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/ipc.h> (SysV IPC perms; Horizon has no SysV IPC, but box64
+// box64-nx shim — <sys/ipc.h> (SysV IPC perms; Horizon has no SysV IPC, but box64
 // references these structs when marshalling guest syscalls).
 #pragma once
 #ifdef __SWITCH__

@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/xattr.h> (Linux extended attributes; stubbed for link).
+// box64-nx shim — <sys/xattr.h> (Linux extended attributes; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

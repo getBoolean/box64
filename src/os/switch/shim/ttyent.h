@@ -1,4 +1,4 @@
-// KurokoNX shim — <ttyent.h> (BSD/glibc ttys db; stubbed for link).
+// box64-nx shim — <ttyent.h> (BSD/glibc ttys db; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #define _PATH_TTYS "/etc/ttys"

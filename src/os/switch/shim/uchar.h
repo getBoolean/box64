@@ -1,4 +1,4 @@
-// KurokoNX shim — <uchar.h> (C11 char16/char32; stubbed for link).
+// box64-nx shim — <uchar.h> (C11 char16/char32; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <stdint.h>

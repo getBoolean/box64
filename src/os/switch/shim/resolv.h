@@ -1,4 +1,4 @@
-// KurokoNX shim — <resolv.h> (DNS resolver; box64 only forwards these, stubbed for link).
+// box64-nx shim — <resolv.h> (DNS resolver; box64 only forwards these, stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 // res_nsearch is declared via the generated glibc decls.

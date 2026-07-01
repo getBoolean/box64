@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/reg.h> (glibc register defs; only __WORDSIZE is needed,
+// box64-nx shim — <sys/reg.h> (glibc register defs; only __WORDSIZE is needed,
 // as elfhacks.c falls back to it for __ELF_NATIVE_CLASS). 64-bit target.
 #pragma once
 #ifdef __SWITCH__

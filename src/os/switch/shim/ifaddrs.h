@@ -1,4 +1,4 @@
-// KurokoNX shim — <ifaddrs.h> (glibc interface enumeration; stubbed for link).
+// box64-nx shim — <ifaddrs.h> (glibc interface enumeration; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/socket.h>

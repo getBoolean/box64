@@ -1,5 +1,5 @@
-// KurokoNX shim — <execinfo.h> (GNU backtrace; no host unwinder on Horizon).
-// Stubbed in kuro_posix.c.
+// box64-nx shim — <execinfo.h> (GNU backtrace; no host unwinder on Horizon).
+// Stubbed in nx_posix.c.
 #pragma once
 #ifdef __SWITCH__
 int    backtrace(void **buffer, int size);

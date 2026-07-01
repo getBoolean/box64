@@ -1,4 +1,4 @@
-// KurokoNX shim — <pty.h> (no PTYs on Horizon; stubbed for link in kuro_posix.c).
+// box64-nx shim — <pty.h> (no PTYs on Horizon; stubbed for link in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

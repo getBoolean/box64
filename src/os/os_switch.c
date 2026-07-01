@@ -1,9 +1,9 @@
-// box64 — Horizon/Switch OS backend (KurokoNX port).
+// box64 — Horizon/Switch OS backend (box64-nx port).
 //
 // Implements the src/include/os.h interface for Nintendo Switch's Horizon OS (devkitA64 + libnx).
 // Based on os_linux.c: the box64-internal wrappers are kept verbatim; only the handful of
 // host-OS-touching functions are swapped to the libnx-backed "kuro-posix" shim (see
-// src/os/switch/kuro_posix.h). Built only for __SWITCH__ (CMake selects this instead of os_linux.c).
+// src/os/switch/nx_posix.h). Built only for __SWITCH__ (CMake selects this instead of os_linux.c).
 #ifdef __SWITCH__
 
 #include <unistd.h>
@@ -29,17 +29,17 @@
 #include "librarian.h"
 #include "emu/x64emu_private.h"
 
-#include "switch/kuro_posix.h"   // libnx-backed host primitives
+#include "switch/nx_posix.h"   // libnx-backed host primitives
 
 // --- host-OS functions: routed to kuro-posix -------------------------------------------------
-int GetTID(void) { return kuro_gettid(); }
-int SchedYield(void) { return kuro_sched_yield(); }
+int GetTID(void) { return nx_gettid(); }
+int SchedYield(void) { return nx_sched_yield(); }
 
 void* InternalMmap(void* addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
-    return kuro_mmap(addr, length, prot, flags, fd, offset);
+    return nx_mmap(addr, length, prot, flags, fd, offset);
 }
 int InternalMunmap(void* addr, unsigned long length) {
-    return kuro_munmap(addr, length);
+    return nx_munmap(addr, length);
 }
 
 // Horizon is 64-bit only and has no process "personality"/mallopt — no-op.

@@ -1,4 +1,4 @@
-// KurokoNX shim — <printf.h> (glibc custom printf hooks; stubbed for link).
+// box64-nx shim — <printf.h> (glibc custom printf hooks; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <stdio.h>

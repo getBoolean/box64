@@ -1,4 +1,4 @@
-// KurokoNX — Switch replacement for src/libtools/signals.c.
+// box64-nx — Switch replacement for src/libtools/signals.c.
 //
 // box64's signals.c drives x86 signal emulation off the *host* Linux signal
 // machinery: rich siginfo_t (si_addr/si_errno), struct sigaction with

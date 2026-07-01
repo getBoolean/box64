@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/timerfd.h> (Linux timerfd; stubbed for link).
+// box64-nx shim — <sys/timerfd.h> (Linux timerfd; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <time.h>

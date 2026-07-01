@@ -1,4 +1,4 @@
-// KurokoNX shim — <libintl.h> (gettext i18n; pass-through stubs for link).
+// box64-nx shim — <libintl.h> (gettext i18n; pass-through stubs for link).
 #pragma once
 #ifdef __SWITCH__
 char *gettext(const char *msgid);

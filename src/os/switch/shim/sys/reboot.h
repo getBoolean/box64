@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/reboot.h> (Linux reboot; stubbed for link).
+// box64-nx shim — <sys/reboot.h> (Linux reboot; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #define RB_AUTOBOOT     0x01234567

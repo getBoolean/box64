@@ -1,4 +1,4 @@
-// KurokoNX shim — <mntent.h> (glibc mount-entry; stubbed for link).
+// box64-nx shim — <mntent.h> (glibc mount-entry; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <stdio.h>

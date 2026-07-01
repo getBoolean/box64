@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/ptrace.h> (no ptrace on Horizon; stubbed in kuro_posix.c).
+// box64-nx shim — <sys/ptrace.h> (no ptrace on Horizon; stubbed in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 

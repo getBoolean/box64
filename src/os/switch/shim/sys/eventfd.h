@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/eventfd.h> (Horizon has no eventfd; stubbed in kuro_posix.c).
+// box64-nx shim — <sys/eventfd.h> (Horizon has no eventfd; stubbed in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 #include <stdint.h>

@@ -1,4 +1,4 @@
-// KurokoNX shim — <error.h> (GNU error()). Implemented in kuro_posix.c.
+// box64-nx shim — <error.h> (GNU error()). Implemented in nx_posix.c.
 #pragma once
 #ifdef __SWITCH__
 

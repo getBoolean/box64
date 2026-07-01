@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/sysmacros.h> (device-number macros).
+// box64-nx shim — <sys/sysmacros.h> (device-number macros).
 #pragma once
 #ifdef __SWITCH__
 #define major(dev)        ((unsigned int)(((dev) >> 8) & 0xff))

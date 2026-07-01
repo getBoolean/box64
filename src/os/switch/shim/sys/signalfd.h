@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/signalfd.h> (Horizon has no signalfd; stubbed in kuro_posix.c).
+// box64-nx shim — <sys/signalfd.h> (Horizon has no signalfd; stubbed in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 #include <stdint.h>

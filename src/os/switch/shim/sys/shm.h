@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/shm.h> (SysV shared memory; stubbed for link).
+// box64-nx shim — <sys/shm.h> (SysV shared memory; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/ipc.h>

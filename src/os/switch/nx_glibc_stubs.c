@@ -1,7 +1,7 @@
-// KurokoNX — GENERATED stub definitions (-ENOSYS). symbols newlib/libnx define are excluded.
+// box64-nx — GENERATED stub definitions (-ENOSYS). symbols newlib/libnx define are excluded.
 #ifdef __SWITCH__
 #include <errno.h>
-#include "kuro_glibc_decls.h"
+#include "nx_glibc_decls.h"
 int __argz_count() { errno = ENOSYS; return -1; }
 int __argz_next() { errno = ENOSYS; return -1; }
 int __argz_stringify() { errno = ENOSYS; return -1; }

@@ -1,3 +1,36 @@
+# box64-nx — box64 for Nintendo Switch (Horizon OS)
+
+> **This is a fork of [box64](https://github.com/ptitSeb/box64).** It adds a Nintendo Switch
+> (Horizon OS) backend so box64 builds and runs as homebrew. The upstream README follows below,
+> unchanged. Fork work lives on the `kurokonx-horizon` branch, driven by the
+> [KurokoNX](https://github.com/getBoolean) research project.
+
+Upstream box64 targets Linux on Arm/RISC-V/LoongArch. **box64-nx** ports it to
+**devkitA64 + newlib + libnx**, so the emulator itself runs as a Horizon homebrew **NRO** (tested on
+Ryujinx; real hardware pending).
+
+**What it adds over upstream:**
+
+- **Horizon/newlib/libnx OS backend** — a new `src/os/switch/` (with `os_switch.c`) implementing box64's
+  OS surface (`mmap`, sysinfo, signals, exit, POSIX shims) on Horizon instead of Linux syscalls.
+- **NRO entry** — `src/os/switch/nx_main.c` replaces box64's shell `main()`: a libnx `main()` that loads
+  a guest (path from `argv[1]` or the `NX_GUEST_PATH` compile default) and drives `initialize()` +
+  `emulate()`. Packaged to `box64.nro` (elf2nro + NACP) by the `NintendoSwitch` CMake branch.
+- **newlib gap layer** — `nx_posix`, a set of vendored/stub glibc headers under `src/os/switch/shim/`,
+  and an `-ENOSYS` link layer (`nx_glibc_stubs.c`/`nx_link_stubs.c`/`nx_resolv_stubs.c`) that satisfy
+  box64's STATICBUILD wrapped-libc layer on newlib (inert for a static guest).
+- **Interpreter-first bring-up** — builds with `ARM_DYNAREC=OFF -DSTATICBUILD=ON`; Horizon-aware
+  `mmap`/sysinfo/`exit_group` handling. The Arm64 **dynarec + W^X JIT** path is the next milestone.
+
+**Status:** the interpreter runs a static-PIE x86-64 Linux binary end-to-end on Ryujinx (`guest exited
+42`, clean exit). Still ahead: dynarec/W^X (JIT), dynamically-linked guests, and real-hardware validation.
+
+**Build/run:** use the devkitPro `Switch.cmake` toolchain (`CMAKE_SYSTEM_NAME=NintendoSwitch`) →
+`box64.nro`. Bake a default guest path with `-DNX_GUEST_PATH=sdmc:/your/guest`, or pass it at runtime as
+`argv[1]`. Everything below is the upstream box64 documentation.
+
+---
+
 ![Official logo](docs/img/Box64Logo.png "Official Logo")
 
 # Box64: Linux Userspace x86-64 Emulator with a Twist

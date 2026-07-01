@@ -1,7 +1,7 @@
-// KurokoNX shim — glibc large-file (*64) types/functions as REAL symbols.
+// box64-nx shim — glibc large-file (*64) types/functions as REAL symbols.
 // Macro-aliasing (#define stat64 stat) corrupts box64's wrapper tables (which have
 // both `stat` and `stat64` members), so these are real declarations; the bodies in
-// kuro_posix.c forward to the plain newlib calls (newlib's off_t is already 64-bit).
+// nx_posix.c forward to the plain newlib calls (newlib's off_t is already 64-bit).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>
@@ -64,7 +64,7 @@ void globfree64(glob64_t *pglob);
 int  ftw64(const char *dirpath, int (*fn)(const char *, const struct stat64 *, int), int nopenfd);
 int  nftw64(const char *dirpath, int (*fn)(const char *, const struct stat64 *, int, struct FTW *), int nopenfd, int flags);
 
-// glibc ctype table accessors (newlib uses __ctype_ptr__); impl in kuro_posix.c.
+// glibc ctype table accessors (newlib uses __ctype_ptr__); impl in nx_posix.c.
 const unsigned short **__ctype_b_loc(void);
 const int **__ctype_toupper_loc(void);
 const int **__ctype_tolower_loc(void);

@@ -1,4 +1,4 @@
-// box64 Horizon port — guest fault/interrupt emitters (KurokoNX).
+// box64 Horizon port — guest fault/interrupt emitters (box64-nx).
 // A clean static M1 guest doesn't fault, so these log loudly rather than deliver a host signal
 // (Horizon has no POSIX signal delivery). Real guest-signal emulation is M2+ work.
 #ifdef __SWITCH__

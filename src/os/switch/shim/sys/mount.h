@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/mount.h> (Linux mount; stubbed for link).
+// box64-nx shim — <sys/mount.h> (Linux mount; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #define MS_RDONLY      1

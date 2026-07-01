@@ -1,16 +1,16 @@
-// KurokoNX — "kuro-posix" implementation (libnx). See kuro_posix.h.
+// box64-nx — "kuro-posix" implementation (libnx). See nx_posix.h.
 #ifdef __SWITCH__
 
-#include "kuro_posix.h"
+#include "nx_posix.h"
 
 #include <switch.h>
 #include <stdlib.h>
 #include <malloc.h>     // memalign
 #include <string.h>
 #include <errno.h>
-#include <sys/mman.h>   // PROT_*/MAP_* (KurokoNX shim)
+#include <sys/mman.h>   // PROT_*/MAP_* (box64-nx shim)
 
-#define KURO_PAGE 0x1000UL
+#define NX_PAGE 0x1000UL
 
 // M1.1: back mappings with the newlib heap (page-aligned). box64's ELF loader first reserves a
 // whole-image block with a plain (non-FIXED) anonymous mmap, then places each PT_LOAD segment at a
@@ -19,13 +19,13 @@
 // then fread()s the file contents over the file-backed part. A *file*-backed MAP_FIXED can't be
 // satisfied by a heap allocator, so we fail it, which makes box64 fall back to its anon-map+fread
 // path. Real virtmem-backed placement + a W^X dynarec arena arrive in M1.2/M1.3.
-void *kuro_mmap(void *addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
+void *nx_mmap(void *addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
     (void)prot; (void)fd; (void)offset;
-#ifdef KURO_MMAP_TRACE
-    { char b[128]; int n = snprintf(b, sizeof b, "kuro_mmap(addr=%p len=0x%lx fl=0x%x fd=%d)\n", addr, length, (unsigned)flags, fd); svcOutputDebugString(b, n); }
+#ifdef NX_MMAP_TRACE
+    { char b[128]; int n = snprintf(b, sizeof b, "nx_mmap(addr=%p len=0x%lx fl=0x%x fd=%d)\n", addr, length, (unsigned)flags, fd); svcOutputDebugString(b, n); }
 #endif
     if (!length) return MAP_FAILED;
-    size_t rounded = (length + KURO_PAGE - 1) & ~(KURO_PAGE - 1);
+    size_t rounded = (length + NX_PAGE - 1) & ~(NX_PAGE - 1);
 
     if (flags & MAP_FIXED) {
         if (!(flags & MAP_ANONYMOUS) || !addr) {
@@ -37,13 +37,13 @@ void *kuro_mmap(void *addr, unsigned long length, int prot, int flags, int fd, s
         return addr;
     }
 
-    void *p = memalign(KURO_PAGE, rounded);
+    void *p = memalign(NX_PAGE, rounded);
     if (!p) { errno = ENOMEM; return MAP_FAILED; }
     if (flags & MAP_ANONYMOUS) memset(p, 0, rounded);
     return p;
 }
 
-int kuro_munmap(void *addr, unsigned long length) {
+int nx_munmap(void *addr, unsigned long length) {
     (void)addr; (void)length;
     // NOTE: addr may be a MAP_FIXED sub-range *inside* a larger reserved block (not its own
     // allocation), so free()ing it here would corrupt the heap. Leak for now — a static M1 guest
@@ -51,12 +51,12 @@ int kuro_munmap(void *addr, unsigned long length) {
     return 0;
 }
 
-int kuro_gettid(void) {
+int nx_gettid(void) {
     // Single-threaded for now (M1 static guests). Real per-thread ids arrive with thread support.
     return 1;
 }
 
-int kuro_sched_yield(void) {
+int nx_sched_yield(void) {
     svcSleepThread(0);
     return 0;
 }
@@ -64,7 +64,7 @@ int kuro_sched_yield(void) {
 // Probe real Horizon system info via libnx (used by src/os/sysinfo.c, which has no libnx).
 // Core count from the process core mask (svcGetInfo), CPU clock from the clkrst service (may
 // be stubbed under emulation -> fallback), and the hardware model from set:sys.
-void kuro_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long namelen) {
+void nx_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long namelen) {
     u64 mask = 0;
     if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && mask)
         *ncpu = (uint64_t)__builtin_popcountll(mask);
@@ -98,11 +98,11 @@ void kuro_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long n
 #include <dlfcn.h>
 
 // NOTE: mmap/mmap64/munmap are provided by box64's src/custommmap.c, which delegates to
-// InternalMmap (os_switch.c -> kuro_mmap). We only supply the rest of the mman surface here.
+// InternalMmap (os_switch.c -> nx_mmap). We only supply the rest of the mman surface here.
 // No real page-permission changes for the interpreter (heap-backed mmap); revisited in M1.2.
 int mprotect(void *addr, size_t len, int prot) { (void)addr; (void)len; (void)prot; return 0; }
 void *mremap(void *old_addr, size_t old_size, size_t new_size, int flags, ...) {
-    (void)old_size; (void)flags; return kuro_mmap(old_addr, new_size, 0, MAP_ANONYMOUS, -1, 0);
+    (void)old_size; (void)flags; return nx_mmap(old_addr, new_size, 0, MAP_ANONYMOUS, -1, 0);
 }
 int madvise(void *a, size_t l, int adv) { (void)a; (void)l; (void)adv; return 0; }
 int msync(void *a, size_t l, int f) { (void)a; (void)l; (void)f; return 0; }
@@ -382,7 +382,7 @@ int uname(struct utsname *buf) {
     strcpy(buf->sysname, "Linux");          // box64 presents a Linux personality to the guest
     strcpy(buf->nodename, "switch");
     strcpy(buf->release, "6.1.0-kurokonx");
-    strcpy(buf->version, "#1 KurokoNX Horizon");
+    strcpy(buf->version, "#1 box64-nx Horizon");
     strcpy(buf->machine, "x86_64");         // the *guest* ABI box64 emulates
     return 0;
 }

@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/utmp.h>. newlib's <utmp.h> includes it but doesn't ship it.
+// box64-nx shim — <sys/utmp.h>. newlib's <utmp.h> includes it but doesn't ship it.
 // Minimal login-record struct + accessors (stubbed for link).
 #pragma once
 #ifdef __SWITCH__

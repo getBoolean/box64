@@ -1,4 +1,4 @@
-// KurokoNX shim — <link.h> (host dynamic-linker introspection; unused on Horizon).
+// box64-nx shim — <link.h> (host dynamic-linker introspection; unused on Horizon).
 #pragma once
 #ifdef __SWITCH__
 #include <stddef.h>
@@ -15,7 +15,7 @@ struct dl_phdr_info {
     void              *dlpi_tls_data;
 };
 
-// No host shared objects on Horizon — stub (see kuro_posix.c).
+// No host shared objects on Horizon — stub (see nx_posix.c).
 int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *data), void *data);
 
 // newlib's <elf.h> provides all Elf{32,64}_* types/constants but not glibc's

@@ -540,7 +540,7 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     // Horizon has no host exit syscall (our syscall() passthrough returns -ENOSYS), so
     // exit(60)/exit_group(231) would fall through and the guest would run off into garbage.
     // Instead, carry the guest's exit code into EAX and unwind the interpreter — emulate()'s
-    // GetEAX() then returns it to kuro_main (which prints it and exits the NRO cleanly).
+    // GetEAX() then returns it to nx_main (which prints it and exits the NRO cleanly).
     if (s == 231 || s == 60) {
         R_EAX = R_EDI;
         emu->quit = 1;

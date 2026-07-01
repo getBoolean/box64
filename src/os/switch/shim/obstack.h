@@ -104,7 +104,7 @@
 #ifndef _OBSTACK_H
 #define _OBSTACK_H 1
 
-/* KurokoNX: neutralize glibc-only annotation macros so this vendored header
+/* box64-nx: neutralize glibc-only annotation macros so this vendored header
    compiles under newlib/devkitA64. */
 #ifdef __SWITCH__
 # ifndef __THROW

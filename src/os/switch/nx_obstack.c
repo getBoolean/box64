@@ -1,4 +1,4 @@
-// KurokoNX — host GNU obstack implementation for the Switch build.
+// box64-nx — host GNU obstack implementation for the Switch build.
 //
 // box64's src/libtools/obstack.c wraps the *guest's* obstack usage and calls the
 // host out-of-line obstack functions (_obstack_begin/_obstack_newchunk/...), which
@@ -183,7 +183,7 @@ int _obstack_memory_used(struct obstack* h)
 
 static void print_and_abort(void)
 {
-    fprintf(stderr, "kuro_obstack: memory exhausted\n");
+    fprintf(stderr, "nx_obstack: memory exhausted\n");
     exit(obstack_exit_failure);
 }
 

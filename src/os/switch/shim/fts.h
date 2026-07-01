@@ -1,4 +1,4 @@
-// KurokoNX shim — <fts.h> (filesystem-tree walk). Horizon has no fts; box64 only
+// box64-nx shim — <fts.h> (filesystem-tree walk). Horizon has no fts; box64 only
 // forwards the fts_* calls (no field access), so minimal structs + stubs suffice.
 #pragma once
 #ifdef __SWITCH__

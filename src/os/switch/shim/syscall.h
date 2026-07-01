@@ -1,4 +1,4 @@
-// KurokoNX shim — bare <syscall.h> (glibc alias for <sys/syscall.h>).
+// box64-nx shim — bare <syscall.h> (glibc alias for <sys/syscall.h>).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/syscall.h>

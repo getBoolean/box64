@@ -1,4 +1,4 @@
-// KurokoNX shim — <mqueue.h> (POSIX message queues; none on Horizon, stubbed for link).
+// box64-nx shim — <mqueue.h> (POSIX message queues; none on Horizon, stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

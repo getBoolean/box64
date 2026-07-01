@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/personality.h> (Linux execution domain; stubbed for link).
+// box64-nx shim — <sys/personality.h> (Linux execution domain; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #define ADDR_NO_RANDOMIZE 0x0040000

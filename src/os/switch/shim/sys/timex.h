@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/timex.h> (Linux adjtimex; stubbed for link).
+// box64-nx shim — <sys/timex.h> (Linux adjtimex; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/time.h>

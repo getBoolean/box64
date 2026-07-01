@@ -1,4 +1,4 @@
-// box64 Horizon port — randomness (KurokoNX), via libnx randomGet64 (seeded from csrng).
+// box64 Horizon port — randomness (box64-nx), via libnx randomGet64 (seeded from csrng).
 #ifdef __SWITCH__
 
 #include <stdint.h>

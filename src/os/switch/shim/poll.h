@@ -1,4 +1,4 @@
-// KurokoNX shim — <poll.h> (Horizon has no poll; stubbed in kuro_posix.c).
+// box64-nx shim — <poll.h> (Horizon has no poll; stubbed in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 typedef unsigned long nfds_t;

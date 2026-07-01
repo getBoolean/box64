@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/msg.h> (SysV message queues; stubbed for link).
+// box64-nx shim — <sys/msg.h> (SysV message queues; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/ipc.h>

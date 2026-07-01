@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/prctl.h> (Horizon has no prctl; stubbed in kuro_posix.c).
+// box64-nx shim — <sys/prctl.h> (Horizon has no prctl; stubbed in nx_posix.c).
 #pragma once
 #ifdef __SWITCH__
 

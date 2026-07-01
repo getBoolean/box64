@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/inotify.h> (Linux inotify; stubbed for link).
+// box64-nx shim — <sys/inotify.h> (Linux inotify; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <stdint.h>

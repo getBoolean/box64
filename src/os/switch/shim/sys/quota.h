@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/quota.h> (Linux disk quotas; stubbed for link).
+// box64-nx shim — <sys/quota.h> (Linux disk quotas; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

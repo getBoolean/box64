@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/fanotify.h> (Linux fanotify; stubbed for link).
+// box64-nx shim — <sys/fanotify.h> (Linux fanotify; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 int fanotify_init(unsigned int flags, unsigned int event_f_flags);

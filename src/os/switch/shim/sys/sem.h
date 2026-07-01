@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/sem.h> (SysV semaphores; structs only, for box64's struct
+// box64-nx shim — <sys/sem.h> (SysV semaphores; structs only, for box64's struct
 // marshalling. The sem* syscalls route through the stubbed syscall() passthrough).
 #pragma once
 #ifdef __SWITCH__

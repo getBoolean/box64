@@ -25,7 +25,7 @@ static void readCpuinfo(sysinfo_t* info)
     {
         uint64_t s_ncpu = 0, s_freq = 0;
         char s_name[64];
-        kuro_sysinfo(&s_ncpu, &s_freq, s_name, sizeof(s_name));
+        nx_sysinfo(&s_ncpu, &s_freq, s_name, sizeof(s_name));
         info->ncpu = s_ncpu ? s_ncpu : 1;
         info->cpuname = (char*)calloc(strlen(s_name) + 1, 1);
         strcpy(info->cpuname, s_name);

@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/sendfile.h> (Linux sendfile; stubbed for link).
+// box64-nx shim — <sys/sendfile.h> (Linux sendfile; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

@@ -1,4 +1,4 @@
-// KurokoNX shim — <sys/vfs.h> (statfs). Linux struct layout; stubbed in kuro_posix.c.
+// box64-nx shim — <sys/vfs.h> (statfs). Linux struct layout; stubbed in nx_posix.c.
 #pragma once
 #ifdef __SWITCH__
 #include <sys/types.h>

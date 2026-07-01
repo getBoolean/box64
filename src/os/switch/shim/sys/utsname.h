@@ -1,5 +1,5 @@
-// KurokoNX shim — <sys/utsname.h>. uname() is implemented in kuro_posix.c with
-// plausible KurokoNX/Horizon values so guests that probe the kernel get an answer.
+// box64-nx shim — <sys/utsname.h>. uname() is implemented in nx_posix.c with
+// plausible box64-nx/Horizon values so guests that probe the kernel get an answer.
 #pragma once
 #ifdef __SWITCH__
 #define _UTSNAME_LENGTH 65

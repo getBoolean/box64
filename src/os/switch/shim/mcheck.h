@@ -1,4 +1,4 @@
-// KurokoNX shim — <mcheck.h> (glibc malloc checking; stubbed for link).
+// box64-nx shim — <mcheck.h> (glibc malloc checking; stubbed for link).
 #pragma once
 #ifdef __SWITCH__
 enum mcheck_status {

@@ -69,11 +69,11 @@ const char* GetBridgeName(void* p);
 // __jmp_buf_tag. Emulate glibc's tag struct over newlib's jmp_buf so box64's
 // (non-ANDROID) jmpbuf code compiles unchanged. Single-threaded interpreter
 // needs no signal-mask save/restore, so sig* collapse to plain setjmp/longjmp.
-typedef struct __kuro_jmp_buf_tag { jmp_buf __jb; } __kuro_jmp_buf_tag;
-#define LongJmp(env, val)        longjmp(((__kuro_jmp_buf_tag*)(env))->__jb, (val))
-#define SigSetJmp(env, savemask) setjmp(((__kuro_jmp_buf_tag*)(env))->__jb)
-#define sigsetjmp(env, savemask) setjmp(((__kuro_jmp_buf_tag*)(env))->__jb)
-#define siglongjmp(env, val)     longjmp(((__kuro_jmp_buf_tag*)(env))->__jb, (val))
+typedef struct __nx_jmp_buf_tag { jmp_buf __jb; } __nx_jmp_buf_tag;
+#define LongJmp(env, val)        longjmp(((__nx_jmp_buf_tag*)(env))->__jb, (val))
+#define SigSetJmp(env, savemask) setjmp(((__nx_jmp_buf_tag*)(env))->__jb)
+#define sigsetjmp(env, savemask) setjmp(((__nx_jmp_buf_tag*)(env))->__jb)
+#define siglongjmp(env, val)     longjmp(((__nx_jmp_buf_tag*)(env))->__jb, (val))
 #else
 #define LongJmp longjmp
 #define SigSetJmp sigsetjmp
@@ -91,7 +91,7 @@ typedef struct __kuro_jmp_buf_tag { jmp_buf __jb; } __kuro_jmp_buf_tag;
 #define JUMPBUFF sigjmp_buf
 #define GET_JUMPBUFF(name) name
 #elif defined(__SWITCH__)
-#define JUMPBUFF __kuro_jmp_buf_tag
+#define JUMPBUFF __nx_jmp_buf_tag
 #define GET_JUMPBUFF(name) &name
 #else
 #define JUMPBUFF struct __jmp_buf_tag
