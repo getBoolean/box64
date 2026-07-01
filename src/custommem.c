@@ -3309,7 +3309,12 @@ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ss
         prot|=PROT_READ;    // PROT_READ is implicit with PROT_WRITE on i386
     int new_flags = flags;
     void* old_addr = addr;
-    #ifndef NOALIGN
+    #ifdef __SWITCH__
+    // Horizon's heap sits above 4GB and can't be placed at box64's chosen 32-bit/47-bit addresses,
+    // so drop MAP_32BIT and let InternalMmap (kuro_mmap) pick the address. A static interpreter
+    // guest never references the bridge via a 32-bit pointer. (Real placement waits for M1.3 virtmem.)
+    new_flags &= ~MAP_32BIT;
+    #elif !defined(NOALIGN)
     new_flags&=~MAP_32BIT;   // remove MAP_32BIT
     if((flags&MAP_32BIT) && !(flags&MAP_FIXED)) {
         // MAP_32BIT only exist on x86_64!
@@ -3326,7 +3331,8 @@ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ss
     // original address here.
     if (ret == MAP_FAILED && old_addr == NULL && fd >= 0)
         ret = InternalMmap(old_addr, length, prot, new_flags, fd, offset);
-#if !defined(NOALIGN)
+#if !defined(NOALIGN) && !defined(__SWITCH__)
+    // (Horizon: no 32-bit/47-bit address re-placement — accept whatever InternalMmap returned.)
     if((ret!=MAP_FAILED) && (flags&MAP_32BIT) &&
       (((uintptr_t)ret>0xffffffffLL) || ((box64_wine) && ((uintptr_t)ret&0xffff) && (ret!=addr)))) {
         int olderr = errno;

@@ -246,7 +246,9 @@ static void hookMangoHud()
     if (FileExist("/etc/MangoHud.conf", IS_FILE)) return;
     const char* configdir = getenv("XDG_CONFIG_HOME");
     const char* homedir = getenv("HOME");
-#ifndef ANDROID
+#if !defined(ANDROID) && !defined(__SWITCH__)
+    // Horizon has no passwd db; getpwuid() is a -ENOSYS stub returning a bogus pointer,
+    // so don't deref it. No $HOME -> homedir stays NULL and we bail below (no MangoHud).
     homedir = homedir ? homedir : getpwuid(getuid())->pw_dir;
 #endif
     if (!homedir) return;
@@ -1011,6 +1013,12 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
         AddPath("libwayland-client.so.0", &my_context->box64_emulated_libs, 0);
 
     my_context->box64path = ResolveFile(argv[0], &my_context->box64_path);
+#ifdef __SWITCH__
+    // Horizon has no /proc/self/exe and no PATH, so ResolveFile("box64") returns NULL; box64path
+    // is later box_strdup()'d and manipulated (box86 detection, re-exec), which would strdup(NULL).
+    if(!my_context->box64path)
+        my_context->box64path = box_strdup("sdmc:/box64");
+#endif
     // prepare all other env. var
     my_context->envc = CountEnv(environ?environ:env);
     printf_log(LOG_INFO, "Counted %d Env var\n", my_context->envc);

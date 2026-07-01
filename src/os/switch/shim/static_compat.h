@@ -22,6 +22,9 @@
 #define ftello64 ftello
 #endif
 
+// Real Horizon system info probed via libnx (implemented in kuro_posix.c).
+void kuro_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long namelen);
+
 // GNU libm extensions newlib lacks; real symbols live in kuro_posix.c so the
 // libm wrapper table (&sincos) also resolves at link time.
 void sincos(double x, double *s, double *c);

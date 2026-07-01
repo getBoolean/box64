@@ -460,6 +460,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/os_switch.c"
         "${BOX64_ROOT}/src/os/switch/kuro_posix.c"
         "${BOX64_ROOT}/src/os/switch/kuro_signals.c"
+        "${BOX64_ROOT}/src/os/switch/kuro_main.c"
         "${BOX64_ROOT}/src/os/switch/kuro_obstack.c"
         "${BOX64_ROOT}/src/os/switch/kuro_glibc_stubs.c"
         "${BOX64_ROOT}/src/os/switch/kuro_link_stubs.c"
@@ -534,6 +535,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     # host-signal-backed signals.c can't compile against newlib (minimal siginfo_t /
     # no sa_sigaction); replaced by src/os/switch/kuro_signals.c stubs.
     list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/libtools/signals.c")
+    # box64's shell main() is replaced by the libnx NRO entry (src/os/switch/kuro_main.c).
+    list(REMOVE_ITEM ELFLOADER_SRC "${BOX64_ROOT}/src/main.c")
 endif()
 if(NOT STATICBUILD)
     list(APPEND ELFLOADER_SRC

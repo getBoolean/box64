@@ -1,5 +1,8 @@
 #define _GNU_SOURCE         /* See feature_test_macros(7) */
 #include <stdint.h>
+#ifdef __SWITCH__
+#include <switch.h>         /* svcOutputDebugString — mirror guest stdout to the debug log */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -533,6 +536,17 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         S_RAX = my_syscall_user_dispatch_prctl(emu, R_RSI, R_RDX, R_R10, (void*)R_R8);
         return;
     }
+#ifdef __SWITCH__
+    // Horizon has no host exit syscall (our syscall() passthrough returns -ENOSYS), so
+    // exit(60)/exit_group(231) would fall through and the guest would run off into garbage.
+    // Instead, carry the guest's exit code into EAX and unwind the interpreter — emulate()'s
+    // GetEAX() then returns it to kuro_main (which prints it and exits the NRO cleanly).
+    if (s == 231 || s == 60) {
+        R_EAX = R_EDI;
+        emu->quit = 1;
+        return;
+    }
+#endif
     // check wrapper first
     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);
     if(s<cnt && syscallwrap[s].nats) {
@@ -576,6 +590,12 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                 S_RAX = -errno;
             break;
         case 1:  // sys_write
+#ifdef __SWITCH__
+            // Mirror guest stdout/stderr to the debug log so guest output is visible headlessly
+            // (in the Ryujinx log / on a debugger), not only on the on-screen console.
+            if ((S_EDI == 1 || S_EDI == 2) && R_RDX)
+                svcOutputDebugString((const char*)R_RSI, (size_t)R_RDX);
+#endif
             S_RAX = write(S_EDI, (void*)R_RSI, (size_t)R_RDX);
             if(S_RAX==-1)
                 S_RAX = -errno;

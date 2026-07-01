@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#ifdef __SWITCH__
+#include <switch.h>   // svcOutputDebugString
+#endif
 
 #include "os.h"
 #include "signals.h"
@@ -129,6 +132,11 @@ void PrintfFtrace(int prefix, const char* fmt, ...) {
     fflush(ftrace);
     va_end(args);
     write(trace_fd, tmp, strlen(tmp));
+#ifdef __SWITCH__
+    // Also emit to the debug log so box64's diagnostics are visible in the Ryujinx log / on a
+    // debugger (the console fd only reaches the on-screen framebuffer).
+    svcOutputDebugString(tmp, strlen(tmp));
+#endif
 }
 
 void* GetEnv(const char* name) { return getenv(name); }
@@ -140,9 +148,14 @@ int FileExist(const char* filename, int flags) {
     if (flags & IS_FILE) {
         if (!S_ISREG(sb.st_mode)) return 0;
     } else if (!S_ISDIR(sb.st_mode)) return 0;
+#ifndef __SWITCH__
+    // On Horizon the guest lives on the SD card (FAT via libnx), which reports no Unix execute
+    // bit, so an ELF would wrongly fail box64's IS_EXECUTABLE check. Any readable regular file
+    // is considered executable here.
     if (flags & IS_EXECUTABLE) {
         if ((sb.st_mode & S_IXUSR) != S_IXUSR) return 0;
     }
+#endif
     return 1;
 }
 

@@ -12,14 +12,31 @@
 
 #define KURO_PAGE 0x1000UL
 
-// M1.0/M1.1: back anonymous RW mappings with the newlib heap (aligned). This does NOT honor
-// MAP_FIXED at guest-chosen x86 addresses yet — box64's address-space placement + executable
-// (dynarec) arenas come in M1.1/M1.2 (libnx virtmem + jit dual-alias). For now this is enough to
-// link and to run a simple static interpreter guest.
+// M1.1: back mappings with the newlib heap (page-aligned). box64's ELF loader first reserves a
+// whole-image block with a plain (non-FIXED) anonymous mmap, then places each PT_LOAD segment at a
+// fixed offset *inside* that block with MAP_FIXED. Since the heap block is already RW, we honor an
+// anonymous MAP_FIXED by returning the requested address (zeroing it — that covers .bss); box64
+// then fread()s the file contents over the file-backed part. A *file*-backed MAP_FIXED can't be
+// satisfied by a heap allocator, so we fail it, which makes box64 fall back to its anon-map+fread
+// path. Real virtmem-backed placement + a W^X dynarec arena arrive in M1.2/M1.3.
 void *kuro_mmap(void *addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
-    (void)addr; (void)prot; (void)fd; (void)offset; (void)flags;
+    (void)prot; (void)fd; (void)offset;
+#ifdef KURO_MMAP_TRACE
+    { char b[128]; int n = snprintf(b, sizeof b, "kuro_mmap(addr=%p len=0x%lx fl=0x%x fd=%d)\n", addr, length, (unsigned)flags, fd); svcOutputDebugString(b, n); }
+#endif
     if (!length) return MAP_FAILED;
     size_t rounded = (length + KURO_PAGE - 1) & ~(KURO_PAGE - 1);
+
+    if (flags & MAP_FIXED) {
+        if (!(flags & MAP_ANONYMOUS) || !addr) {
+            // File-backed (or NULL) fixed mapping — force box64's anon-map + fread fallback.
+            errno = ENODEV;
+            return MAP_FAILED;
+        }
+        memset(addr, 0, rounded);   // target is inside an already-reserved heap block
+        return addr;
+    }
+
     void *p = memalign(KURO_PAGE, rounded);
     if (!p) { errno = ENOMEM; return MAP_FAILED; }
     if (flags & MAP_ANONYMOUS) memset(p, 0, rounded);
@@ -27,8 +44,10 @@ void *kuro_mmap(void *addr, unsigned long length, int prot, int flags, int fd, s
 }
 
 int kuro_munmap(void *addr, unsigned long length) {
-    (void)length;
-    free(addr);   // pairs with memalign above; refined when virtmem-backed mmap lands
+    (void)addr; (void)length;
+    // NOTE: addr may be a MAP_FIXED sub-range *inside* a larger reserved block (not its own
+    // allocation), so free()ing it here would corrupt the heap. Leak for now — a static M1 guest
+    // maps once and runs; a real allocator (tracking reserved blocks) lands with virtmem in M1.3.
     return 0;
 }
 
@@ -40,6 +59,39 @@ int kuro_gettid(void) {
 int kuro_sched_yield(void) {
     svcSleepThread(0);
     return 0;
+}
+
+// Probe real Horizon system info via libnx (used by src/os/sysinfo.c, which has no libnx).
+// Core count from the process core mask (svcGetInfo), CPU clock from the clkrst service (may
+// be stubbed under emulation -> fallback), and the hardware model from set:sys.
+void kuro_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long namelen) {
+    u64 mask = 0;
+    if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && mask)
+        *ncpu = (uint64_t)__builtin_popcountll(mask);
+    else
+        *ncpu = 3;   // a homebrew applet is normally granted 3 of the 4 A57 cores
+
+    *freq_hz = 0;
+    if (R_SUCCEEDED(clkrstInitialize())) {
+        ClkrstSession s;
+        if (R_SUCCEEDED(clkrstOpenSession(&s, PcvModuleId_CpuBus, 3))) {
+            u32 hz = 0;
+            if (R_SUCCEEDED(clkrstGetClockRate(&s, &hz)) && hz) *freq_hz = hz;
+            clkrstCloseSession(&s);
+        }
+        clkrstExit();
+    }
+    if (!*freq_hz) *freq_hz = 1020000000ULL;   // ~1.02 GHz (docked) fallback
+
+    // NOTE: the exact model (Erista/Mariko/Lite/OLED) is available via setsysGetProductModel
+    // (set:sys cmd 79), but Ryujinx *throws* on that unimplemented command and takes the whole
+    // emulator down (it doesn't return a catchable error), so we keep a generic name. All models
+    // are a Tegra X1/X1+ with a 4x Cortex-A57 cluster, which is what matters for box64.
+    const char *model = "Nintendo Switch (Tegra)";
+    if (namelen) {
+        strncpy(name, model, namelen - 1);
+        name[namelen - 1] = '\0';
+    }
 }
 
 // --- POSIX system-name wrappers (box64 calls these directly in places) -----------------------
@@ -279,6 +331,23 @@ int forkpty(int *am, char *n, const struct termios *t, const struct winsize *w) 
 void login(const struct utmp *ut) { (void)ut; }
 int  logout(const char *line) { (void)line; return 0; }
 void logwtmp(const char *line, const char *name, const char *host) { (void)line; (void)name; (void)host; }
+
+// sysconf/getpagesize — newlib's return -ENOSYS via our stubs, but box64 needs a real page
+// size (box64_pagesize = sysconf(_SC_PAGESIZE); a -1 poisons all its alignment/mmap math).
+#include <unistd.h>
+long sysconf(int name) {
+    switch (name) {
+        case _SC_PAGESIZE:          return 4096;
+        case _SC_NPROCESSORS_CONF:
+        case _SC_NPROCESSORS_ONLN:  return 3;      // homebrew applet cores
+        case _SC_CLK_TCK:           return 100;
+        case _SC_OPEN_MAX:          return 1024;
+        case _SC_PHYS_PAGES:        return (long)((256UL * 1024 * 1024) / 4096);
+        case _SC_AVPHYS_PAGES:      return (long)((128UL * 1024 * 1024) / 4096);
+        default:                    errno = EINVAL; return -1;
+    }
+}
+int getpagesize(void) { return 4096; }
 
 long syscall(long number, ...) { (void)number; errno = ENOSYS; return -1; }
 int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {

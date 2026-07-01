@@ -18,6 +18,27 @@ static void readCpuinfo(sysinfo_t* info)
 {
     memset(info, 0, sizeof(sysinfo_t));
 
+#ifdef __SWITCH__
+    // Horizon has no /sys, /proc/cpuinfo, or lscpu (and popen() is a -ENOSYS stub returning a
+    // non-NULL (FILE*)-1 that would defeat the `if(!f)` guards). Probe real values via libnx
+    // instead: core count from the process core mask, CPU clock from clkrst, model from set:sys.
+    {
+        uint64_t s_ncpu = 0, s_freq = 0;
+        char s_name[64];
+        kuro_sysinfo(&s_ncpu, &s_freq, s_name, sizeof(s_name));
+        info->ncpu = s_ncpu ? s_ncpu : 1;
+        info->cpuname = (char*)calloc(strlen(s_name) + 1, 1);
+        strcpy(info->cpuname, s_name);
+        info->read_cpuname = 1;
+        info->read_ncpu = 1;
+        info->frequency = s_freq;
+        info->emulated_frequency = 1;   // box64 still drives RDTSC off the aarch64 cntvct
+        info->read_frequency = 1;
+        info->bogomips = info->frequency;
+    }
+    return;
+#endif
+
     if (getenv("BOX64_SYSINFO_CACHED")) {
         // in case it's the x86_64 lscpu, prevent infinite loop
         if (getenv("BOX64_SYSINFO_NCPU"))
