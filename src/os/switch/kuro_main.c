@@ -55,14 +55,16 @@ int main(int argc, char **argv) {
         printf("\nguest exited: %d\n", code);
         { char b[48]; snprintf(b, sizeof b, "kuro_main: guest exited %d\n", code); kdbg(b); }
     }
-    consoleUpdate(NULL);
+    printf("\n(returning to the menu shortly)\n");
+    consoleUpdate(NULL);   // present the final frame ONCE
+    (void)pad;
 
-    printf("\nPress + to exit.\n");
-    while (appletMainLoop()) {
-        padUpdate(&pad);
-        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
-        consoleUpdate(NULL);
-    }
+    // Hold the result on screen briefly, then exit cleanly. We deliberately do NOT poll HID
+    // (padUpdate) or re-present (consoleUpdate) in this loop: on Ryujinx those libnx service
+    // calls (_hidGetNpadInternalState / framebufferBegin) abort (svcBreak) after the app goes
+    // idle for a few seconds. appletMainLoop() alone is stable and lets the OS request exit.
+    for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i)
+        svcSleepThread(16000000ULL);   // ~16 ms; ~8 s total, or until the OS asks us to quit
     consoleExit(NULL);
     return (code < 0) ? 0 : code;
 }
