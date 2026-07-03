@@ -352,6 +352,13 @@ void ClearCache(void* start, size_t len)
     // manually clear cache, I have issue with regular function on Ampere with kernel 6.12.4
     uintptr_t xstart = (uintptr_t)start;
     uintptr_t xend = (uintptr_t)start + len + 1;
+    // box64-nx (M1.2): on Switch the code cache is a libnx `jit` region with distinct write (`rw`)
+    // and execute (`rx`) aliases. `start` is the `rw` address box64 wrote to (correct for `dc cvau`),
+    // but the I-cache must be invalidated on the `rx` alias. nx_bias = rw_base - rx_base (0 elsewhere).
+    int64_t nx_bias = 0;
+#ifdef __SWITCH__
+    nx_bias = GetDynarecRWBias(start);
+#endif
     // Cache Type Info. Only grab the info once
     static uint64_t ctr_el0 = 0;
     if (ctr_el0 == 0)
@@ -367,9 +374,11 @@ void ClearCache(void* start, size_t len)
     }
     __asm __volatile("dsb ish");
     if (!ctr_el0_dic) {
-        // purge each icache line
-        for (uint64_t addr=xstart&~(icache_line_size-1); addr<xend; addr+=icache_line_size)
-            __asm __volatile("ic ivau, %0" ::"r"(addr));
+        // purge each icache line (on Switch, on the executable `rx` alias — nx_bias is 0 elsewhere)
+        for (uint64_t addr=xstart&~(icache_line_size-1); addr<xend; addr+=icache_line_size) {
+            uintptr_t iaddr = (uintptr_t)((int64_t)addr - nx_bias);
+            __asm __volatile("ic ivau, %0" ::"r"(iaddr));
+        }
         __asm __volatile("dsb ish");
     }
     __asm __volatile("isb sy");

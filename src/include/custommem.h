@@ -67,6 +67,19 @@ uintptr_t getJumpTable32(void);
 uintptr_t getJumpTableAddress64(uintptr_t addr);
 uintptr_t getJumpAddress64(uintptr_t addr);
 
+// box64-nx (M1.2): Horizon W^X dual-alias support. On a Switch build the dynarec code cache lives in
+// libnx `jit` regions with distinct writable (`rw`) and executable (`rx`) aliases. box64 keeps the
+// `rw` address as canonical (block allocator + instruction emission are unchanged); the handful of
+// *execution* sites translate `rw`->`rx` by subtracting a fixed per-chunk bias. `GetDynarecRWBias`
+// returns `rw_base - rx_base` for a pointer inside a jit code-cache chunk, else 0. `dynarec_rx` is
+// the identity on every non-Switch target, so callers can use it unconditionally at zero cost.
+#ifdef __SWITCH__
+int64_t GetDynarecRWBias(void* rw_ptr);
+static inline void* dynarec_rx(void* p) { return p ? (void*)((uintptr_t)p - GetDynarecRWBias(p)) : p; }
+#else
+static inline void* dynarec_rx(void* p) { return p; }
+#endif
+
 #ifdef SAVE_MEM
 #define JMPTABL_SHIFTMAX   JMPTABL_SHIFT4
 #define JMPTABL_SHIFT4 16

@@ -31,6 +31,9 @@
 #include "dynarec/dynarec_next.h"
 #include "dynacache_compress.h"
 #include "freq.h"
+#ifdef __SWITCH__
+#include "nx_jit.h"     // box64-nx: libnx jit-backed W^X code cache (M1.2)
+#endif
 
 // init inside dynablocks.c
 static mmaplist_t          *mmaplist = NULL;
@@ -100,6 +103,9 @@ typedef struct blocklist_s {
     uint32_t            lowest;
     uint8_t             type;
     uint8_t             is32bits;
+#ifdef __SWITCH__
+    int64_t             rw_bias;    // box64-nx (M1.2): rw_base - rx_base for this jit chunk (0 if not jit-backed)
+#endif
 } blocklist_t;
 
 #define MMAPSIZE (512*1024)     // allocate 512kb sized blocks
@@ -1643,11 +1649,24 @@ void DelMmaplist(mmaplist_t* list)
     box_free(list);
 }
 
+#ifdef __SWITCH__
+// box64-nx (M1.2): return the rw->rx bias (rw_base - rx_base) of the jit code-cache chunk that
+// contains `rw_ptr`, or 0 if it isn't inside one. Used by the execution-site rx translation
+// (jump-table setters, dispatcher) and by ClearCache to flush the correct alias.
+int64_t GetDynarecRWBias(void* rw_ptr)
+{
+    if(!rw_ptr)
+        return 0;
+    blocklist_t* bl = (blocklist_t*)rb_get_64(rbt_dynmem, (uintptr_t)rw_ptr);
+    return bl ? bl->rw_bias : 0;
+}
+#endif
+
 dynablock_t* FindDynablockFromNativeAddress(void* p)
 {
     if(!p)
         return NULL;
-    
+
     uintptr_t addr = (uintptr_t)p;
 
     blocklist_t* bl = (blocklist_t*)rb_get_64(rbt_dynmem, addr);
@@ -1787,6 +1806,9 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
     // allign sz with pagesize
     allocsize = (allocsize+(box64_pagesize-1))&~(box64_pagesize-1);
     void* p=MAP_FAILED;
+#ifdef __SWITCH__
+    int64_t nx_bias = 0;    // box64-nx (M1.2): rw->rx bias of the jit chunk backing this allocation
+#endif
     #ifdef BOX32
     if(box64_is32bits)
         p = box32_dynarec_mmap(allocsize, -1, 0);
@@ -1801,8 +1823,19 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
         else printf_log(LOG_INFO, "Failed to allocated a dynarec memory block with HugeTLB (%s)\n", strerror(errno));
     }
     #endif
+#ifdef __SWITCH__
+    // box64-nx (M1.2): back the dynarec code cache with a libnx `jit` region (W^X dual alias)
+    // instead of an RWX mmap (Horizon forbids RWX). nx_jit_alloc returns the writable (`rw`) base;
+    // nx_bias carries rw_base - rx_base for the execution-site rx translation. Normalize a NULL
+    // failure to MAP_FAILED so the shared check just below still applies.
+    if(p==MAP_FAILED) {
+        p = nx_jit_alloc(allocsize, &nx_bias);
+        if(!p) p = MAP_FAILED;
+    }
+#else
     if(p==MAP_FAILED)
         p = InternalMmap(NULL, allocsize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#endif
     if(p==MAP_FAILED) {
         dynarec_log(LOG_INFO, "Cannot create dynamic map of %zu bytes (%s)\n", allocsize, strerror(errno));
         return 0;
@@ -1819,6 +1852,9 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
 #endif
     setProtection_box((uintptr_t)p, allocsize, PROT_READ | PROT_WRITE | PROT_EXEC);
     list->chunks[i] = p;
+#ifdef __SWITCH__
+    list->chunks[i]->rw_bias = nx_bias;     // box64-nx (M1.2): record rw->rx bias for this jit chunk
+#endif
     rb_set_64(rbt_dynmem, (uintptr_t)p, (uintptr_t)p+allocsize, (uintptr_t)list->chunks[i]);
     p = p + sizeof(blocklist_t);    // adjust pointer and size, to exclude blocklist_t itself
     allocsize-=sizeof(blocklist_t);
@@ -2050,6 +2086,7 @@ static uintptr_t *create_jmptbl(int for32bits, uintptr_t idx0, uintptr_t idx1, u
 
 int addJumpTableIfDefault64(void* addr, void* jmp)
 {
+    jmp = dynarec_rx(jmp);  // box64-nx (M1.2): the jump table holds executable (`rx`) targets on Switch
     uintptr_t idx3, idx2, idx1, idx0;
     #ifdef JMPTABL_SHIFT4
     uintptr_t idx4;
@@ -2090,6 +2127,7 @@ void setJumpTableDefault64(void* addr)
 }
 int setJumpTableDefaultIfRef64(void* addr, void* jmp)
 {
+    jmp = dynarec_rx(jmp);  // box64-nx (M1.2): `jmp` is compared against the stored `rx` target
     uintptr_t idx3, idx2, idx1, idx0;
     #ifdef JMPTABL_SHIFT4
     uintptr_t idx4;
@@ -2116,6 +2154,7 @@ int setJumpTableDefaultIfRef64(void* addr, void* jmp)
 }
 void setJumpTableDefaultRef64(void* addr, void* jmp)
 {
+    jmp = dynarec_rx(jmp);  // box64-nx (M1.2): `jmp` is compared against the stored `rx` target
     uintptr_t idx3, idx2, idx1, idx0;
     #ifdef JMPTABL_SHIFT4
     uintptr_t idx4;
@@ -2138,6 +2177,9 @@ void setJumpTableDefaultRef64(void* addr, void* jmp)
 }
 int setJumpTableIfRef64(void* addr, void* jmp, void* ref)
 {
+    // box64-nx (M1.2): both the new target and the compared-against reference are `rx` on Switch.
+    jmp = dynarec_rx(jmp);
+    ref = dynarec_rx(ref);
     uintptr_t idx3, idx2, idx1, idx0;
     #ifdef JMPTABL_SHIFT4
     uintptr_t idx4 = (((uintptr_t)addr)>>JMPTABL_START4)&JMPTABLE_MASK4;

@@ -350,6 +350,16 @@ if(ZYDIS3)
     add_definitions(-DZYDIS3)
 endif()
 
+# box64-nx (M1.2): opt-in ARM64 dynarec for the Horizon/Switch build (W^X via libnx `jit`).
+# Default OFF keeps the proven M1.1 interpreter-only build; configure with -DBOX64_NX_DYNAREC=ON to
+# enable the JIT. Must run *before* the ARM_DYNAREC consumption just below (which adds -DDYNAREC,
+# the ASM language, and the src/dynarec/arm64 sources).
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" AND BOX64_NX_DYNAREC)
+    set(ARM_DYNAREC ON CACHE BOOL "" FORCE)
+    set(NOALIGN OFF CACHE BOOL "" FORCE)
+    set(LD80BITS OFF CACHE BOOL "" FORCE)
+endif()
+
 if(ARM_DYNAREC)
     add_definitions(-DDYNAREC)
     add_definitions(-DARM64)
@@ -409,8 +419,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch"
         "${BOX64_ROOT}/src/os/switch/shim"
     )
-    # newlib libc aliases (fseeko64, ...) needed in every TU; force-include.
-    add_compile_options("-include" "${BOX64_ROOT}/src/os/switch/shim/static_compat.h")
+    # newlib libc aliases (fseeko64, ...) needed in every TU; force-include into C/C++ only.
+    # (box64-nx M1.2: NOT for ASM — the arm64 .S dynarec sources go through cpp, and the C
+    # declarations static_compat.h emits are not valid assembler.)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -include ${BOX64_ROOT}/src/os/switch/shim/static_compat.h")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include ${BOX64_ROOT}/src/os/switch/shim/static_compat.h")
+    # box64-nx (M1.2): the arm64 dynarec lock helpers (arm64_lock.S) contain LSE atomics
+    # (swpal/casal) and CRC32 ops, both selected at runtime via `cpuext`. The Switch's Cortex-A57 is
+    # ARMv8.0 (no LSE), so they never execute — but the assembler must still be told +lse/+crc to
+    # *encode* them. Give the ASM the same arch as C, plus lse.
+    set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a+crc+crypto+lse")
     # Horizon NROs are position-independent (switch.specs links -pie); build PIC objects.
     add_compile_options(-fPIE)
     # Baked-in default guest path for the NRO loader (nx_main.c). Empty -> the source default
@@ -473,6 +491,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch/nx_link_stubs.c"
         "${BOX64_ROOT}/src/os/switch/nx_resolv_stubs.c"
         "${BOX64_ROOT}/src/os/switch/nx_stdio.c"
+        "${BOX64_ROOT}/src/os/switch/nx_jit.c"
         "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
         "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
         "${BOX64_ROOT}/src/os/switch/random_switch.c"

@@ -102,7 +102,7 @@ void* LinkNext(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
         }
     }
     //dynablock_t *father = block->father?block->father:block;
-    return jblock;
+    return dynarec_rx(jblock);  // box64-nx (M1.2): the linker branches to the executable (`rx`) alias on Switch
 }
 void* LinkNextInvalid(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
 {
@@ -313,7 +313,7 @@ void EmuRun(x64emu_t* emu, int use_dynarec, int no_alt)
                     printf_log(LOG_NONE, "Warning, cannot find Secondary Entry Point %p in dynablock %p\n", (void*)R_RIP, block);
                     skip = 1;
                 } else
-                    native_prolog(emu, jblock);
+                    native_prolog(emu, dynarec_rx(jblock));  // box64-nx (M1.2): enter via the `rx` alias on Switch
             }
             if(emu->fork) {
                 int forktype = emu->fork;

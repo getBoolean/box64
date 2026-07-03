@@ -27,6 +27,22 @@ typedef struct ucontext {
     mcontext_t         uc_mcontext;
 } ucontext_t;
 
+// Linux aarch64 signal FP context records (asm/sigcontext.h). box64 walks uc_mcontext.__reserved[]
+// for a FPSIMD_MAGIC record to read/write guest SIMD state during signal handling and (with the
+// dynarec) unaligned-access fixups. Layout-only on Horizon (no signal delivery) — present so
+// box64's signal/dynarec code compiles; never populated at runtime. (box64-nx M1.2)
+struct _aarch64_ctx {
+    uint32_t magic;
+    uint32_t size;
+};
+#define FPSIMD_MAGIC 0x46508001
+struct fpsimd_context {
+    struct _aarch64_ctx head;
+    uint32_t     fpsr;
+    uint32_t     fpcr;
+    __uint128_t  vregs[32];
+};
+
 // The makecontext/swapcontext family is unsupported on Horizon (box64 doesn't need them for the
 // interpreter path); declare for completeness.
 int  getcontext(ucontext_t *ucp);
