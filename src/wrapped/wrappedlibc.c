@@ -4562,12 +4562,21 @@ static void* timed_exit_thread(void* a)
 
 void startTimedExit()
 {
+#ifdef __SWITCH__
+    // On Horizon box64 is one-shot and the process exits cleanly, so the NVidia-ARM64 exit-freeze
+    // workaround is irrelevant. Worse, this watchdog thread lingers (sleeping in usleep) and then
+    // faults when hbloader unmaps box64's code at exit — an Instruction Abort that fatals the whole
+    // process AFTER the guest already ran. So skip spawning it.
+    (void)timed_exit_thread;
+    return;
+#else
     static int started = 0;
     if(started)
         return;
     started = 1;
     pthread_t exit_thread;
     pthread_create(&exit_thread, NULL, timed_exit_thread, NULL);
+#endif
 }
 
 EXPORT void my_exit(x64emu_t* emu, int code)
