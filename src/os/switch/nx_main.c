@@ -24,13 +24,18 @@
 static void kdbg(const char *s) { svcOutputDebugString(s, strlen(s)); }
 
 int main(int argc, char **argv) {
-    // Guest path: argv[1] when a launcher provides one, else the compile default.
-    const char *guest = (argc >= 2 && argv[1] && argv[1][0]) ? argv[1] : NX_GUEST_PATH;
-
     consoleInit(NULL);
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
+
+    // Mount the romfs embedded in this NRO (holds the x86-64 guests: romfs:/hello, /loop, /churn),
+    // so a single nxlink push carries box64 + its guest — no SD staging needed for a hardware test.
+    bool have_romfs = R_SUCCEEDED(romfsInit());
+    // Guest path: argv[1] when a launcher provides one (e.g. `nxlink --args romfs:/loop box64.nro`),
+    // else the embedded romfs:/hello, else the SD compile default when romfs is unavailable.
+    const char *guest = (argc >= 2 && argv[1] && argv[1][0]) ? argv[1]
+                        : (have_romfs ? "romfs:/hello" : NX_GUEST_PATH);
 
     kdbg("nx_main: start\n");
     printf("box64 (Horizon)\nguest: %s\n\n", guest);
@@ -68,6 +73,7 @@ int main(int argc, char **argv) {
     // idle for a few seconds. appletMainLoop() alone is stable and lets the OS request exit.
     for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i)
         svcSleepThread(16000000ULL);   // ~16 ms; ~8 s total, or until the OS asks us to quit
+    if (have_romfs) romfsExit();
     consoleExit(NULL);
     return (code < 0) ? 0 : code;
 }

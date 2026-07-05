@@ -1448,6 +1448,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         COMMAND "${NACPTOOL}" --create "box64" "box64-nx" "0.1.0" "${CMAKE_BINARY_DIR}/box64.nacp"
         COMMAND "${ELF2NRO}" "$<TARGET_FILE:${BOX64}>" "${CMAKE_BINARY_DIR}/box64.nro"
                 "--nacp=${CMAKE_BINARY_DIR}/box64.nacp" "--icon=${NX_ICON}"
+                "--romfsdir=${CMAKE_SOURCE_DIR}/nx-romfs"
         BYPRODUCTS "${CMAKE_BINARY_DIR}/box64.nro" "${CMAKE_BINARY_DIR}/box64.nacp"
         COMMENT "Packaging box64.nro (Horizon homebrew)"
         VERBATIM)
