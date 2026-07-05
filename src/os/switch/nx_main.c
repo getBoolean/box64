@@ -10,6 +10,7 @@
 
 #include <switch.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>   // environ
 
@@ -23,8 +24,29 @@
 
 static void kdbg(const char *s) { svcOutputDebugString(s, strlen(s)); }
 
+// nxlink host socket (>=0 only when launched via nxlink) — lets a hardware run stream box64's
+// status/result to the PC terminal while it also shows on the Switch console.
+static int g_nxlink_fd = -1;
+
+// Print to the on-screen console AND, when launched via nxlink, mirror the same text to the host PC.
+static void kout(const char *fmt, ...) {
+    char buf[512];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
+    fputs(buf, stdout);
+    fflush(stdout);
+    if (g_nxlink_fd >= 0) write(g_nxlink_fd, buf, (size_t)n);
+}
+
 int main(int argc, char **argv) {
     consoleInit(NULL);
+    // Connect to the nxlink host WITHOUT redirecting stdout (kout mirrors manually), so the Switch
+    // console keeps the screen and results also stream to the PC. <0 when not launched via nxlink.
+    socketInitializeDefault();
+    g_nxlink_fd = nxlinkConnectToHost(false, false);
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
@@ -38,7 +60,7 @@ int main(int argc, char **argv) {
                         : (have_romfs ? "romfs:/hello" : NX_GUEST_PATH);
 
     kdbg("nx_main: start\n");
-    printf("box64 (Horizon)\nguest: %s\n\n", guest);
+    kout("box64 (Horizon)\nguest: %s\n\n", guest);
     consoleUpdate(NULL);
 
     // box64 rewrites argv in place assuming the strings are contiguous (as a Linux kernel lays
@@ -56,14 +78,14 @@ int main(int argc, char **argv) {
 
     if (initialize(2, b_argv, environ, &emu, &elf, 1)) {
         kdbg("nx_main: initialize failed\n");
-        printf("box64: initialize failed (guest missing or not a valid x86-64 ELF?)\n");
+        kout("box64: initialize failed (guest missing or not a valid x86-64 ELF?)\n");
     } else {
         kdbg("nx_main: emulate\n");
         code = emulate(emu, elf);
-        printf("\nguest exited: %d\n", code);
+        kout("\nguest exited: %d\n", code);
         { char b[48]; snprintf(b, sizeof b, "nx_main: guest exited %d\n", code); kdbg(b); }
     }
-    printf("\n(returning to the menu shortly)\n");
+    kout("\n(returning to the menu shortly)\n");
     consoleUpdate(NULL);   // present the final frame ONCE
     (void)pad;
 
@@ -74,6 +96,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i)
         svcSleepThread(16000000ULL);   // ~16 ms; ~8 s total, or until the OS asks us to quit
     if (have_romfs) romfsExit();
+    if (g_nxlink_fd >= 0) close(g_nxlink_fd);
+    socketExit();
     consoleExit(NULL);
     return (code < 0) ? 0 : code;
 }

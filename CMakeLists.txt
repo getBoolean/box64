@@ -1416,7 +1416,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     # Horizon: link the homebrew runtime (libnx) via the switch specs (crt0 + linker
     # script). newlib provides c/m/pthread; dl/resolv/util don't exist (their few symbols
     # are stubbed in nx_posix.c / nx_glibc_stubs.c).
-    set_property(TARGET ${BOX64} APPEND_STRING PROPERTY LINK_FLAGS " -specs=$ENV{DEVKITPRO}/libnx/switch.specs -L$ENV{DEVKITPRO}/libnx/lib -Wl,-z,notext ")
+    # KUROKONX: use nx.specs (a copy of switch.specs whose linker script folds .rodata into the
+    # writable .data.rel.ro) so newlib's relocated const structs don't sit in a read-only segment
+    # that faults during libnx crt0 relocation on real hardware. See src/os/switch/nx.ld.
+    set_property(TARGET ${BOX64} APPEND_STRING PROPERTY LINK_FLAGS " -specs=${CMAKE_SOURCE_DIR}/src/os/switch/nx.specs -L$ENV{DEVKITPRO}/libnx/lib -Wl,-z,notext ")
     target_link_libraries(${BOX64} m nx)
 elseif(STATICBUILD)
     #set_target_properties(${BOX64} PROPERTIES LINK_FLAGS "-fuse-ld=gold -static -Wl,--no-relax -Wl,--allow-multiple-definition -ldl -lrt -lpthread -lresolv -lc -lutil -lm -Wl,-defsym,_DYNAMIC=0 -pthread")

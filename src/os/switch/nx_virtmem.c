@@ -41,6 +41,18 @@
 void __libnx_initheap(void) {
     extern char* fake_heap_start;
     extern char* fake_heap_end;
+
+    // When launched as an NRO, hbloader hands us a heap region via the homebrew ABI and has already
+    // mapped it. We MUST use that region (like libnx's default initheap does): calling svcSetHeapSize
+    // ourselves instead yields a heap that libnx's own argvSetup then memsets and faults on real
+    // hardware (Data Abort — the emulator tolerated it). Only when there is no loader override
+    // (i.e. box64 packaged as an NSP/title) do we carve our own bounded heap so the rest of physical
+    // RAM stays free for the svcMapPhysicalMemory arena.
+    if (envHasHeapOverride()) {
+        fake_heap_start = (char*)envGetHeapOverrideAddr();
+        fake_heap_end   = (char*)envGetHeapOverrideAddr() + envGetHeapOverrideSize();
+        return;
+    }
     void* base = NULL;
     if (R_SUCCEEDED(svcSetHeapSize(&base, NX_NEWLIB_HEAP)) && base) {
         fake_heap_start = (char*)base;
