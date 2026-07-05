@@ -16,6 +16,7 @@ extern "C" {
 // (exec arenas move to the libnx jit dual-alias in M1.2).
 void *nx_mmap(void *addr, unsigned long length, int prot, int flags, int fd, ssize_t offset);
 int   nx_munmap(void *addr, unsigned long length);
+int   nx_vm_protect(void *addr, size_t len, int prot);   // real mprotect (none/R/RW); nx_virtmem.c
 
 // Thread / scheduling.
 int nx_gettid(void);

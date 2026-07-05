@@ -1,33 +1,60 @@
 # box64-nx — box64 for Nintendo Switch (Horizon OS)
 
-> **This is a fork of [box64](https://github.com/ptitSeb/box64).** It adds a Nintendo Switch
-> (Horizon OS) backend so box64 builds and runs as homebrew. The upstream README follows below,
-> unchanged. Fork work lives on the `kurokonx-horizon` branch, driven by the
-> [KurokoNX](https://github.com/getBoolean) research project.
+[KurokoNX research project](https://github.com/getBoolean) | fork branch `kurokonx-horizon` | [upstream box64](https://github.com/ptitSeb/box64)
 
-Upstream box64 targets Linux on Arm/RISC-V/LoongArch. **box64-nx** ports it to
-**devkitA64 + newlib + libnx**, so the emulator itself runs as a Horizon homebrew **NRO** (tested on
-Ryujinx; real hardware pending).
+---
 
-**What it adds over upstream:**
+A fork of [box64](https://github.com/ptitSeb/box64) that adds a **Nintendo Switch (Horizon OS)** backend, porting it to **devkitA64 + newlib + libnx** so the emulator runs as Switch homebrew. Driven by the [KurokoNX](https://github.com/getBoolean) research project; fork work lives on the `kurokonx-horizon` branch. The upstream box64 README follows below, unchanged.
 
-- **Horizon/newlib/libnx OS backend** — a new `src/os/switch/` (with `os_switch.c`) implementing box64's
-  OS surface (`mmap`, sysinfo, signals, exit, POSIX shims) on Horizon instead of Linux syscalls.
-- **NRO entry** — `src/os/switch/nx_main.c` replaces box64's shell `main()`: a libnx `main()` that loads
-  a guest (path from `argv[1]` or the `NX_GUEST_PATH` compile default) and drives `initialize()` +
-  `emulate()`. Packaged to `box64.nro` (elf2nro + NACP) by the `NintendoSwitch` CMake branch.
-- **newlib gap layer** — `nx_posix`, a set of vendored/stub glibc headers under `src/os/switch/shim/`,
-  and an `-ENOSYS` link layer (`nx_glibc_stubs.c`/`nx_link_stubs.c`/`nx_resolv_stubs.c`) that satisfy
-  box64's STATICBUILD wrapped-libc layer on newlib (inert for a static guest).
-- **Interpreter-first bring-up** — builds with `ARM_DYNAREC=OFF -DSTATICBUILD=ON`; Horizon-aware
-  `mmap`/sysinfo/`exit_group` handling. The Arm64 **dynarec + W^X JIT** path is the next milestone.
+---
 
-**Status:** the interpreter runs a static-PIE x86-64 Linux binary end-to-end on Ryujinx (`guest exited
-42`, clean exit). Still ahead: dynarec/W^X (JIT), dynamically-linked guests, and real-hardware validation.
+## What box64-nx adds
 
-**Build/run:** use the devkitPro `Switch.cmake` toolchain (`CMAKE_SYSTEM_NAME=NintendoSwitch`) →
-`box64.nro`. Bake a default guest path with `-DNX_GUEST_PATH=sdmc:/your/guest`, or pass it at runtime as
-`argv[1]`. Everything below is the upstream box64 documentation.
+- **Horizon OS backend** — a new `src/os/switch/` (with `os_switch.c`) implementing box64's OS surface (`mmap`, sysinfo, signals, `exit`, POSIX shims) on Horizon instead of Linux syscalls.
+- **NRO/NSP entry** — `src/os/switch/nx_main.c` replaces box64's shell `main()`: a libnx `main()` that loads a guest (from `argv[1]` or the `NX_GUEST_PATH` compile default) and drives `initialize()` + `emulate()`.
+- **newlib gap layer** — `nx_posix`, vendored/stub glibc headers under `src/os/switch/shim/`, and an `-ENOSYS` link layer (`nx_glibc_stubs.c` / `nx_link_stubs.c` / `nx_resolv_stubs.c`) that satisfy box64's STATICBUILD wrapped-libc layer on newlib.
+- **Arm64 dynarec under W^X** — the JIT code cache uses libnx `jit` dual-alias memory; guest memory uses a real `svcMapPhysicalMemory` arena (`src/os/switch/nx_virtmem.c`).
+
+---
+
+## Packaging: NRO vs NSP
+
+Real `mmap`/`mprotect` and the W^X guest arena use `svcMapPhysicalMemory` / `svcSetMemoryPermission`, which require `system_resource_size > 0` in the process NPDM. A plain hbloader **NRO** has `0` — in both applet and application/full-RAM mode (confirmed on real hardware) — so those calls fail with `InvalidState`. The `NintendoSwitch` build therefore emits both:
+
+- **`box64.nro`** — plain homebrew; `nx_virtmem.c` falls back to a heap allocator (a one-page trial map at init detects the missing resource).
+- **`box64.nsp`** — a title with a custom `main.npdm` (`src/os/switch/box64.json`) that sets `system_resource_size`, so the arena maps guest memory for real. Ryujinx loads the homebrew `box64.nsp` directly (no keys).
+
+---
+
+## Building
+
+From a devkitPro MSYS2 shell (with `DEVKITPRO` set), configure with the `Switch.cmake` toolchain and build — this emits both `box64.nro` and `box64.nsp`:
+
+```sh
+cmake -S . -B build -G "Unix Makefiles" \
+  -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DSTATICBUILD=ON \
+  -DBOX64_NX_DYNAREC=ON \
+  -DNX_GUEST_PATH=sdmc:/your/guest        # baked-in default guest; or pass it as argv[1] at runtime
+cmake --build build -j$(nproc)           # -> build/box64.nro  and  build/box64.nsp
+```
+
+`-DBOX64_NX_DYNAREC=ON` enables the Arm64 dynarec (omit for interpreter-only). If CMake can't find Python 3 (used by box64's wrapper generator), add `-DPython3_EXECUTABLE=/path/to/python`.
+
+You also need a **guest** — the x86-64 Linux binary box64 emulates. Build one with any x86-64 Linux compiler and copy it onto the SD card at the `NX_GUEST_PATH` you configured. The port currently runs **static-PIE** guests (dynamically-linked guests are future work); the raw-syscall test guests are built like this:
+
+```sh
+clang --target=x86_64-linux-gnu -static-pie -nostdlib -o guest guest.c   # or: x86_64-linux-gnu-gcc ...
+cp guest <SD>/your/guest                                                 # matches -DNX_GUEST_PATH=sdmc:/your/guest
+```
+
+box64 loads the guest at startup and runs it — e.g. a guest that writes a line and `exit_group(42)` prints its output and exits 42.
+
+---
+
+## Status
+
+The interpreter and the Arm64 dynarec both run a static-PIE x86-64 Linux binary end-to-end on Ryujinx (`guest exited 42`, clean), and real virtual memory works via `box64.nsp`. Still ahead: dynamically-linked guests and broader real-hardware validation.
 
 ---
 

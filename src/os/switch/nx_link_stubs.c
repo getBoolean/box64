@@ -386,7 +386,7 @@ __asm__(
 "  .global posix_spawnattr_setsigdefault\n  .type posix_spawnattr_setsigdefault, %function\n  .set posix_spawnattr_setsigdefault, nx_enosys_stub\n"
 "  .global posix_spawnattr_setsigmask\n  .type posix_spawnattr_setsigmask, %function\n  .set posix_spawnattr_setsigmask, nx_enosys_stub\n"
 "  .global posix_spawnp\n  .type posix_spawnp, %function\n  .set posix_spawnp, nx_enosys_stub\n"
-"  .global prctl\n  .type prctl, %function\n  .set prctl, nx_enosys_stub\n"
+// prctl is a real function in nx_posix.c (PR_SET_NAME/PR_GET_NAME accepted) — no ENOSYS alias.
 "  .global pread\n  .type pread, %function\n  .set pread, nx_enosys_stub\n"
 "  .global preadv\n  .type preadv, %function\n  .set preadv, nx_enosys_stub\n"
 "  .global pselect\n  .type pselect, %function\n  .set pselect, nx_enosys_stub\n"
@@ -449,11 +449,7 @@ __asm__(
 "  .global shmctl\n  .type shmctl, %function\n  .set shmctl, nx_enosys_stub\n"
 "  .global shmdt\n  .type shmdt, %function\n  .set shmdt, nx_enosys_stub\n"
 "  .global shmget\n  .type shmget, %function\n  .set shmget, nx_enosys_stub\n"
-"  .global sigaddset\n  .type sigaddset, %function\n  .set sigaddset, nx_enosys_stub\n"
-"  .global sigdelset\n  .type sigdelset, %function\n  .set sigdelset, nx_enosys_stub\n"
-"  .global sigemptyset\n  .type sigemptyset, %function\n  .set sigemptyset, nx_enosys_stub\n"
-"  .global sigfillset\n  .type sigfillset, %function\n  .set sigfillset, nx_enosys_stub\n"
-"  .global sigismember\n  .type sigismember, %function\n  .set sigismember, nx_enosys_stub\n"
+// sigaddset/sigdelset/sigemptyset/sigfillset/sigismember are real in nx_posix.c (bitmask ops).
 "  .global sigpending\n  .type sigpending, %function\n  .set sigpending, nx_enosys_stub\n"
 "  .global sigprocmask\n  .type sigprocmask, %function\n  .set sigprocmask, nx_enosys_stub\n"
 "  .global sigsuspend\n  .type sigsuspend, %function\n  .set sigsuspend, nx_enosys_stub\n"

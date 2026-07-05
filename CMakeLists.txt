@@ -492,6 +492,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch/nx_resolv_stubs.c"
         "${BOX64_ROOT}/src/os/switch/nx_stdio.c"
         "${BOX64_ROOT}/src/os/switch/nx_jit.c"
+        "${BOX64_ROOT}/src/os/switch/nx_virtmem.c"
         "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
         "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
         "${BOX64_ROOT}/src/os/switch/random_switch.c"
@@ -1449,6 +1450,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
                 "--nacp=${CMAKE_BINARY_DIR}/box64.nacp" "--icon=${NX_ICON}"
         BYPRODUCTS "${CMAKE_BINARY_DIR}/box64.nro" "${CMAKE_BINARY_DIR}/box64.nacp"
         COMMENT "Packaging box64.nro (Horizon homebrew)"
+        VERBATIM)
+
+    # Also package as an NSP/title. A title's main.npdm declares system_resource_size, which the
+    # plain NRO cannot — that is what makes svcMapPhysicalMemory / svcSetMemoryPermission (real
+    # page-granular mmap + real mprotect, used by nx_virtmem.c) work. Unencrypted homebrew PFS0, so
+    # no keys are needed and Ryujinx loads it directly. (Real HW: install or run via a forwarder.)
+    find_program(ELF2NSO    elf2nso    PATHS "$ENV{DEVKITPRO}/tools/bin")
+    find_program(NPDMTOOL   npdmtool   PATHS "$ENV{DEVKITPRO}/tools/bin")
+    find_program(BUILD_PFS0 build_pfs0 PATHS "$ENV{DEVKITPRO}/tools/bin")
+    set(NX_NPDM_JSON "${BOX64_ROOT}/src/os/switch/box64.json")
+    add_custom_command(TARGET ${BOX64} POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/exefs"
+        COMMAND "${ELF2NSO}"   "$<TARGET_FILE:${BOX64}>" "${CMAKE_BINARY_DIR}/exefs/main"
+        COMMAND "${NPDMTOOL}"  "${NX_NPDM_JSON}"          "${CMAKE_BINARY_DIR}/exefs/main.npdm"
+        COMMAND "${BUILD_PFS0}" "${CMAKE_BINARY_DIR}/exefs" "${CMAKE_BINARY_DIR}/box64.nsp"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/box64.nsp"
+        COMMENT "Packaging box64.nsp (Horizon title; system_resource_size enables real virtmem)"
         VERBATIM)
 endif()
 

@@ -8,48 +8,29 @@
 #include <malloc.h>     // memalign
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>      // vsnprintf
+#include <stdarg.h>
 #include <sys/mman.h>   // PROT_*/MAP_* (box64-nx shim)
 
 #define NX_PAGE 0x1000UL
 
-// M1.1: back mappings with the newlib heap (page-aligned). box64's ELF loader first reserves a
-// whole-image block with a plain (non-FIXED) anonymous mmap, then places each PT_LOAD segment at a
-// fixed offset *inside* that block with MAP_FIXED. Since the heap block is already RW, we honor an
-// anonymous MAP_FIXED by returning the requested address (zeroing it — that covers .bss); box64
-// then fread()s the file contents over the file-backed part. A *file*-backed MAP_FIXED can't be
-// satisfied by a heap allocator, so we fail it, which makes box64 fall back to its anon-map+fread
-// path. Real virtmem-backed placement + a W^X dynarec arena arrive in M1.2/M1.3.
-void *nx_mmap(void *addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
-    (void)prot; (void)fd; (void)offset;
-#ifdef NX_MMAP_TRACE
-    { char b[128]; int n = snprintf(b, sizeof b, "nx_mmap(addr=%p len=0x%lx fl=0x%x fd=%d)\n", addr, length, (unsigned)flags, fd); svcOutputDebugString(b, n); }
-#endif
-    if (!length) return MAP_FAILED;
-    size_t rounded = (length + NX_PAGE - 1) & ~(NX_PAGE - 1);
-
-    if (flags & MAP_FIXED) {
-        if (!(flags & MAP_ANONYMOUS) || !addr) {
-            // File-backed (or NULL) fixed mapping — force box64's anon-map + fread fallback.
-            errno = ENODEV;
-            return MAP_FAILED;
-        }
-        memset(addr, 0, rounded);   // target is inside an already-reserved heap block
-        return addr;
-    }
-
-    void *p = memalign(NX_PAGE, rounded);
-    if (!p) { errno = ENOMEM; return MAP_FAILED; }
-    if (flags & MAP_ANONYMOUS) memset(p, 0, rounded);
-    return p;
+// Loud one-line warning to the Horizon debug log (svcOutputDebugString, which Ryujinx surfaces).
+// Used to make still-faked host primitives announce themselves, so a guest that trips one produces
+// a self-explaining log line instead of failing silently. Deliberately dependency-free (no box64
+// debug.h) so it is safe to call from the lowest-level POSIX shims.
+static void nx_warnf(const char *fmt, ...) {
+    char b[160];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof b - 1) n = (int)sizeof b - 1;
+    svcOutputDebugString(b, (size_t)n);
 }
 
-int nx_munmap(void *addr, unsigned long length) {
-    (void)addr; (void)length;
-    // NOTE: addr may be a MAP_FIXED sub-range *inside* a larger reserved block (not its own
-    // allocation), so free()ing it here would corrupt the heap. Leak for now — a static M1 guest
-    // maps once and runs; a real allocator (tracking reserved blocks) lands with virtmem in M1.3.
-    return 0;
-}
+// nx_mmap / nx_munmap moved to nx_virtmem.c (phase 1): a real page-granular allocator over the
+// Alias region (svcMapPhysicalMemory) with reclaiming munmap, falling back to the heap path if the
+// arena can't init. See nx_virtmem.c.
 
 int nx_gettid(void) {
     // Single-threaded for now (M1 static guests). Real per-thread ids arrive with thread support.
@@ -100,9 +81,15 @@ void nx_sysinfo(uint64_t *ncpu, uint64_t *freq_hz, char *name, unsigned long nam
 // NOTE: mmap/mmap64/munmap are provided by box64's src/custommmap.c, which delegates to
 // InternalMmap (os_switch.c -> nx_mmap). We only supply the rest of the mman surface here.
 // No real page-permission changes for the interpreter (heap-backed mmap); revisited in M1.2.
-int mprotect(void *addr, size_t len, int prot) { (void)addr; (void)len; (void)prot; return 0; }
+int mprotect(void *addr, size_t len, int prot) { return nx_vm_protect(addr, len, prot); }
 void *mremap(void *old_addr, size_t old_size, size_t new_size, int flags, ...) {
-    (void)old_size; (void)flags; return nx_mmap(old_addr, new_size, 0, MAP_ANONYMOUS, -1, 0);
+    // Previously returned a *fresh zeroed* block, silently dropping old_addr's contents — a
+    // data-loss trap (glibc malloc arenas / large realloc got zeroed garbage with no error). Fail
+    // loudly instead until phase 1 provides a real remap; callers then fall back to malloc+copy+free.
+    (void)flags;
+    nx_warnf("nx_stub: mremap(old=%p 0x%zx->0x%zx) unsupported -> MAP_FAILED\n", old_addr, old_size, new_size);
+    errno = ENOMEM;
+    return MAP_FAILED;
 }
 int madvise(void *a, size_t l, int adv) { (void)a; (void)l; (void)adv; return 0; }
 int msync(void *a, size_t l, int f) { (void)a; (void)l; (void)f; return 0; }
@@ -111,6 +98,41 @@ int munlock(const void *a, size_t l) { (void)a; (void)l; return 0; }
 // POSIX shared memory — no cross-process shm on Horizon (single process).
 int shm_open(const char *name, int oflag, mode_t mode) { (void)name; (void)oflag; (void)mode; errno = ENOSYS; return -1; }
 int shm_unlink(const char *name) { (void)name; errno = ENOSYS; return -1; }
+
+// --- Signal-set builders (newlib leaves these to the port) ------------------------------------
+// Real bitmask ops. Signal *delivery* stays stubbed until phase 4, but code must still be able to
+// *build* a sigset (glibc/pthread setup does). These were aliased to the -ENOSYS stub, so even
+// sigemptyset() failed — a correctness bug that would break the first threaded/libc guest.
+// NB: newlib defines sig*set as function-like MACROS in <sys/signal.h>; box64's wrapper tables
+// take these by address, so we need real function symbols. #undef the macros, then define them
+// (matching newlib's own macro semantics: signals are 1-based, stored in a single unsigned long).
+#include <signal.h>
+#undef sigemptyset
+#undef sigfillset
+#undef sigaddset
+#undef sigdelset
+#undef sigismember
+int sigemptyset(sigset_t *set) { if (!set) { errno = EINVAL; return -1; } *set = 0UL;  return 0; }
+int sigfillset(sigset_t *set)  { if (!set) { errno = EINVAL; return -1; } *set = ~0UL; return 0; }
+int sigaddset(sigset_t *set, int signo) {
+    if (!set || signo < 1 || signo > (int)(8 * sizeof(*set))) { errno = EINVAL; return -1; }
+    *set |= (1UL << (signo - 1)); return 0;
+}
+int sigdelset(sigset_t *set, int signo) {
+    if (!set || signo < 1 || signo > (int)(8 * sizeof(*set))) { errno = EINVAL; return -1; }
+    *set &= ~(1UL << (signo - 1)); return 0;
+}
+int sigismember(const sigset_t *set, int signo) {
+    if (!set || signo < 1 || signo > (int)(8 * sizeof(*set))) { errno = EINVAL; return -1; }
+    return (*set & (1UL << (signo - 1))) ? 1 : 0;
+}
+
+// --- prctl: Horizon has none; satisfy the PR_SET_NAME box64 calls at startup (was -ENOSYS noise) --
+#include <sys/prctl.h>
+int prctl(int option, ...) {
+    if (option == PR_SET_NAME || option == PR_GET_NAME) return 0;   // thread name: accept + ignore
+    errno = ENOSYS; return -1;
+}
 
 // --- dlopen stubs (Horizon has no dynamic loading; STATICBUILD never calls these at runtime) --
 void *dlopen(const char *f, int fl) { (void)f; (void)fl; return NULL; }
@@ -339,17 +361,39 @@ long sysconf(int name) {
     switch (name) {
         case _SC_PAGESIZE:          return 4096;
         case _SC_NPROCESSORS_CONF:
-        case _SC_NPROCESSORS_ONLN:  return 3;      // homebrew applet cores
+        case _SC_NPROCESSORS_ONLN: {
+            u64 mask = 0;                                       // real core count from the process mask
+            if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && mask)
+                return (long)__builtin_popcountll(mask);
+            return 3;
+        }
         case _SC_CLK_TCK:           return 100;
         case _SC_OPEN_MAX:          return 1024;
-        case _SC_PHYS_PAGES:        return (long)((256UL * 1024 * 1024) / 4096);
-        case _SC_AVPHYS_PAGES:      return (long)((128UL * 1024 * 1024) / 4096);
+        case _SC_PHYS_PAGES: {
+            u64 total = 0;                                      // real per-process memory budget
+            if (R_SUCCEEDED(svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0)) && total)
+                return (long)(total / 4096);
+            return (long)((256UL * 1024 * 1024) / 4096);
+        }
+        case _SC_AVPHYS_PAGES: {
+            u64 total = 0, used = 0;
+            if (R_SUCCEEDED(svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0)) &&
+                R_SUCCEEDED(svcGetInfo(&used,  InfoType_UsedMemorySize,  CUR_PROCESS_HANDLE, 0)) && total >= used)
+                return (long)((total - used) / 4096);
+            return (long)((128UL * 1024 * 1024) / 4096);
+        }
         default:                    errno = EINVAL; return -1;
     }
 }
 int getpagesize(void) { return 4096; }
 
-long syscall(long number, ...) { (void)number; errno = ENOSYS; return -1; }
+long syscall(long number, ...) {
+    // The host has no Linux syscall; box64 routes its syscallwrap[] long tail through here, so an
+    // unimplemented number currently fails silently. Log it — phase 6 grows a real per-number
+    // dispatcher in this function; until then every miss is at least visible.
+    nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
+    errno = ENOSYS; return -1;
+}
 int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
     (void)fn; (void)stack; (void)flags; (void)arg; errno = ENOSYS; return -1;
 }
