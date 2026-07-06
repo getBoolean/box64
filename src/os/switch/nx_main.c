@@ -15,6 +15,7 @@
 #include <unistd.h>   // environ
 
 #include "core.h"     // initialize(), emulate(), x64emu_t, elfheader_t
+#include "nx_posix.h" // nx_vm_status() — which memory backend (arena vs heap fallback) is active
 
 // Default guest path on the SD card. Overridable at build time (-DNX_GUEST_PATH=... /
 // the NX_GUEST_PATH CMake cache var) or at runtime via argv[1].
@@ -61,6 +62,14 @@ int main(int argc, char **argv) {
 
     kdbg("nx_main: start\n");
     kout("box64 (Horizon)\nguest: %s\n\n", guest);
+
+    // Report the memory backend up front: the real svcMapPhysicalMemory arena (box64 as an NSP/title
+    // with system_resource_size>0) vs the heap fallback (plain hbloader NRO). Forces arena init, so
+    // this doubles as the on-device NSP-vs-NRO SystemResourceSize measurement (folds in resprobe).
+    { uintptr_t vb = 0; size_t vs = 0; unsigned long long sr = 0;
+      int st = nx_vm_status(&vb, &vs, &sr);
+      kout("nx_vm: %s sysres=0x%llx base=0x%llx size=0x%llx\n\n",
+           st == 1 ? "ARENA" : "heap-fallback", sr, (unsigned long long)vb, (unsigned long long)vs); }
     consoleUpdate(NULL);
 
     // box64 rewrites argv in place assuming the strings are contiguous (as a Linux kernel lays

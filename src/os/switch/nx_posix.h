@@ -6,6 +6,7 @@
 #ifdef __SWITCH__
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus
@@ -17,6 +18,9 @@ extern "C" {
 void *nx_mmap(void *addr, unsigned long length, int prot, int flags, int fd, ssize_t offset);
 int   nx_munmap(void *addr, unsigned long length);
 int   nx_vm_protect(void *addr, size_t len, int prot);   // real mprotect (none/R/RW); nx_virtmem.c
+// Startup diagnostic: 1 = real svcMapPhysicalMemory arena (NSP), -1 = heap fallback (NRO). Forces
+// arena init; fills the arena span and process SystemResourceSize. See nx_main.c.
+int   nx_vm_status(uintptr_t *base, size_t *size, unsigned long long *sysres);
 
 // Thread / scheduling.
 int nx_gettid(void);

@@ -163,6 +163,23 @@ static void vm_init(void) {
 
 static inline void vm_ensure_init(void) { if (!vm_ready) vm_init(); }
 
+// Report the active memory backend for a startup diagnostic (nx_main.c prints it to the console and,
+// on the NRO, streams it over nxlink). Forces arena init if it hasn't run yet (idempotent — vm_init
+// only reserves address space + trial-maps one page). Returns vm_ready (1 = real svcMapPhysicalMemory
+// arena, -1 = heap fallback); fills the arena span (0 on the fallback path) and the process
+// SystemResourceSize (the NPDM pool the arena needs; 0 on a plain NRO).
+int nx_vm_status(uintptr_t* base, size_t* size, unsigned long long* sysres) {
+    vm_ensure_init();
+    if (base) *base = vm_base;
+    if (size) *size = (size_t)(vm_end - vm_base);
+    if (sysres) {
+        u64 v = 0;
+        svcGetInfo(&v, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+        *sysres = (unsigned long long)v;
+    }
+    return vm_ready;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Heap fallback (box64.nro path): memalign-backed, with real free()-on-munmap for whole mappings.
 // ---------------------------------------------------------------------------------------------
