@@ -1456,10 +1456,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         COMMENT "Packaging box64.nro (Horizon homebrew)"
         VERBATIM)
 
-    # Also package as an NSP/title. A title's main.npdm declares system_resource_size, which the
-    # plain NRO cannot — that is what makes svcMapPhysicalMemory / svcSetMemoryPermission (real
-    # page-granular mmap + real mprotect, used by nx_virtmem.c) work. Unencrypted homebrew PFS0, so
-    # no keys are needed and Ryujinx loads it directly. (Real HW: install or run via a forwarder.)
+    # Also package as an NSP/title. A title's main.npdm can declare an Applet memory pool
+    # (pool_partition=1), which the plain NRO cannot — that is what lets nx_virtmem.c's UNSAFE backend
+    # use svcMapPhysicalMemoryUnsafe for real page-granular memory. This keyless PFS0 (build_pfs0) is
+    # UNENCRYPTED with no NCAs: Ryujinx loads it directly, but real HW (Goldleaf) rejects it — for real
+    # HW build a proper NCA NSP with hacBrewPack (see CLAUDE.local.md). NB: svcMapPhysicalMemory (the
+    # PHYS backend, needs system_resource_size>0) is a Ryujinx-only path — see box64-phys.json.
     find_program(ELF2NSO    elf2nso    PATHS "$ENV{DEVKITPRO}/tools/bin")
     find_program(NPDMTOOL   npdmtool   PATHS "$ENV{DEVKITPRO}/tools/bin")
     find_program(BUILD_PFS0 build_pfs0 PATHS "$ENV{DEVKITPRO}/tools/bin")

@@ -1,21 +1,21 @@
-// box64-nx — real virtual memory backend for the Horizon port (phase 1b / M1.3).
+// box64-nx — real virtual memory backend for the Horizon port (M1.3).
 //
-// Page-granular anonymous memory via Horizon's svcMapPhysicalMemory, over a reserved slice of the
-// process **Alias region**. This works only when the process declares system_resource_size > 0 in
-// its NPDM — i.e. box64 packaged as an NSP/title (see src/os/switch/box64.json). A plain hbloader
-// NRO has no such resource, so svcMapPhysicalMemory fails with KernelError_InvalidState. We detect
-// that at init with a one-page TRIAL MAP and, if it fails, fall back to the M1.1 heap allocator so
-// box64.nro keeps working (heap-backed, no real page permissions).
+// Page-granular anonymous memory at box64's chosen guest addresses, via a RUNTIME-SELECTED backend
+// (tried in order at init, one-page map+readback each):
+//   * UNSAFE — svcMapPhysicalMemoryUnsafe over a virtmemFindCodeMemory (ASLR/code) reservation. The
+//     only backend that yields REAL memory to a normally-launched application on real hardware: it
+//     needs NO system_resource_size, but the process must be in a non-Application memory pool
+//     (box64.json declares MemoryRegion=Applet -> pool_partition 1) and grant svc 0x48/0x49/0x4a, and
+//     the target VA must be in the AliasCode region (hence virtmemFindCodeMemory, not the Alias region).
+//   * PHYS — svcMapPhysicalMemory over the process Alias region. Needs system_resource_size>0, which a
+//     normal app CANNOT declare on real hardware (rejected at process creation) — but WORKS in Ryujinx
+//     (which never enforces that, implements 0x2c/0x2d, and does NOT implement the unsafe 0x48 trio).
+//     Kept for emulator arena testing and any ns-provisioned title.
+//   * HEAP — memalign-backed fallback (plain hbloader NRO, or when neither real backend is available).
 //
-// On the arena path we get: real fixed-address placement, real reclaim (svcUnmapPhysicalMemory),
-// and — because these pages are svcSetMemoryPermission-capable — a foundation for real mprotect and
-// SMC detection (wired in phase 3, once the fault handler exists; mprotect stays a no-op until then).
-//
-// box64 reserves a whole-image span with a non-FIXED map, then MAP_FIXED-places PT_LOAD segments
-// inside it: a non-FIXED map allocates+backs an arena range; a MAP_FIXED anonymous map lands inside
-// an already-backed range and just zeroes it; a file-backed / NULL MAP_FIXED is refused so box64
-// uses its own anon-map + fread fallback. Address-space accounting is a coalescing free list (static
-// node pool, so nothing here re-enters box64's allocator). Single-threaded for the M1 scope.
+// box64 reserves a whole-image span with a non-FIXED map, then MAP_FIXED-places PT_LOAD segments inside
+// it. Address-space accounting is a coalescing free list (static node pool, so nothing here re-enters
+// box64's allocator). Single-threaded for the M1 scope.
 
 #ifdef __SWITCH__
 
@@ -33,34 +33,55 @@
 #define VM_PAGEMASK (VM_PAGE - 1)
 #define VM_ROUND(x) (((x) + VM_PAGEMASK) & ~VM_PAGEMASK)
 
-// libnx's default __libnx_initheap sizes the newlib heap to (almost) all available physical memory,
-// leaving nothing for svcMapPhysicalMemory to map — so the guest arena would OutOfResource on its
-// first real allocation. Bound the newlib heap (used by box64's own malloc + the NRO heap-fallback
-// path) so the rest of physical RAM stays free for the arena (guest mmap). 2 MiB-aligned.
-#define NX_NEWLIB_HEAP 0x20000000ULL   // 512 MiB
+// --- newlib heap ---------------------------------------------------------------------------------
+// On an NRO, hbloader hands us a pre-mapped heap via the homebrew ABI — we MUST reuse it (calling
+// svcSetHeapSize instead yields a heap libnx's argvSetup then Data-Aborts on). As a title there is no
+// override, so we carve our own heap with svcSetHeapSize — but the amount available depends on the
+// process memory pool (an Applet-pool title has a smaller budget than the old Application-pool
+// assumption), so we retry DOWN from a generous size and NEVER leave the heap NULL (a null heap makes
+// the first malloc — inside consoleInit — Data-Abort, which is exactly the crash we saw as a title).
+// The guest arena no longer comes from this heap (it's the UNSAFE/PHYS pool), so it needn't be bounded
+// to "leave RAM for the arena".
 void __libnx_initheap(void) {
     extern char* fake_heap_start;
     extern char* fake_heap_end;
 
-    // When launched as an NRO, hbloader hands us a heap region via the homebrew ABI and has already
-    // mapped it. We MUST use that region (like libnx's default initheap does): calling svcSetHeapSize
-    // ourselves instead yields a heap that libnx's own argvSetup then memsets and faults on real
-    // hardware (Data Abort — the emulator tolerated it). Only when there is no loader override
-    // (i.e. box64 packaged as an NSP/title) do we carve our own bounded heap so the rest of physical
-    // RAM stays free for the svcMapPhysicalMemory arena.
     if (envHasHeapOverride()) {
         fake_heap_start = (char*)envGetHeapOverrideAddr();
         fake_heap_end   = (char*)envGetHeapOverrideAddr() + envGetHeapOverrideSize();
         return;
     }
-    void* base = NULL;
-    if (R_SUCCEEDED(svcSetHeapSize(&base, NX_NEWLIB_HEAP)) && base) {
-        fake_heap_start = (char*)base;
-        fake_heap_end   = (char*)base + NX_NEWLIB_HEAP;
+    static const u64 sizes[] = {
+        0x20000000ULL, 0x10000000ULL, 0x08000000ULL, 0x04000000ULL, 0x02000000ULL, 0x01000000ULL, 0x00200000ULL
+    };
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        void* base = NULL;
+        if (R_SUCCEEDED(svcSetHeapSize(&base, sizes[i])) && base) {
+            fake_heap_start = (char*)base;
+            fake_heap_end   = (char*)base + sizes[i];
+            return;
+        }
     }
+    // Last resort: a static .bss heap so newlib ALWAYS has a valid arena. If svcSetHeapSize grants
+    // nothing in this memory pool (an Applet-pool application appears to get no svcSetHeapSize budget
+    // on real HW), a null fake_heap_start makes the FIRST malloc — inside libnx's pre-main __appInit,
+    // before fsdev even mounts — Data-Abort with no possible diagnostics. A .bss buffer is mapped at
+    // load, so this can't fail; small, but enough to reach main, mount the SD, and run a tiny guest.
+    static __attribute__((aligned(0x1000))) char s_static_heap[16 * 1024 * 1024];
+    fake_heap_start = s_static_heap;
+    fake_heap_end   = s_static_heap + sizeof(s_static_heap);
 }
 
-static int vm_ready = 0;   // 0 = uninit, 1 = arena (svcMapPhysicalMemory), -1 = heap fallback
+// --- backend selection ---------------------------------------------------------------------------
+enum { VM_UNINIT = -1, VM_HEAP = 0, VM_PHYS = 1, VM_UNSAFE = 2 };
+static int vm_backend = VM_UNINIT;
+
+#define VM_UNSAFE_LIMIT  0x10000000ULL    // 256 MiB system-wide unsafe cap (svcSetUnsafeLimit). Modest
+                                          // on purpose: the unsafe pool IS the Application pool, so an
+                                          // over-large cap destabilises the system (audio/omm) when an
+                                          // app is suspended there. Tunable up once launched app-pool-free.
+#define VM_RESERVE_SIZE  0x40000000ULL    // 1 GiB VA reservation for the guest arena; physical use is
+                                          // bounded by VM_UNSAFE_LIMIT / the pool, not this. Tunable.
 
 // ---------------------------------------------------------------------------------------------
 // Arena allocator over [vm_base, vm_end): a coalescing free list of address-space intervals.
@@ -126,48 +147,100 @@ static int vm_in_arena(uintptr_t a, size_t len) {
     return vm_base && a >= vm_base && a + len <= vm_end && a + len >= a;
 }
 
-static void vm_init(void) {
+// Map/unmap one arena range with the active backend's SVC.
+static Result vm_map(void* addr, size_t size) {
+    return (vm_backend == VM_UNSAFE) ? svcMapPhysicalMemoryUnsafe(addr, size)
+                                     : svcMapPhysicalMemory(addr, size);
+}
+static Result vm_unmap(void* addr, size_t size) {
+    return (vm_backend == VM_UNSAFE) ? svcUnmapPhysicalMemoryUnsafe(addr, size)
+                                     : svcUnmapPhysicalMemory(addr, size);
+}
+
+// Reset the node pool + free list over [base, base+size), tag the backend, and TRIAL-map one page:
+// map + write + readback (confirms real memory even if an emulator no-ops the SVC) + unmap. Returns 1
+// if the backend is usable (committed state left in vm_base/vm_end/vm_free/vm_backend), else 0.
+static int vm_try(uintptr_t base, size_t size, int backend) {
     for (int i = 0; i < VM_NODES - 1; i++) vm_pool[i].next = &vm_pool[i + 1];
     vm_pool[VM_NODES - 1].next = NULL;
     vm_nodefree = &vm_pool[0];
 
-    u64 abase = 0, asize = 0;
-    if (R_FAILED(svcGetInfo(&abase, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0)) ||
-        R_FAILED(svcGetInfo(&asize, InfoType_AliasRegionSize,    CUR_PROCESS_HANDLE, 0)) ||
-        !abase || asize < 0x200000) {
-        vm_ready = -1; return;
-    }
-    virtmemLock();
-    vm_resv = virtmemAddReservation((void*)(uintptr_t)abase, (size_t)asize);
-    virtmemUnlock();
-    if (!vm_resv) { vm_ready = -1; return; }
+    vm_base = base; vm_end = base + size;
+    vm_free = node_get(base, size);
+    if (!vm_free) return 0;
+    vm_backend = backend;
 
-    vm_base = (uintptr_t)abase; vm_end = (uintptr_t)(abase + asize);
-    vm_free = node_get(vm_base, (size_t)asize);
-    if (!vm_free) { vm_ready = -1; return; }
-
-    // Trial map one page: on an NRO (no system_resource_size) this fails -> heap fallback; on the
-    // NSP it succeeds -> real arena.
     uintptr_t t = vm_reserve(VM_PAGE);
-    if (!t || R_FAILED(svcMapPhysicalMemory((void*)t, VM_PAGE))) {
+    if (!t || R_FAILED(vm_map((void*)t, VM_PAGE))) {
         if (t) vm_release(t, VM_PAGE);
-        virtmemLock(); virtmemRemoveReservation(vm_resv); virtmemUnlock();
-        vm_resv = NULL; vm_free = NULL; vm_base = vm_end = 0;
-        vm_ready = -1; return;
+        return 0;
     }
-    svcUnmapPhysicalMemory((void*)t, VM_PAGE);
+    volatile u32* p = (volatile u32*)t; *p = 0xC0DE1234u;
+    int ok = (*p == 0xC0DE1234u);
+    vm_unmap((void*)t, VM_PAGE);
     vm_release(t, VM_PAGE);
-    vm_ready = 1;
-    { char b[96]; int n = snprintf(b, sizeof b, "nx_vm: ARENA ready base=0x%llx size=0x%llx\n", (unsigned long long)vm_base, (unsigned long long)asize); svcOutputDebugString(b, n); }
+    return ok;
 }
 
-static inline void vm_ensure_init(void) { if (!vm_ready) vm_init(); }
+static void vm_reset_state(void) {
+    if (vm_resv) { virtmemLock(); virtmemRemoveReservation(vm_resv); virtmemUnlock(); vm_resv = NULL; }
+    vm_free = NULL; vm_base = vm_end = 0; vm_backend = VM_UNINIT;
+}
+
+static void vm_init(void) {
+    // --- 1) UNSAFE (real-HW application path) ---------------------------------------------------
+    // Gate on detectMesosphere(): only real hardware (Atmosphère) implements the unsafe SVCs — Ryujinx
+    // THROWS NotImplementedException on svcSetUnsafeLimit/svcMapPhysicalMemoryUnsafe (a crash, not an
+    // error), so we must never call them there. Then require the SVC be granted (an ungranted SVC also
+    // FAULTS): a title (no hbloader heap override) has it from box64.json; an NRO must be syscall-hinted.
+    if (detectMesosphere() && (!envHasHeapOverride() || envIsSyscallHinted(0x48))) {
+        svcSetUnsafeLimit(VM_UNSAFE_LIMIT);   // system-wide cap; harmless/no-op where unimplemented
+        void* rbase = NULL;
+        virtmemLock();
+        rbase = virtmemFindCodeMemory(VM_RESERVE_SIZE, 0);
+        if (rbase) vm_resv = virtmemAddReservation(rbase, VM_RESERVE_SIZE);
+        virtmemUnlock();
+        if (rbase && vm_resv) {
+            if (vm_try((uintptr_t)rbase, VM_RESERVE_SIZE, VM_UNSAFE)) {
+                char b[112]; int n = snprintf(b, sizeof b,
+                    "nx_vm: UNSAFE ready base=0x%llx size=0x%llx\n",
+                    (unsigned long long)vm_base, (unsigned long long)VM_RESERVE_SIZE);
+                svcOutputDebugString(b, n);
+                return;
+            }
+        }
+        vm_reset_state();
+    }
+
+    // --- 2) PHYS (Ryujinx / ns-provisioned title with system_resource_size>0) -------------------
+    u64 abase = 0, asize = 0;
+    if (R_SUCCEEDED(svcGetInfo(&abase, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0)) &&
+        R_SUCCEEDED(svcGetInfo(&asize, InfoType_AliasRegionSize,    CUR_PROCESS_HANDLE, 0)) &&
+        abase && asize >= 0x200000) {
+        virtmemLock();
+        vm_resv = virtmemAddReservation((void*)(uintptr_t)abase, (size_t)asize);
+        virtmemUnlock();
+        if (vm_resv && vm_try((uintptr_t)abase, (size_t)asize, VM_PHYS)) {
+            char b[112]; int n = snprintf(b, sizeof b,
+                "nx_vm: PHYS ready base=0x%llx size=0x%llx\n",
+                (unsigned long long)vm_base, (unsigned long long)asize);
+            svcOutputDebugString(b, n);
+            return;
+        }
+        vm_reset_state();
+    }
+
+    // --- 3) HEAP fallback -----------------------------------------------------------------------
+    vm_backend = VM_HEAP;
+    svcOutputDebugString("nx_vm: heap-fallback\n", 20);
+}
+
+static inline void vm_ensure_init(void) { if (vm_backend == VM_UNINIT) vm_init(); }
 
 // Report the active memory backend for a startup diagnostic (nx_main.c prints it to the console and,
-// on the NRO, streams it over nxlink). Forces arena init if it hasn't run yet (idempotent — vm_init
-// only reserves address space + trial-maps one page). Returns vm_ready (1 = real svcMapPhysicalMemory
-// arena, -1 = heap fallback); fills the arena span (0 on the fallback path) and the process
-// SystemResourceSize (the NPDM pool the arena needs; 0 on a plain NRO).
+// on the NRO, streams it over nxlink). Forces backend selection if it hasn't run yet. Returns the
+// backend (VM_HEAP=0, VM_PHYS=1, VM_UNSAFE=2); fills the arena span (0 on heap) and the process
+// SystemResourceSize (0 on a normal app / NRO; non-zero only on a PHYS/provisioned title).
 int nx_vm_status(uintptr_t* base, size_t* size, unsigned long long* sysres) {
     vm_ensure_init();
     if (base) *base = vm_base;
@@ -177,7 +250,7 @@ int nx_vm_status(uintptr_t* base, size_t* size, unsigned long long* sysres) {
         svcGetInfo(&v, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
         *sysres = (unsigned long long)v;
     }
-    return vm_ready;
+    return vm_backend;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -213,21 +286,22 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
     size_t rounded = VM_ROUND(length);
 
     vm_ensure_init();
-    if (vm_ready != 1)
+    if (vm_backend == VM_HEAP)
         return nx_mmap_heap(addr, rounded, flags);
 
+    // PHYS or UNSAFE arena
     if (flags & MAP_FIXED) {
         if (!(flags & MAP_ANONYMOUS) || !addr) { errno = ENODEV; return MAP_FAILED; }
         uintptr_t a = (uintptr_t)addr;
         if (vm_in_arena(a, rounded)) { memset(addr, 0, rounded); return addr; }   // pages already backed
-        if (R_FAILED(svcMapPhysicalMemory(addr, rounded))) { errno = ENOMEM; return MAP_FAILED; }
+        if (R_FAILED(vm_map(addr, rounded))) { errno = ENOMEM; return MAP_FAILED; }
         memset(addr, 0, rounded);
         return addr;
     }
 
     uintptr_t a = vm_reserve(rounded);
     if (!a) { errno = ENOMEM; return MAP_FAILED; }
-    if (R_FAILED(svcMapPhysicalMemory((void*)a, rounded))) {
+    if (R_FAILED(vm_map((void*)a, rounded))) {
         vm_release(a, rounded);
         errno = ENOMEM;
         return MAP_FAILED;
@@ -241,23 +315,24 @@ int nx_munmap(void* addr, unsigned long length) {
     size_t rounded = VM_ROUND(length);
     uintptr_t a = (uintptr_t)addr;
 
-    if (vm_ready == 1 && vm_in_arena(a, rounded)) {
-        svcUnmapPhysicalMemory(addr, rounded);   // real reclaim of the physical pages...
-        vm_release(a, rounded);                  // ...and the address range
+    if (vm_backend != VM_HEAP && vm_in_arena(a, rounded)) {
+        vm_unmap(addr, rounded);   // real reclaim of the physical pages...
+        vm_release(a, rounded);    // ...and the address range
         return 0;
     }
-    if (hb_untrack(a)) free(addr);               // heap-fallback whole-block reclaim
+    if (hb_untrack(a)) free(addr); // heap-fallback whole-block reclaim
     return 0;
 }
 
-// Page permissions. Real svcSetMemoryPermission works on arena pages (NSP), but enforcing RO before
-// the phase-2 fault handler exists would crash box64's protectDB path — so this stays a no-op until
-// phase 3 wires it up together with SMC detection. Surface any executable request once.
+// Page permissions. Real svcSetMemoryPermission works on arena pages (None/R/RW), but enforcing RO
+// before the SMC fault handler exists would crash box64's protectDB path — so this stays a no-op until
+// that lands. Surface any executable request once (box64 never executes guest pages; exec is the jit
+// code-memory path, not this).
 int nx_vm_protect(void* addr, size_t len, int prot) {
     (void)addr; (void)len;
     if (prot & PROT_EXEC) {
         static int warned = 0;
-        if (!warned) { warned = 1; svcOutputDebugString("nx_vm: mprotect(PROT_EXEC) no-op (real perms land in phase 3)\n", 61); }
+        if (!warned) { warned = 1; svcOutputDebugString("nx_vm: mprotect(PROT_EXEC) no-op\n", 32); }
     }
     return 0;
 }
