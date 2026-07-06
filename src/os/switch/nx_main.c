@@ -95,13 +95,18 @@ int main(int argc, char **argv) {
     // Report the active memory backend up front: UNSAFE (real svcMapPhysicalMemoryUnsafe arena — an
     // Applet-pool NSP on real HW), PHYS (svcMapPhysicalMemory arena — Ryujinx / provisioned title), or
     // heap-fallback (plain NRO). Forces backend selection; sysres is non-zero only on the PHYS path.
+    // heap = the newlib heap libnx handed us (svcSetHeapSize on a title). On the heap-fallback backend
+    // THIS is the guest's real memory, so report it: it distinguishes a real Application-pool heap
+    // (hundreds of MiB) from the 16 MiB static-.bss last resort.
+    extern char *fake_heap_start, *fake_heap_end;
+    unsigned long long heap_sz = (unsigned long long)(fake_heap_end - fake_heap_start);
     { uintptr_t vb = 0; size_t vs = 0; unsigned long long sr = 0;
       int st = nx_vm_status(&vb, &vs, &sr);
       const char *name = (st == 2) ? "UNSAFE" : (st == 1) ? "PHYS" : "heap-fallback";
-      kout("nx_vm: %s sysres=0x%llx base=0x%llx size=0x%llx\n\n",
-           name, sr, (unsigned long long)vb, (unsigned long long)vs);
-      char rb[160]; snprintf(rb, sizeof rb, "backend=%s sysres=0x%llx base=0x%llx size=0x%llx",
-           name, sr, (unsigned long long)vb, (unsigned long long)vs); rlog(rb); }
+      kout("nx_vm: %s heap=0x%llx sysres=0x%llx base=0x%llx size=0x%llx\n\n",
+           name, heap_sz, sr, (unsigned long long)vb, (unsigned long long)vs);
+      char rb[192]; snprintf(rb, sizeof rb, "backend=%s heap=0x%llx sysres=0x%llx base=0x%llx size=0x%llx",
+           name, heap_sz, sr, (unsigned long long)vb, (unsigned long long)vs); rlog(rb); }
     consoleUpdate(NULL);
 
     // box64 rewrites argv in place assuming the strings are contiguous (as a Linux kernel lays

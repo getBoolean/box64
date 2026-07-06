@@ -51,8 +51,11 @@ void __libnx_initheap(void) {
         fake_heap_end   = (char*)envGetHeapOverrideAddr() + envGetHeapOverrideSize();
         return;
     }
+    // Descending: a consistent Application-pool NSP (pool_partition 0 + application_type Application)
+    // can carve a large heap from the ~3.2 GiB Application pool, so start at 1 GiB of REAL memory and
+    // fall back if the pool is tighter. (An Applet-pool/album host has far less; the retry covers it.)
     static const u64 sizes[] = {
-        0x20000000ULL, 0x10000000ULL, 0x08000000ULL, 0x04000000ULL, 0x02000000ULL, 0x01000000ULL, 0x00200000ULL
+        0x40000000ULL, 0x20000000ULL, 0x10000000ULL, 0x08000000ULL, 0x04000000ULL, 0x02000000ULL, 0x01000000ULL, 0x00200000ULL
     };
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
         void* base = NULL;

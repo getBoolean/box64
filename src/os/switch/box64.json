@@ -8,7 +8,7 @@
     "is_64_bit": true,
     "address_space_type": 3,
     "process_category": 0,
-    "pool_partition": 1,
+    "pool_partition": 0,
     "main_thread_stack_size": "0x100000",
     "main_thread_priority": 44,
     "default_cpu_id": 0,
@@ -99,6 +99,9 @@
             "svcCreateCodeMemory": "0x4b",
             "svcControlCodeMemory": "0x4c"
         }
+    }, {
+        "type": "application_type",
+        "value": 1
     }, {
         "type": "min_kernel_version",
         "value": "0x0030"
