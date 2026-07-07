@@ -121,7 +121,20 @@ void SetupInitialStack(x64emu_t *emu)
     elfheader_t* main = my_context->elfs[0];
     Push64(emu, 0); Push64(emu, 0);                         //AT_NULL(0)=0
     Push64(emu, main->fileno); Push64(emu, 2);   //AT_EXECFD=file desciptor of program
+#ifdef __SWITCH__
+    // KurokoNX M2.1: for the real-ld.so path, AT_PHDR must be the program headers AS MAPPED in the guest
+    // (main base + PT_PHDR.p_vaddr), because ld.so derives the main program's load base from
+    // AT_PHDR - PT_PHDR.p_vaddr. box64's parsed PHEntries copy has the right *contents* but the wrong
+    // *address*, which would hand ld.so a garbage base (-> program PT_DYNAMIC not found -> link_map
+    // l_info stays NULL -> crash). Fall back to the copy if PT_PHDR is absent.
+    { uintptr_t kx_phdr = (uintptr_t)main->PHEntries._64;
+      for (size_t i = 0; i < main->numPHEntries; ++i)
+          if (main->PHEntries._64[i].p_type == PT_PHDR) { kx_phdr = (uintptr_t)(main->delta + main->PHEntries._64[i].p_vaddr); break; }
+      Push64(emu, kx_phdr); }
+    Push64(emu, 3);                          //AT_PHDR(3)=address of the PH of the executable (mapped)
+#else
     Push64(emu, (uintptr_t)main->PHEntries._64); Push64(emu, 3);                          //AT_PHDR(3)=address of the PH of the executable
+#endif
     Push64(emu, sizeof(Elf64_Phdr)); Push64(emu, 4);                          //AT_PHENT(4)=size of PH entry
     Push64(emu, main->numPHEntries); Push64(emu, 5);                          //AT_PHNUM(5)=number of elf headers
     Push64(emu, box64_pagesize); Push64(emu, 6);            //AT_PAGESZ(6)
