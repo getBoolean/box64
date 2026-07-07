@@ -30,6 +30,8 @@
 #include <sys/mman.h>   // PROT_*/MAP_* (box64-nx shim)
 #include <unistd.h>     // read/lseek (M2.1 file-backed mmap)
 
+extern void nx_result_log(const char*);   // nx_main.c: heap-free SD result line (HW crash-diag channel)
+
 #define VM_PAGE     0x1000UL
 #define VM_PAGEMASK (VM_PAGE - 1)
 #define VM_ROUND(x) (((x) + VM_PAGEMASK) & ~VM_PAGEMASK)
@@ -344,6 +346,11 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
             }
         }
         if (save != (off_t)-1) lseek(fd, save, SEEK_SET);
+        // Marker: the guest ld.so file-backs libc's (and other .so) segments here. On real HW this is
+        // the only way to learn the runtime load base of libc, so a creport's guest RIP (X[27]) can be
+        // resolved to libc+offset. Cheap: only a handful of these per run (one per PT_LOAD of each .so).
+        { char b[128]; snprintf(b, sizeof b, "mmap file fd=%d off=0x%lx len=0x%lx -> 0x%lx",
+                   fd, (unsigned long)offset, (unsigned long)length, (unsigned long)p); nx_result_log(b); }
         return p;
     }
     (void)offset;

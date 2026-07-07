@@ -753,6 +753,9 @@ int convert_bitmask(uint64_t bitmask);
 #define MSR_fpsr(Rt)                    EMIT(MRS_gen(0, 1, 3, 4, 4, 1, Rt))
 // mrs   x0, cntvct_el0     op0=0b11 op1=0b011 CRn=0b1110 CRm=0b0000 op2=0b010
 #define MRS_cntvct_el0(Rt)              EMIT(MRS_gen(1, 1, 0b011, 0b1110, 0b0000, 0b010, Rt))
+// mrs   x0, cntpct_el0     op0=0b11 op1=0b011 CRn=0b1110 CRm=0b0000 op2=0b001
+// (physical counter — the ARMv8.0 one Horizon leaves EL0-readable, unlike the virtual CNTVCT_EL0)
+#define MRS_cntpct_el0(Rt)              EMIT(MRS_gen(1, 1, 0b011, 0b1110, 0b0000, 0b001, Rt))
 // mrs   x0, cntpctss_el0   op0=0b11 op1=0b011 CRn=0b1110 CRm=0b0000 op2=0b101
 #define MRS_cntpctss_el0(Rt)            EMIT(MRS_gen(1, 1, 0b011, 0b1110, 0b0000, 0b101, Rt))
 // mrs   rt, rndr           op0=0b11 op1=0b011 CRn=0b0010 CRm=0b0100 op2=0b000

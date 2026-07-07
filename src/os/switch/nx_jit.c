@@ -12,6 +12,10 @@
 
 #include <switch.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+extern void nx_result_log(const char*);   // nx_main.c: heap-free SD result line (HW JIT-alloc trace)
+static int nx_jit_seq = 0;
 
 #define NX_JIT_PAGE 0x1000ULL
 
@@ -53,6 +57,9 @@ void* nx_jit_alloc(size_t size, int64_t* out_rw_bias)
 
     void* rw = jitGetRwAddr(&node->jit);
     void* rx = jitGetRxAddr(&node->jit);
+    { char b[160]; snprintf(b, sizeof b, "jit#%d size=0x%zx rw=0x%lx rx=0x%lx bias=0x%lx type=%d",
+              nx_jit_seq++, size, (unsigned long)rw, (unsigned long)rx,
+              (unsigned long)((intptr_t)rw - (intptr_t)rx), (int)node->jit.type); nx_result_log(b); }
     if (out_rw_bias)
         *out_rw_bias = (int64_t)((intptr_t)rw - (intptr_t)rx);
     return rw;

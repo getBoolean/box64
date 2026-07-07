@@ -33,7 +33,7 @@ static uint8_t dummy_code[] = {0x90, 0xc3}; // some dummy code so update_flags d
 void* create_updateflags()
 {
     if(updaflags_arm64)
-        return updaflags_arm64->block;
+        return dynarec_rx(updaflags_arm64->block);  // box64-nx (M2.1): rx alias — see the return below
     uint64_t jmp_df[d_unknown+1] = {0};
     dynarec_arm_t helper = {0};
     instruction_arm64_t insts[1] = {0};
@@ -129,5 +129,10 @@ void* create_updateflags()
     ClearCache(actual_p+sizeof(void*), native_size);   // need to clear the cache before execution...
 
     updaflags_arm64 = block;
-    return block->block;
+    // box64-nx (M2.1): callers do `BLR x1` to this gadget, so hand back the EXECUTABLE (`rx`) alias.
+    // block->block is the writable (`rw`) alias on Switch; returning it made every deferred-flags
+    // recompute (BLR const_updateflags_arm64, dynarec_arm64_helper.c) branch into non-executable rw
+    // memory -> Instruction Abort on real HW. The simple M1 guests never hit the deferred-flags path,
+    // so this only surfaced with glibc. dynarec_rx() is the identity on every non-Switch target.
+    return dynarec_rx(block->block);
 }

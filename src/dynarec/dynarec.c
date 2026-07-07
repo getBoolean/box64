@@ -127,7 +127,11 @@ void* LinkNextInvalid(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
                 }
             }
             if(jblock)
-                return jblock;
+                return dynarec_rx(jblock);  // box64-nx (M1.2): branch to the executable (`rx`) alias on
+                                            // Switch — same as LinkNext (line ~105). Missing this made
+                                            // the invalidate-then-relink (self-modifying-code) path jump
+                                            // to the writable `rw` alias -> Instruction Abort. glibc's
+                                            // ld.so relocates its own code pages, so it hits this path.
         }
     }
     return LinkNext(emu, addr, x2, x3);

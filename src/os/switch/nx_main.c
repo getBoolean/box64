@@ -40,6 +40,38 @@ static void rlog(const char *s) {
     fsdevCommitDevice("sdmc");
 }
 
+// Exported so the loader reroute (core.c) and the mmap libos (nx_virtmem.c) can drop load-address
+// markers into the SAME result file. On real HW this is the only crash-diagnostics channel (no
+// svcOutputDebugString capture), so it's how we turn a creport's guest RIP (X[27]) into lib+offset.
+void nx_result_log(const char *s) { rlog(s); }
+
+// Optional runtime tuning WITHOUT a rebuild: read sdmc:/box64/box64.env and setenv each KEY=VALUE line
+// (blank / '#' lines skipped). Horizon has no shell env, so this is how we flip BOX64_DYNAREC / BOX64_LOG
+// etc. over FTP between hardware runs. Overwrites, so the file wins over the compiled-in defaults.
+static void load_env_file(void) {
+    int fd = open("sdmc:/box64/box64.env", O_RDONLY);
+    if (fd < 0) return;
+    static char buf[1024];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n' && *p != '\r') ++p;
+        if (*p) *p++ = 0;
+        while (*p == '\n' || *p == '\r') ++p;
+        while (*line == ' ' || *line == '\t') ++line;
+        if (*line == '#' || !*line) continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+        { char b[160]; snprintf(b, sizeof b, "env %s=%s", line, eq + 1); rlog(b); }
+    }
+}
+
 // nxlink host socket (>=0 only when launched via nxlink) — lets a hardware run stream box64's
 // status/result to the PC terminal while it also shows on the Switch console.
 static int g_nxlink_fd = -1;
@@ -132,6 +164,7 @@ int main(int argc, char **argv) {
     // svcOutputDebugString, which Ryujinx logs). 2=verbose (lib load, reloc, KX reroute markers).
     // TODO(M2.1 close-out): gate behind a compile flag / lower once the dynamic-glibc path is green.
     setenv("BOX64_LOG", "2", 1);
+    load_env_file();   // FTP-flippable overrides (e.g. BOX64_DYNAREC=0 to force the interpreter on HW)
     if (initialize(2, b_argv, environ, &emu, &elf, 1)) {
         kdbg("nx_main: initialize failed\n");
         kout("box64: initialize failed (guest missing or not a valid x86-64 ELF?)\n");

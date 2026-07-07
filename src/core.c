@@ -781,6 +781,7 @@ extern char** environ;
 // fake ld.so), so the real ld.so loads + relocates glibc and builds _rtld_global itself. box64 is only
 // the x86-64 engine + the Horizon syscall libos. See experiments/m2-emu-vehicle-spike/FINDINGS.md.
 static uintptr_t kx_interp_ep = 0;   // set => emulate() jumps to the real ld.so entry, not the program's
+extern void nx_result_log(const char*);   // nx_main.c: heap-free SD result line (only HW crash channel)
 // Map the interpreter ELF into memory (segments only; ld.so self-relocates via AT_BASE). Returns its
 // elfheader (->delta = load base, ->entrypoint = entry vaddr), or NULL on failure.
 static elfheader_t* kx_load_interp(box64context_t* context)
@@ -802,6 +803,7 @@ static elfheader_t* kx_load_interp(box64context_t* context)
     if(AllocLoadElfMemory(context, h, 0)) { printf_log(LOG_NONE, "KX: AllocLoadElfMemory(interp) failed\n"); return NULL; }
     AddElfHeader(context, h);
     printf_log(LOG_INFO, "KX: interp %s mapped base=%p entry=%p\n", path, (void*)h->delta, (void*)(h->entrypoint+h->delta));
+    { char b[128]; snprintf(b, sizeof b, "KX interp base=0x%lx entry=0x%lx", (unsigned long)h->delta, (unsigned long)(h->entrypoint+h->delta)); nx_result_log(b); }
     return h;
 }
 #endif
@@ -1574,6 +1576,8 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
         }
         printf_log(LOG_INFO, "KX: run real ld.so entry=%p base=%p, program entry=%p (box64 librarian bypassed)\n",
                    (void*)kx_interp_ep, (void*)interp->delta, (void*)prog_ep);
+        { char b[160]; snprintf(b, sizeof b, "KX reroute ldso_ep=0x%lx ldso_base=0x%lx prog_base=0x%lx prog_ep=0x%lx",
+                   (unsigned long)kx_interp_ep, (unsigned long)interp->delta, (unsigned long)elf_header->delta, (unsigned long)prog_ep); nx_result_log(b); }
     } else
 #endif
     {

@@ -107,7 +107,11 @@ uintptr_t dynarec64_0F(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                     if(box64_rdtsc) {
                         CALL_(const_readtsc, x1, x3);
                     } else {
+#ifdef __SWITCH__
+                        MRS_cntpct_el0(x1);   // Horizon traps EL0 CNTVCT_EL0 -> use the physical counter
+#else
                         MRS_cntvct_el0(x1);
+#endif
                     }
                     if(box64_rdtsc_shift) {
                         LSLx(x1, x1, box64_rdtsc_shift);
@@ -592,7 +596,11 @@ uintptr_t dynarec64_0F(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
             if(box64_rdtsc) {
                 CALL_(const_readtsc, x1, x3);
             } else {
+#ifdef __SWITCH__
+                MRS_cntpct_el0(x1);   // Horizon traps EL0 CNTVCT_EL0 -> use the physical counter
+#else
                 MRS_cntvct_el0(x1);
+#endif
             }
             if(box64_rdtsc_shift) {
                 LSLx(x1, x1, box64_rdtsc_shift);
