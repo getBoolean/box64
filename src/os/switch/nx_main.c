@@ -128,6 +128,10 @@ int main(int argc, char **argv) {
     int code = -1;
 
     rlog("pre-initialize");
+    // M2.1 bring-up: no shell env on Horizon, so inject box64's log level here (printf_log ->
+    // svcOutputDebugString, which Ryujinx logs). 2=verbose (lib load, reloc, KX reroute markers).
+    // TODO(M2.1 close-out): gate behind a compile flag / lower once the dynamic-glibc path is green.
+    setenv("BOX64_LOG", "2", 1);
     if (initialize(2, b_argv, environ, &emu, &elf, 1)) {
         kdbg("nx_main: initialize failed\n");
         kout("box64: initialize failed (guest missing or not a valid x86-64 ELF?)\n");

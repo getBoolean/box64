@@ -540,6 +540,15 @@ void LoadLDPath(box64context_t *context)
             AddPath("/data/data/com.termux/files/usr/lib/x86_64-linux-gnu", &context->box64_ld_lib, 1);
     }
     #endif
+    #ifdef __SWITCH__
+    // M2 (KurokoNX): Horizon has no /lib/x86_64-linux-gnu; the guest's real x86-64 .so's (ld-linux,
+    // libc, ...) are staged here. FileExist/fopen resolve the libnx VFS prefixes (fsdev 'sdmc:',
+    // romfs 'romfs:'). sdmc first (user-updatable over FTP), romfs second (embedded in the NRO).
+    if(FileExist("sdmc:/box64/lib", 0))
+        AddPath("sdmc:/box64/lib", &context->box64_ld_lib, 1);
+    if(FileExist("romfs:/lib", 0))
+        AddPath("romfs:/lib", &context->box64_ld_lib, 1);
+    #endif
     if(getenv("LD_LIBRARY_PATH"))
         PrependList(&context->box64_ld_lib, getenv("LD_LIBRARY_PATH"), 1);   // in case some of the path are for x86 world
 }
@@ -766,6 +775,36 @@ static void add_argv(const char* what) {
 void pressure_vessel(int argc, const char** argv, int nextarg, const char* prog);
 #endif
 extern char** environ;
+
+#ifdef __SWITCH__
+// KurokoNX M2.1: run the guest's REAL ld-linux-x86-64.so.2 as emulated x86-64 code (instead of box64's
+// fake ld.so), so the real ld.so loads + relocates glibc and builds _rtld_global itself. box64 is only
+// the x86-64 engine + the Horizon syscall libos. See experiments/m2-emu-vehicle-spike/FINDINGS.md.
+static uintptr_t kx_interp_ep = 0;   // set => emulate() jumps to the real ld.so entry, not the program's
+// Map the interpreter ELF into memory (segments only; ld.so self-relocates via AT_BASE). Returns its
+// elfheader (->delta = load base, ->entrypoint = entry vaddr), or NULL on failure.
+static elfheader_t* kx_load_interp(box64context_t* context)
+{
+    static const char* cands[] = {
+        "sdmc:/box64/lib/ld-linux-x86-64.so.2",
+        "romfs:/lib/ld-linux-x86-64.so.2",
+        NULL
+    };
+    FILE* f = NULL; const char* path = NULL;
+    for(int i=0; cands[i]; ++i) { f = fopen(cands[i], "rb"); if(f) { path = cands[i]; break; } }
+    if(!f) { printf_log(LOG_NONE, "KX: interpreter ld-linux-x86-64.so.2 not found on sdmc:/ or romfs:/\n"); return NULL; }
+    elfheader_t* h = LoadAndCheckElfHeader(f, path, 0);  // 0 = library, not the main exe
+    if(!h) { fclose(f); printf_log(LOG_NONE, "KX: %s is not a valid x86-64 ELF\n", path); return NULL; }
+    // NB: keep the file open through AllocLoadElfMemory — it reads the PT_LOAD segment data from the
+    // FILE stored in the elfheader. (Mirrors loadEmulatedLib() in library.c, which closes early only on
+    // a bad header.) CalcLoadAddr picks a base; AllocLoadElfMemory maps + reads the segments.
+    if(CalcLoadAddr(h))                   { printf_log(LOG_NONE, "KX: CalcLoadAddr(interp) failed\n"); return NULL; }
+    if(AllocLoadElfMemory(context, h, 0)) { printf_log(LOG_NONE, "KX: AllocLoadElfMemory(interp) failed\n"); return NULL; }
+    AddElfHeader(context, h);
+    printf_log(LOG_INFO, "KX: interp %s mapped base=%p entry=%p\n", path, (void*)h->delta, (void*)(h->entrypoint+h->delta));
+    return h;
+}
+#endif
 
 int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elfheader_t** elfheader, int exec)
 {
@@ -1018,6 +1057,12 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
     // is later box_strdup()'d and manipulated (box86 detection, re-exec), which would strdup(NULL).
     if(!my_context->box64path)
         my_context->box64path = box_strdup("sdmc:/box64");
+    // M2.1 (KurokoNX): a dynamic guest runs its OWN real glibc via the real ld.so (see the reroute in
+    // LoadEmulator below and experiments/m2-emu-vehicle-spike/FINDINGS.md). box64 does NOT wrap libc and
+    // does NOT run its librarian for the guest — the real ld-linux loads + relocates glibc itself, so
+    // there's nothing to force into box64_emulated_libs here; libc is loaded by ld.so at runtime via the
+    // Horizon syscall libos (nx_posix.c). The SD/romfs search paths added in LoadLDPath let both box64's
+    // interp-load and ld.so's VFS find the staged x86-64 .so's.
 #endif
     // prepare all other env. var
     my_context->envc = CountEnv(environ?environ:env);
@@ -1511,6 +1556,27 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
         }
     }
     FreeCollection(&ld_preload);
+#ifdef __SWITCH__
+    // KurokoNX M2.1: a dynamically-linked guest runs its OWN real ld-linux + glibc. Load the real
+    // interpreter and hand control to it; ld.so loads/relocates glibc + the main elf and sets up TLS
+    // itself. box64's librarian/relocator is bypassed entirely (it fakes ld.so and NULL-derefs
+    // _rtld_global — see experiments/m2-emu-vehicle-spike/FINDINGS.md). box64 stays only the x86-64
+    // engine + the syscall libos (nx_posix.c).
+    if(NeededLibs(elf_header) > 0) {
+        elfheader_t* interp = kx_load_interp(my_context);
+        if(!interp) { FreeBox64Context(&my_context); return -1; }
+        kx_interp_ep = interp->entrypoint + interp->delta;   // emulate() jumps here, not the program entry
+        uintptr_t prog_ep = elf_header->entrypoint + elf_header->delta;
+        // Patch the auxv the real ld.so reads: AT_BASE(7)=interp load base, AT_ENTRY(9)=program entry.
+        if(my_context->auxval_start) {
+            uintptr_t* av = my_context->auxval_start;
+            while(av[0]) { if(av[0]==7) av[1]=(uintptr_t)interp->delta; else if(av[0]==9) av[1]=prog_ep; av+=2; }
+        }
+        printf_log(LOG_INFO, "KX: run real ld.so entry=%p base=%p, program entry=%p (box64 librarian bypassed)\n",
+                   (void*)kx_interp_ep, (void*)interp->delta, (void*)prog_ep);
+    } else
+#endif
+    {
     // Call librarian to load all dependant elf
     if(LoadNeededLibs(elf_header, my_context->maplib, 0, 0, 0, my_context, emu)) {
         printf_log(LOG_NONE, "Error: Loading needed libs in elf %s\n", my_context->argv[0]);
@@ -1533,6 +1599,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
     RefreshElfTLS(elf_header, emu);
     // do some special case check, _IO_2_1_stderr_ and friends, that are setup by libc, but it's already done here, so need to do a copy
     ResetSpecialCaseMainElf(elf_header);
+    }
     // init...
     setupTrace();
 
@@ -1544,6 +1611,15 @@ int emulate(x64emu_t* emu, elfheader_t* elf_header)
 {
     // get entrypoint
     my_context->ep = GetEntryPoint(my_context->maplib, elf_header);
+#ifdef __SWITCH__
+    // KurokoNX M2.1: for a dynamic guest we hand control to the real ld-linux, not the program's _start
+    // (ld.so relocates glibc + the main elf, then jumps to the program itself via AT_ENTRY).
+    if(kx_interp_ep) {
+        printf_log(LOG_INFO, "KX: entering real ld.so at %p instead of program entry %p\n",
+                   (void*)kx_interp_ep, (void*)my_context->ep);
+        my_context->ep = kx_interp_ep;
+    }
+#endif
 
     atexit(endBox64);
     loadProtectionFromMap();

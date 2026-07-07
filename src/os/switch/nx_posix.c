@@ -387,12 +387,46 @@ long sysconf(int name) {
 }
 int getpagesize(void) { return 4096; }
 
+// M2.1 libos: the guest's real ld.so/glibc issue raw Linux syscalls; box64 translates the x86-64 number
+// to the aarch64 NR and routes the tail (whatever it does NOT hand-case in emu/x64syscall.c) through
+// here. Implement the milestone-1 set over Horizon SVCs; log the rest so the bring-up loop sees the next
+// gap. NUMBERS ARE aarch64/generic-Linux NRs (box64 already translated from x86-64).
+static uint8_t *g_brk_base = NULL, *g_brk_cur = NULL, *g_brk_end = NULL;   // simple bump arena for brk()
 long syscall(long number, ...) {
-    // The host has no Linux syscall; box64 routes its syscallwrap[] long tail through here, so an
-    // unimplemented number currently fails silently. Log it — phase 6 grows a real per-number
-    // dispatcher in this function; until then every miss is at least visible.
-    nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
-    errno = ENOSYS; return -1;
+    va_list ap; va_start(ap, number);
+    unsigned long a0 = va_arg(ap, unsigned long);
+    unsigned long a1 = va_arg(ap, unsigned long);
+    unsigned long a2 = va_arg(ap, unsigned long); (void)a2;
+    va_end(ap);
+    switch (number) {
+        case 214: {   // brk(addr): glibc/ld.so bump allocator. Linux returns the resulting break.
+            if (!g_brk_base) {
+                size_t sz = 64UL * 1024 * 1024;     // 64 MiB arena is ample for ld.so + a hello's heap
+                void* p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+                if (p == MAP_FAILED) { nx_warnf("nx: brk arena mmap failed\n"); errno = ENOMEM; return -1; }
+                g_brk_base = g_brk_cur = (uint8_t*)p; g_brk_end = g_brk_base + sz;
+            }
+            uint8_t* req = (uint8_t*)a0;
+            if (!req) return (long)(uintptr_t)g_brk_cur;                     // query current break
+            if (req >= g_brk_base && req <= g_brk_end) g_brk_cur = req;       // grow/shrink within the arena
+            return (long)(uintptr_t)g_brk_cur;                               // else unchanged (grow failed)
+        }
+        case 96:  return 1;                          // set_tid_address -> our (single) tid
+        case 99:  return 0;                          // set_robust_list -> accept
+        case 293: errno = ENOSYS; return -1;         // rseq -> glibc tolerates ENOSYS
+        case 261: errno = ENOSYS; return -1;         // prlimit64 -> glibc falls back to getrlimit/defaults
+        case 278:                                    // getrandom(buf, len, flags)
+            if (a0 && a1) { randomGet((void*)a0, a1); return (long)a1; }
+            return 0;
+        case 135: return 0;                          // rt_sigprocmask -> accept (no signals yet)
+        case 178: return 1;                          // gettid
+        case 172: return 1;                          // getpid
+        case 124: svcSleepThread(0); return 0;       // sched_yield
+        case 98:  return 0;                          // futex -> single-thread: no contention (temporary)
+        default:
+            nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
+            errno = ENOSYS; return -1;
+    }
 }
 int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
     (void)fn; (void)stack; (void)flags; (void)arg; errno = ENOSYS; return -1;
