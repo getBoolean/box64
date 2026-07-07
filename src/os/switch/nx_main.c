@@ -99,14 +99,19 @@ int main(int argc, char **argv) {
     // THIS is the guest's real memory, so report it: it distinguishes a real Application-pool heap
     // (hundreds of MiB) from the 16 MiB static-.bss last resort.
     extern char *fake_heap_start, *fake_heap_end;
+    // Memory-budget diagnostics from __libnx_initheap (svcGetInfo Total/UsedMemorySize): memtotal is the
+    // process's whole pool, memused the code+stacks used before our heap — so memtotal-memused is the
+    // grantable heap ceiling, and heap is what we actually took (ceiling minus a safety margin).
+    extern u64 nx_mem_total_size, nx_mem_used_at_init;
+    unsigned long long memtot = (unsigned long long)nx_mem_total_size, memuse = (unsigned long long)nx_mem_used_at_init;
     unsigned long long heap_sz = (unsigned long long)(fake_heap_end - fake_heap_start);
     { uintptr_t vb = 0; size_t vs = 0; unsigned long long sr = 0;
       int st = nx_vm_status(&vb, &vs, &sr);
       const char *name = (st == 2) ? "UNSAFE" : (st == 1) ? "PHYS" : "heap-fallback";
-      kout("nx_vm: %s heap=0x%llx sysres=0x%llx base=0x%llx size=0x%llx\n\n",
-           name, heap_sz, sr, (unsigned long long)vb, (unsigned long long)vs);
-      char rb[192]; snprintf(rb, sizeof rb, "backend=%s heap=0x%llx sysres=0x%llx base=0x%llx size=0x%llx",
-           name, heap_sz, sr, (unsigned long long)vb, (unsigned long long)vs); rlog(rb); }
+      kout("nx_vm: %s heap=0x%llx memtotal=0x%llx memused=0x%llx sysres=0x%llx base=0x%llx size=0x%llx\n\n",
+           name, heap_sz, memtot, memuse, sr, (unsigned long long)vb, (unsigned long long)vs);
+      char rb[256]; snprintf(rb, sizeof rb, "backend=%s heap=0x%llx memtotal=0x%llx memused=0x%llx sysres=0x%llx base=0x%llx size=0x%llx",
+           name, heap_sz, memtot, memuse, sr, (unsigned long long)vb, (unsigned long long)vs); rlog(rb); }
     consoleUpdate(NULL);
 
     // box64 rewrites argv in place assuming the strings are contiguous (as a Linux kernel lays
@@ -138,16 +143,20 @@ int main(int argc, char **argv) {
     kout("\n(returning to the menu shortly)\n");
     consoleUpdate(NULL);   // present the final frame ONCE
 
-    // Hold the result on screen. An NRO returns to hbmenu when the OS asks (or after ~8 s). A title
-    // (application) can't return to a menu on its own — a self-exiting application makes am show "The
-    // software was closed because an error occurred", and appletMainLoop() returns false for it right
-    // away — so hold ~30 s with a fixed sleep (pumping appletMainLoop but not exiting on it) so the
-    // result is readable via a screenshot. Do NOT re-present/poll HID here (Ryujinx aborts on those).
+    // Hold the result on screen. An NRO returns to hbmenu when the OS asks (or after ~8 s), so pump
+    // appletMainLoop() and exit when it goes false. A title (application) can't return to a menu on its
+    // own — a self-exiting application makes am show "The software was closed because an error occurred",
+    // and appletMainLoop() returns false for it right away — so hold ~30 s with a PLAIN fixed sleep so
+    // the result is readable via a screenshot. Do NOT poll appletMainLoop() on the title path: once am
+    // tears down the applet channel, polling it just spins svcWaitSynchronization(handle 0)=InvalidHandle
+    // (~16 ms cadence) — harmless |W| noise, but pure log spam with no benefit. (No HID re-present either;
+    // Ryujinx aborts on those.)
     if (homebrew) {
         for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i)
             svcSleepThread(16000000ULL);
     } else {
-        for (int i = 0; i < 30 * 60; ++i) { appletMainLoop(); svcSleepThread(16000000ULL); }
+        for (int i = 0; i < 30 * 60; ++i)
+            svcSleepThread(16000000ULL);
     }
     if (have_romfs) romfsExit();
     if (g_nxlink_fd >= 0) close(g_nxlink_fd);

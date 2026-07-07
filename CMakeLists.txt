@@ -350,10 +350,13 @@ if(ZYDIS3)
     add_definitions(-DZYDIS3)
 endif()
 
-# box64-nx (M1.2): opt-in ARM64 dynarec for the Horizon/Switch build (W^X via libnx `jit`).
-# Default OFF keeps the proven M1.1 interpreter-only build; configure with -DBOX64_NX_DYNAREC=ON to
-# enable the JIT. Must run *before* the ARM_DYNAREC consumption just below (which adds -DDYNAREC,
-# the ASM language, and the src/dynarec/arm64 sources).
+# box64-nx (M1.2): ARM64 dynarec for the Horizon/Switch build (W^X via libnx `jit`).
+# Now the DEFAULT (ON) — the dynarec is hardware-confirmed (M1.2 gate cleared on real Tegra: hello->42,
+# loop->186, churn->199), so it is the one canonical Switch build. Configure with -DBOX64_NX_DYNAREC=OFF
+# for the interpreter-only build (slower; kept for debugging / bisecting a dynarec regression). Must run
+# *before* the ARM_DYNAREC consumption below (which adds -DDYNAREC, the ASM language, and the
+# src/dynarec/arm64 sources).
+option(BOX64_NX_DYNAREC "Horizon/Switch: enable the ARM64 dynarec (OFF = interpreter-only)" ON)
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" AND BOX64_NX_DYNAREC)
     set(ARM_DYNAREC ON CACHE BOOL "" FORCE)
     set(NOALIGN OFF CACHE BOOL "" FORCE)

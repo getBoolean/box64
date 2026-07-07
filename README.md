@@ -13,16 +13,17 @@ A fork of [box64](https://github.com/ptitSeb/box64) that adds a **Nintendo Switc
 - **Horizon OS backend** — a new `src/os/switch/` (with `os_switch.c`) implementing box64's OS surface (`mmap`, sysinfo, signals, `exit`, POSIX shims) on Horizon instead of Linux syscalls.
 - **NRO/NSP entry** — `src/os/switch/nx_main.c` replaces box64's shell `main()`: a libnx `main()` that loads a guest (from `argv[1]` or the `NX_GUEST_PATH` compile default) and drives `initialize()` + `emulate()`.
 - **newlib gap layer** — `nx_posix`, vendored/stub glibc headers under `src/os/switch/shim/`, and an `-ENOSYS` link layer (`nx_glibc_stubs.c` / `nx_link_stubs.c` / `nx_resolv_stubs.c`) that satisfy box64's STATICBUILD wrapped-libc layer on newlib.
-- **Arm64 dynarec under W^X** — the JIT code cache uses libnx `jit` dual-alias memory; guest memory uses a real `svcMapPhysicalMemory` arena (`src/os/switch/nx_virtmem.c`).
+- **Arm64 dynarec under W^X** — the JIT code cache uses libnx `jit` dual-alias memory (write `rw`, execute `rx`), hardware-confirmed on real Tegra.
+- **Real guest memory** — `src/os/switch/nx_virtmem.c` is a runtime multi-backend selector: an **installed application NSP** gets real memory from the **Application-pool heap** (`svcSetHeapSize`, up to ~3.2 GB — the path all memory-hungry Switch homebrew use), verified on hardware. Two physical-arena backends exist for other hosts (PHYS = `svcMapPhysicalMemory`, emulator/`ns`-provisioned only; UNSAFE = `svcMapPhysicalMemoryUnsafe`, for a future non-Application-pool host), but a HOME-launched application can reach neither, so it uses the heap.
 
 ---
 
 ## Packaging: NRO vs NSP
 
-Real `mmap`/`mprotect` and the W^X guest arena use `svcMapPhysicalMemory` / `svcSetMemoryPermission`, which require `system_resource_size > 0` in the process NPDM. A plain hbloader **NRO** has `0` — in both applet and application/full-RAM mode (confirmed on real hardware) — so those calls fail with `InvalidState`. The `NintendoSwitch` build therefore emits both:
+The real-memory story differs by host, and the physical-arena SVCs turned out to be **off-limits to a normally-launched application on real hardware**: `svcMapPhysicalMemory` needs `system_resource_size > 0`, which the kernel rejects at process creation for a self-authored app (it worked only on Ryujinx); `svcMapPhysicalMemoryUnsafe` needs a non-Application memory pool, which a HOME-launched app can't have (`Pool_Unsafe == Pool_Application`). So the shipping answer is the **Application-pool heap**. The `NintendoSwitch` build emits both:
 
-- **`box64.nro`** — plain homebrew; `nx_virtmem.c` falls back to a heap allocator (a one-page trial map at init detects the missing resource).
-- **`box64.nsp`** — a title with a custom `main.npdm` (`src/os/switch/box64.json`) that sets `system_resource_size`, so the arena maps guest memory for real. Ryujinx loads the homebrew `box64.nsp` directly (no keys).
+- **`box64.nro`** — plain hbloader homebrew; reuses hbloader's heap override and runs guests through the heap allocator (`nx_vm: heap-fallback`).
+- **`box64.nsp`** — an **installed application title** with a consistent `main.npdm` (`src/os/switch/box64.json`: `pool_partition:0` + `application_type:1` + `system_resource_size:0`) that reaches `main` and sizes its heap from the kernel's own accounting: `svcGetInfo(TotalMemorySize) − svcGetInfo(UsedMemorySize) − 16 MiB` in one `svcSetHeapSize`. On real HW that's `memtotal`=3285 MiB, `memused`=40.6 MiB → **`heap=0xc9c00000` = 3228 MiB** of real Application-pool memory (verified — `loop`→186, `churn`→199). Build a proper NCA NSP with hacBrewPack + `prod.keys` for real hardware (the keyless `build_pfs0` `box64.nsp` is Ryujinx-only); a separate `box64-phys.json` (`system_resource_size>0`) exercises the PHYS arena on the emulator.
 
 ---
 
@@ -34,7 +35,7 @@ From a devkitPro MSYS2 shell (with `DEVKITPRO` set), configure with the `Switch.
 cmake -S . -B build -G "Unix Makefiles" \
   -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake \
   -DCMAKE_BUILD_TYPE=Release -DSTATICBUILD=ON \
-  -DBOX64_NX_DYNAREC=ON \
+  -DBOX64_NX_DYNAREC=ON \                  # default ON (hardware-confirmed); pass =OFF for interpreter-only
   -DNX_GUEST_PATH=sdmc:/your/guest        # baked-in default guest; or pass it as argv[1] at runtime
 cmake --build build -j$(nproc)           # -> build/box64.nro  and  build/box64.nsp
 ```

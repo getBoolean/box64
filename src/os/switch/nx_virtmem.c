@@ -36,12 +36,16 @@
 // --- newlib heap ---------------------------------------------------------------------------------
 // On an NRO, hbloader hands us a pre-mapped heap via the homebrew ABI — we MUST reuse it (calling
 // svcSetHeapSize instead yields a heap libnx's argvSetup then Data-Aborts on). As a title there is no
-// override, so we carve our own heap with svcSetHeapSize — but the amount available depends on the
-// process memory pool (an Applet-pool title has a smaller budget than the old Application-pool
-// assumption), so we retry DOWN from a generous size and NEVER leave the heap NULL (a null heap makes
-// the first malloc — inside consoleInit — Data-Abort, which is exactly the crash we saw as a title).
+// override, so we carve our own heap with svcSetHeapSize, sized to the process's actual memory budget.
 // The guest arena no longer comes from this heap (it's the UNSAFE/PHYS pool), so it needn't be bounded
-// to "leave RAM for the arena".
+// to "leave RAM for the arena" — but this heap IS the guest's whole working set on the heap-fallback
+// path (malloc, the jit code cache, AND guest mmap all draw from it), so we want as much as the pool
+// allows. newlib can't grow the heap after init, hence up front.
+
+// Startup diagnostics for the memory budget (nx_main.c prints them). Filled in __libnx_initheap.
+u64 nx_mem_total_size   = 0;   // svcGetInfo TotalMemorySize — the process's whole pool budget
+u64 nx_mem_used_at_init = 0;   // svcGetInfo UsedMemorySize BEFORE we set the heap (code+stacks)
+
 void __libnx_initheap(void) {
     extern char* fake_heap_start;
     extern char* fake_heap_end;
@@ -51,10 +55,39 @@ void __libnx_initheap(void) {
         fake_heap_end   = (char*)envGetHeapOverrideAddr() + envGetHeapOverrideSize();
         return;
     }
-    // Descending: a consistent Application-pool NSP (pool_partition 0 + application_type Application)
-    // can carve a large heap from the ~3.2 GiB Application pool, so start at 1 GiB of REAL memory and
-    // fall back if the pool is tighter. (An Applet-pool/album host has far less; the retry covers it.)
+
+    // Preferred path: ask the kernel exactly how much this process may use, and take (almost) all of it
+    // in ONE svcSetHeapSize — no probing. TotalMemorySize is the process memory resource limit (the
+    // Application pool for a HOME-launched app); UsedMemorySize is what's already mapped (code, .data,
+    // .bss, initial stacks). The grantable heap ceiling is (total - used). We keep a MARGIN below it for
+    // box64's post-init out-of-heap allocations (extra thread stacks/guard pages, libnx service buffers,
+    // any nvmap the console needs that isn't heap-backed) — without it, grabbing the last byte risks a
+    // later OOM in consoleInit/fsdev. Both InfoTypes are documented (switchbrew SVC / libnx svc.h).
+    {
+        u64 total = 0, used = 0;
+        if (R_SUCCEEDED(svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0)) &&
+            R_SUCCEEDED(svcGetInfo(&used,  InfoType_UsedMemorySize,  CUR_PROCESS_HANDLE, 0)) &&
+            total > used) {
+            nx_mem_total_size = total; nx_mem_used_at_init = used;
+            const u64 MARGIN = 0x01000000ULL;               // 16 MiB safety reserve for out-of-heap allocs
+            u64 want = total - used;
+            want = (want > MARGIN) ? (want - MARGIN) : want;
+            want &= ~(u64)VM_PAGEMASK; want &= ~0x1FFFFFULL;  // round down to 2 MiB (svcSetHeapSize rule)
+            void* base = NULL;
+            if (want >= 0x00200000ULL && R_SUCCEEDED(svcSetHeapSize(&base, want)) && base) {
+                fake_heap_start = (char*)base;
+                fake_heap_end   = (char*)base + want;
+                return;
+            }
+        }
+    }
+
+    // Fallback (svcGetInfo failed or the computed request didn't take): walk DOWN a coarse ladder and
+    // take the first svcSetHeapSize that succeeds. Every entry is 2 MiB-aligned. Covers an Applet-pool/
+    // album host too (far smaller budget). (On the NRO we never reach here — hbloader's heap override.)
     static const u64 sizes[] = {
+        0xD8000000ULL, 0xD0000000ULL, 0xC8000000ULL, 0xC0000000ULL,
+        0xA0000000ULL, 0x80000000ULL, 0x60000000ULL,
         0x40000000ULL, 0x20000000ULL, 0x10000000ULL, 0x08000000ULL, 0x04000000ULL, 0x02000000ULL, 0x01000000ULL, 0x00200000ULL
     };
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
@@ -191,12 +224,18 @@ static void vm_reset_state(void) {
 }
 
 static void vm_init(void) {
-    // --- 1) UNSAFE (real-HW application path) ---------------------------------------------------
+    // --- 1) UNSAFE (real-HW non-Application-pool path) ------------------------------------------
     // Gate on detectMesosphere(): only real hardware (Atmosphère) implements the unsafe SVCs — Ryujinx
     // THROWS NotImplementedException on svcSetUnsafeLimit/svcMapPhysicalMemoryUnsafe (a crash, not an
-    // error), so we must never call them there. Then require the SVC be granted (an ungranted SVC also
-    // FAULTS): a title (no hbloader heap override) has it from box64.json; an NRO must be syscall-hinted.
-    if (detectMesosphere() && (!envHasHeapOverride() || envIsSyscallHinted(0x48))) {
+    // error), so we must never call them there. Then require a POSITIVE signal that the host is a
+    // non-Application-pool UNSAFE vehicle: the homebrew syscall hint envIsSyscallHinted(0x48), which a
+    // custom/album-mode hbloader sets when it grants 0x48. A HOME-launched Application NSP is the WRONG
+    // vehicle for UNSAFE — Pool_Unsafe==Pool_Application, so svcMapPhysicalMemoryUnsafe fails there and
+    // svcSetUnsafeLimit would needlessly cap the shared Application pool (destabilising audio/omm) — and
+    // it carries no such hint, so it skips this entirely and uses the Application-pool heap instead.
+    // (Open design point: an UNSAFE host that is a custom-NPDM *title* wouldn't surface the hint and
+    // would need a pool probe instead — M2, see the plan.)
+    if (detectMesosphere() && envIsSyscallHinted(0x48)) {
         svcSetUnsafeLimit(VM_UNSAFE_LIMIT);   // system-wide cap; harmless/no-op where unimplemented
         void* rbase = NULL;
         virtmemLock();
