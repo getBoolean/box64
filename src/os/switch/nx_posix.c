@@ -11,6 +11,8 @@
 #include <stdio.h>      // vsnprintf
 #include <stdarg.h>
 #include <sys/mman.h>   // PROT_*/MAP_* (box64-nx shim)
+#include <fcntl.h>      // open/O_RDONLY (M2.1 rootfs shim)
+#include <unistd.h>     // read/close/lseek
 
 #define NX_PAGE 0x1000UL
 
@@ -255,6 +257,27 @@ void error_at_line(int status, int errnum, const char *filename, unsigned int li
 int stat64(const char *p, struct stat64 *b)  { return stat(p, (struct stat *)b); }
 int fstat64(int fd, struct stat64 *b)         { return fstat(fd, (struct stat *)b); }
 int lstat64(const char *p, struct stat64 *b)  { return lstat(p, (struct stat *)b); }
+// M2.1: real fstatat (was an -ENOSYS link stub). The guest's ld.so stats libc via
+// newfstatat(fd, "", &st, AT_EMPTY_PATH) — box64's my_fstatat forwards here. Handle the fd form
+// (AT_EMPTY_PATH / empty path) via fstat; translate a path form to the staged SD lib dir by basename.
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
+    int r;
+    if ((flags & AT_EMPTY_PATH) || !path || !path[0])
+        r = fstat(dirfd, b);                             // fstat via the open fd
+    else {
+        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+        char sd[128]; snprintf(sd, sizeof sd, "sdmc:/box64/lib/%s", base);
+        r = stat(sd, b);
+    }
+    // fsdev/newlib returns st_dev=st_ino=0 for every file. ld.so dedups loaded objects by (dev,ino),
+    // so 0/0 makes libc.so.6 look "already loaded" (same 0/0 as ld.so/the main exe), ld.so skips
+    // mapping it, and __libc_start_main is then undefined. Give each stat a unique non-zero identity.
+    if (r == 0) { static unsigned long g_ino = 2; b->st_dev = 1; if (!b->st_ino) b->st_ino = __atomic_add_fetch(&g_ino, 1, __ATOMIC_RELAXED); }
+    return r;
+}
 int fstatat64(int d, const char *p, struct stat64 *b, int f) { return fstatat(d, p, (struct stat *)b, f); }
 int open64(const char *p, int fl, ...) { va_list a; va_start(a, fl); mode_t m = (mode_t)va_arg(a, int); va_end(a); return open(p, fl, m); }
 int openat64(int d, const char *p, int fl, ...) { va_list a; va_start(a, fl); mode_t m = (mode_t)va_arg(a, int); va_end(a); return openat(d, p, fl, m); }
@@ -396,7 +419,10 @@ long syscall(long number, ...) {
     va_list ap; va_start(ap, number);
     unsigned long a0 = va_arg(ap, unsigned long);
     unsigned long a1 = va_arg(ap, unsigned long);
-    unsigned long a2 = va_arg(ap, unsigned long); (void)a2;
+    unsigned long a2 = va_arg(ap, unsigned long);
+    unsigned long a3 = va_arg(ap, unsigned long);
+    unsigned long a4 = va_arg(ap, unsigned long); (void)a4;
+    unsigned long a5 = va_arg(ap, unsigned long); (void)a5;
     va_end(ap);
     switch (number) {
         case 214: {   // brk(addr): glibc/ld.so bump allocator. Linux returns the resulting break.
@@ -418,6 +444,41 @@ long syscall(long number, ...) {
         case 278:                                    // getrandom(buf, len, flags)
             if (a0 && a1) { randomGet((void*)a0, a1); return (long)a1; }
             return 0;
+        case 56: {  // openat(dirfd, path, flags, mode)
+            const char* p = (const char*)a1;
+            if (!p) { errno = EFAULT; return -1; }
+            // M2.1 rootfs shim: the guest's real ld.so/glibc search Linux paths (/usr/lib/..., /lib/...)
+            // for the .so's we staged at sdmc:/box64/lib/. Translate by basename (all guest opens here
+            // are absolute lib lookups; dirfd is AT_FDCWD). Missing files -> ENOENT (ld.so tolerates it).
+            const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
+            char sd[128]; snprintf(sd, sizeof sd, "sdmc:/box64/lib/%s", b);
+            int fd = open(sd, O_RDONLY);
+            if (fd < 0) { errno = ENOENT; return -1; }
+            nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, sd, fd);
+            return fd;
+        }
+        case 57: return close((int)a0);                          // close
+        case 63: return read((int)a0, (void*)a1, (size_t)a2);    // read
+        case 62: return (long)lseek((int)a0, (off_t)a1, (int)a2);// lseek
+        case 67: {  // pread64(fd, buf, count, offset) — ld.so reads ELF headers at offsets
+            off_t cur = lseek((int)a0, 0, SEEK_CUR);             // save position (newlib may lack pread)
+            if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) return -1;
+            ssize_t r = read((int)a0, (void*)a1, (size_t)a2);
+            lseek((int)a0, cur, SEEK_SET);                       // restore
+            return (long)r;
+        }
+        case 66: {  // writev(fd, iov, iovcnt) — surface guest stderr/stdout (glibc/ld.so error text)
+            struct kx_iovec { const char* base; size_t len; };
+            const struct kx_iovec* v = (const struct kx_iovec*)a1;
+            long total = 0;
+            for (unsigned i = 0; i < (unsigned)a2 && v; ++i) {
+                if (v[i].base && v[i].len) {
+                    svcOutputDebugString(v[i].base, v[i].len);   // capture in the Ryujinx log
+                    total += (long)v[i].len;
+                }
+            }
+            return total;
+        }
         case 135: return 0;                          // rt_sigprocmask -> accept (no signals yet)
         case 178: return 1;                          // gettid
         case 172: return 1;                          // getpid

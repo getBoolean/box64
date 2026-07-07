@@ -235,7 +235,7 @@ __asm__(
 "  .global freeifaddrs\n  .type freeifaddrs, %function\n  .set freeifaddrs, nx_enosys_stub\n"
 "  .global fremovexattr\n  .type fremovexattr, %function\n  .set fremovexattr, nx_enosys_stub\n"
 "  .global fsetxattr\n  .type fsetxattr, %function\n  .set fsetxattr, nx_enosys_stub\n"
-"  .global fstatat\n  .type fstatat, %function\n  .set fstatat, nx_enosys_stub\n"
+// fstatat: real implementation in nx_posix.c (M2.1 — the guest's ld.so newfstatat's libc via AT_EMPTY_PATH)
 "  .global ftime\n  .type ftime, %function\n  .set ftime, nx_enosys_stub\n"
 "  .global futimens\n  .type futimens, %function\n  .set futimens, nx_enosys_stub\n"
 "  .global futimes\n  .type futimes, %function\n  .set futimes, nx_enosys_stub\n"

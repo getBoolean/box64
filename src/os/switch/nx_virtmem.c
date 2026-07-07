@@ -28,6 +28,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/mman.h>   // PROT_*/MAP_* (box64-nx shim)
+#include <unistd.h>     // read/lseek (M2.1 file-backed mmap)
 
 #define VM_PAGE     0x1000UL
 #define VM_PAGEMASK (VM_PAGE - 1)
@@ -323,8 +324,29 @@ static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {
 // Public mmap / munmap / mprotect
 // ---------------------------------------------------------------------------------------------
 void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
-    (void)prot; (void)fd; (void)offset;
+    (void)prot;
     if (!length) return MAP_FAILED;
+
+    // M2.1: Horizon has no file-backed mmap. The guest's real ld.so maps libc's segments with
+    // MAP_PRIVATE(|MAP_FIXED), fd, offset, so emulate it: map anonymous memory, then read the file
+    // content at `offset` into it (the tail past EOF stays zero = bss). Mirrors box64's own elf-loader
+    // fallback. box64's mprotect is a no-op on Switch, so mapping the page RW then reading is fine.
+    if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
+        void* p = nx_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return MAP_FAILED;
+        off_t save = lseek(fd, 0, SEEK_CUR);
+        if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1) {
+            size_t done = 0;
+            while (done < length) {
+                ssize_t r = read(fd, (char*)p + done, length - done);
+                if (r <= 0) break;
+                done += (size_t)r;
+            }
+        }
+        if (save != (off_t)-1) lseek(fd, save, SEEK_SET);
+        return p;
+    }
+    (void)offset;
     size_t rounded = VM_ROUND(length);
 
     vm_ensure_init();
