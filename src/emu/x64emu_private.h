@@ -5,6 +5,11 @@
 #include "os.h"
 #include "box64context.h"
 #include <signal.h>
+#ifdef __SWITCH__
+// newlib's siginfo_t lacks si_errno/si_addr; box64's deferred-signal queue needs the
+// full x86-64 layout so a guest SA_SIGINFO handler parses it (see nx_signals.c).
+#include "x64_siginfo.h"
+#endif
 
 typedef struct x64_ucontext_s x64_ucontext_t;
 #ifdef BOX32
@@ -145,7 +150,11 @@ typedef struct x64emu_s {
     volatile sig_atomic_t deferred_signal_processing;
     volatile sig_atomic_t deferred_signal_count;
     volatile sig_atomic_t deferred_signal_pending[MAX_SIGNAL+1];
+    #ifdef __SWITCH__
+    x64_siginfo_t deferred_siginfo[MAX_SIGNAL+1];   // x86-64 layout (newlib siginfo_t is too small)
+    #else
     siginfo_t   deferred_siginfo[MAX_SIGNAL+1];
+    #endif
     #endif
     #ifdef BOX32
     int         libc_err;   // copy of errno from libc

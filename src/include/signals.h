@@ -73,10 +73,25 @@ int my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigaction_resto
 
 void enter_critical_section();
 void leave_critical_section();
+#ifdef __SWITCH__
+// box64-nx: the deferred-signal queue stores full x86-64 siginfo (newlib's is too
+// small); defer_signal takes the box64-private x64_siginfo_t there. See nx_signals.c.
+#include "x64_siginfo.h"
+int defer_signal(x64emu_t* emu, int signum, x64_siginfo_t* info);
+#else
 int defer_signal(x64emu_t* emu, int signum, siginfo_t* info);
+#endif
 void cancel_deferred_signal_processing(x64emu_t* emu);
 
 void init_signal_helper(box64context_t* context);
 void fini_signal_helper(void);
+
+#ifdef __SWITCH__
+// box64-nx: synchronous self-directed signal delivery (kill/tgkill/raise routed
+// straight into the guest's own handler; Horizon has no host signal delivery).
+int my_kill(x64emu_t* emu, int pid, int sig);
+int my_tgkill(x64emu_t* emu, int tgid, int tid, int sig);
+int my_raise(x64emu_t* emu, int sig);
+#endif
 
 #endif //__SIGNALS_H__

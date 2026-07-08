@@ -559,6 +559,13 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     // fallback fires and reaches our clone() (nx_posix.c). (Host vs Linux errno numbers differ on
     // newlib generally; this is the one case that must match for threads. See KurokoNX TODO.)
     if (s == 435) { S_RAX = -38; return; }   // clone3 -> -ENOSYS(Linux) -> glibc falls back to clone(56)
+    // Self-directed signals (kill/tkill/tgkill) must reach the guest handler via our synchronous delivery
+    // core (my_kill/my_tgkill -> nx_deliver_self), NOT the host syscall wrapper: syscallwrap[] routes
+    // 62/200/234 to host syscall() -> ENOSYS, so a guest abort()/raise()/assert() would never run its
+    // handler. Intercept here, before the wrapper dispatch. (Single process: any pid/tid resolves to self.)
+    if (s == 62)  { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // kill(pid,sig)
+    if (s == 200) { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // tkill(tid,sig)
+    if (s == 234) { S_RAX = my_tgkill(emu, (int)R_RDI, (int)R_RSI, (int)R_RDX); return; }   // tgkill(tgid,tid,sig)
 #endif
     // check wrapper first
     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);
