@@ -13,6 +13,13 @@
 #include <sys/mman.h>   // PROT_*/MAP_* (box64-nx shim)
 #include <fcntl.h>      // open/O_RDONLY (M2.1 rootfs shim)
 #include <unistd.h>     // read/close/lseek
+#include <pthread.h>    // guest threads (clone) run on host pthreads
+#include <stdatomic.h>  // per-thread tid counter
+#include <limits.h>     // INT_MAX (futex wake-all)
+
+// box64-internal (src/libtools/threads.c): drop this thread's emu from the pthread key so the key
+// destructor can't double-free the emu clone_fn_syscall already released (see clone() below).
+extern void thread_forget_emu(void);
 
 #define NX_PAGE 0x1000UL
 
@@ -34,9 +41,26 @@ static void nx_warnf(const char *fmt, ...) {
 // Alias region (svcMapPhysicalMemory) with reclaiming munmap, falling back to the heap path if the
 // arena can't init. See nx_virtmem.c.
 
+// --- Guest threads (M2.2) -----------------------------------------------------------------------
+// The guest's real glibc creates threads with a raw x86-64 clone syscall; box64 (x64syscall.c case 56)
+// builds a child x64emu_t and calls the host clone() below. We run box64's clone_fn_syscall on a
+// DETACHED host pthread (so its pthread-key emu lookup + per-thread errno/_reent work). A per-thread
+// record carries the tid + the CLONE_CHILD_CLEARTID address so nx_gettid() and thread-exit find them.
+typedef struct nx_clone_s {
+    int  (*fn)(void*);   // == clone_fn_syscall
+    void*  arg;          // == clone_t* (opaque — never dereference)
+    int    flags;
+    int*   ctid;         // CLONE_CHILD_CLEARTID target, or NULL
+    int    tid;          // our positive, unique tid (== the value written to *ptid)
+} nx_clone_t;
+
+static _Atomic int          g_nx_next_tid = 2;     // 1 is the main thread
+static __thread nx_clone_t* g_nx_self     = NULL;  // this thread's record; NULL on the main thread
+
 int nx_gettid(void) {
-    // Single-threaded for now (M1 static guests). Real per-thread ids arrive with thread support.
-    return 1;
+    // Per-thread tid assigned by clone() (main thread -> 1). Must equal the value glibc caches as
+    // pd->tid (we wrote it to *ptid in clone), so pthread_join's futex + robust-mutex owner words agree.
+    return g_nx_self ? g_nx_self->tid : 1;
 }
 
 int nx_sched_yield(void) {
@@ -410,6 +434,61 @@ long sysconf(int name) {
 }
 int getpagesize(void) { return 4096; }
 
+// futex(uaddr, op, val, timeout, uaddr2, val3) over the Horizon address arbiter (svcWaitForAddress /
+// svcSignalToAddress — the kernel's futex). glibc low-level locks use WAIT/WAKE; the 2.25+ condvar uses
+// WAIT_BITSET (absolute timeout, match-any) + WAKE, no requeue — so this op set is complete. PI and
+// requeue ops -> ENOSYS (glibc falls back / doesn't need them for the M2.2 gate).
+#ifndef FUTEX_WAIT
+#define FUTEX_WAIT            0
+#define FUTEX_WAKE            1
+#define FUTEX_WAIT_BITSET     9
+#define FUTEX_WAKE_BITSET     10
+#define FUTEX_PRIVATE_FLAG    128
+#define FUTEX_CLOCK_REALTIME  256
+#endif
+#define FUTEX_CMD_MASK (~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME))
+
+static long nx_futex(int* uaddr, int op, unsigned val, const void* timeout,
+                     int* uaddr2, unsigned val3) {
+    (void)uaddr2; (void)val3;
+    struct nx_ts { long tv_sec, tv_nsec; };                       // x86-64 kernel timespec (both 64-bit)
+    if (((uintptr_t)uaddr) & 3u) { errno = EINVAL; return -1; }   // kernel requires a 4-byte-aligned addr
+    int cmd = op & FUTEX_CMD_MASK;
+    switch (cmd) {
+        case FUTEX_WAIT:
+        case FUTEX_WAIT_BITSET: {
+            s64 timeout_ns = -1;                                  // NULL timeout -> wait forever
+            if (timeout) {
+                const struct nx_ts* to = (const struct nx_ts*)timeout;
+                if (cmd == FUTEX_WAIT) {                          // relative
+                    timeout_ns = (s64)to->tv_sec * 1000000000LL + to->tv_nsec;
+                } else {                                          // WAIT_BITSET: absolute -> relative
+                    u64 now = armTicksToNs(armGetSystemTick());   // CLOCK_MONOTONIC epoch
+                    s64 abs = (s64)to->tv_sec * 1000000000LL + to->tv_nsec;
+                    timeout_ns = abs - (s64)now;
+                    if (timeout_ns < 0) timeout_ns = 0;
+                }
+            }
+            Result rc = svcWaitForAddress(uaddr, ArbitrationType_WaitIfEqual, (s64)(s32)val, timeout_ns);
+            if (R_SUCCEEDED(rc)) return 0;
+            switch (R_DESCRIPTION(rc)) {
+                case 117: errno = ETIMEDOUT; return -1;           // KernelError_TimedOut
+                case 118: errno = EINTR;     return -1;           // KernelError_Cancelled
+                default:  errno = EAGAIN;    return -1;           // 125 InvalidState = *uaddr != val
+            }
+        }
+        case FUTEX_WAKE:
+        case FUTEX_WAKE_BITSET: {
+            s32 count = (val > (unsigned)INT_MAX) ? INT_MAX : (s32)val;
+            svcSignalToAddress(uaddr, SignalType_Signal, 0, count);
+            return 0;                                             // NPTL ignores the woken count
+        }
+        default:
+            nx_warnf("nx: futex op=%d (cmd=%d) unimplemented -> ENOSYS\n", op, cmd);
+            errno = ENOSYS; return -1;
+    }
+}
+
 // M2.1 libos: the guest's real ld.so/glibc issue raw Linux syscalls; box64 translates the x86-64 number
 // to the aarch64 NR and routes the tail (whatever it does NOT hand-case in emu/x64syscall.c) through
 // here. Implement the milestone-1 set over Horizon SVCs; log the rest so the bring-up loop sees the next
@@ -421,8 +500,8 @@ long syscall(long number, ...) {
     unsigned long a1 = va_arg(ap, unsigned long);
     unsigned long a2 = va_arg(ap, unsigned long);
     unsigned long a3 = va_arg(ap, unsigned long);
-    unsigned long a4 = va_arg(ap, unsigned long); (void)a4;
-    unsigned long a5 = va_arg(ap, unsigned long); (void)a5;
+    unsigned long a4 = va_arg(ap, unsigned long);   // futex uaddr2
+    unsigned long a5 = va_arg(ap, unsigned long);   // futex val3
     va_end(ap);
     switch (number) {
         case 214: {   // brk(addr): glibc/ld.so bump allocator. Linux returns the resulting break.
@@ -437,7 +516,7 @@ long syscall(long number, ...) {
             if (req >= g_brk_base && req <= g_brk_end) g_brk_cur = req;       // grow/shrink within the arena
             return (long)(uintptr_t)g_brk_cur;                               // else unchanged (grow failed)
         }
-        case 96:  return 1;                          // set_tid_address -> our (single) tid
+        case 96:  return nx_gettid();                // set_tid_address -> this thread's tid
         case 99:  return 0;                          // set_robust_list -> accept
         case 293: errno = ENOSYS; return -1;         // rseq -> glibc tolerates ENOSYS
         case 261: errno = ENOSYS; return -1;         // prlimit64 -> glibc falls back to getrlimit/defaults
@@ -480,17 +559,67 @@ long syscall(long number, ...) {
             return total;
         }
         case 135: return 0;                          // rt_sigprocmask -> accept (no signals yet)
-        case 178: return 1;                          // gettid
-        case 172: return 1;                          // getpid
+        case 178: return nx_gettid();                // gettid
+        case 172: return 1;                          // getpid (single process)
         case 124: svcSleepThread(0); return 0;       // sched_yield
-        case 98:  return 0;                          // futex -> single-thread: no contention (temporary)
+        case 98:  return nx_futex((int*)a0, (int)a1, (unsigned)a2, (const void*)a3, (int*)a4, (unsigned)a5);
         default:
             nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
             errno = ENOSYS; return -1;
     }
 }
-int  clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
-    (void)fn; (void)stack; (void)flags; (void)arg; errno = ENOSYS; return -1;
+#ifndef CLONE_PARENT_SETTID
+#define CLONE_PARENT_SETTID  0x00100000
+#endif
+#ifndef CLONE_CHILD_CLEARTID
+#define CLONE_CHILD_CLEARTID 0x00200000
+#endif
+
+static void* nx_clone_trampoline(void* p) {
+    nx_clone_t* c = (nx_clone_t*)p;
+    g_nx_self = c;                          // publish tid/ctid before running the guest
+    c->fn(c->arg);                          // clone_fn_syscall: DynaRun the guest, FreeX64Emu, then return
+                                            // here (on __SWITCH__ it returns instead of _exit; x64syscall.c)
+    if (c->ctid) {                          // CLONE_CHILD_CLEARTID: zero the tid + wake pthread_join
+        __atomic_store_n(c->ctid, 0, __ATOMIC_SEQ_CST);
+        svcSignalToAddress(c->ctid, SignalType_Signal, 0, 1);
+    }
+    thread_forget_emu();                    // NULL the pthread key: the emu was already freed, so its
+                                            // destructor must not run (would double-free). The ~64B et leaks.
+    free(c);
+    g_nx_self = NULL;
+    return NULL;                            // detached: pthread/libnx reclaim the host stack
+}
+
+// Host clone() — the seam box64's raw-clone THREAD branch (x64syscall.c case 56) calls. box64's `stack`
+// is a 1MB host scratch stack we ignore (we only receive its top); pthread allocates the host/JIT stack.
+// The guest owns join via the CLONE_CHILD_CLEARTID futex, so the pthread is detached (never host-joined).
+int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
+    (void)stack;
+    va_list ap; va_start(ap, arg);
+    int*  ptid   = va_arg(ap, int*);          // R_RDX (parent_tid)
+    void* newtls = va_arg(ap, void*); (void)newtls;   // R_R8 — CLONE_SETTLS already stripped by box64
+    int*  ctid   = va_arg(ap, int*);          // R_R10 (child_tid)
+    va_end(ap);
+
+    nx_clone_t* c = (nx_clone_t*)malloc(sizeof(*c));
+    if (!c) { errno = ENOMEM; return -1; }
+    c->fn    = fn;
+    c->arg   = arg;
+    c->flags = flags;
+    c->ctid  = (flags & CLONE_CHILD_CLEARTID) ? ctid : NULL;
+    c->tid   = atomic_fetch_add_explicit(&g_nx_next_tid, 1, memory_order_relaxed);
+    if ((flags & CLONE_PARENT_SETTID) && ptid) *ptid = c->tid;   // == the value glibc caches as pd->tid
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1u << 20);                  // >=1MB host/JIT stack
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    int rc = pthread_create(&th, &attr, nx_clone_trampoline, c);
+    pthread_attr_destroy(&attr);
+    if (rc) { free(c); errno = rc; return -1; }
+    return c->tid;                                                // child tid to the guest parent
 }
 
 // --- Advanced pthread APIs libnx lacks (declared in shim/static_compat.h) ---------------------

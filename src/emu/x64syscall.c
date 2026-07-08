@@ -492,7 +492,14 @@ static int clone_fn_syscall(void* arg)
         my_context->stack_clone_used = 0;
     if(stack2free)
         box_free(stack2free);   // this free the stack, so it will crash very soon!
+#ifdef __SWITCH__
+    // Horizon: return to nx_clone_trampoline (nx_posix.c clone()) for CLONE_CHILD_CLEARTID + a
+    // thread-only exit (pthread). _exit here is exit_group -> would kill every other guest thread.
+    // The emu was already freed above, so the trampoline must NULL the pthread key before exiting.
+    return ret;
+#else
     _exit(ret);
+#endif
 }
 
 void EXPORT x64Syscall(x64emu_t *emu)
@@ -546,6 +553,12 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         emu->quit = 1;
         return;
     }
+    // glibc 2.34+ pthread_create issues clone3 (435) first and falls back to legacy clone (56) ONLY
+    // when clone3 returns a LINUX -ENOSYS (38). box64's default returns the host newlib -ENOSYS (88),
+    // which glibc doesn't recognize -> pthread_create fails outright. Force the Linux value so the
+    // fallback fires and reaches our clone() (nx_posix.c). (Host vs Linux errno numbers differ on
+    // newlib generally; this is the one case that must match for threads. See KurokoNX TODO.)
+    if (s == 435) { S_RAX = -38; return; }   // clone3 -> -ENOSYS(Linux) -> glibc falls back to clone(56)
 #endif
     // check wrapper first
     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);

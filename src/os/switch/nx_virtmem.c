@@ -15,7 +15,7 @@
 //
 // box64 reserves a whole-image span with a non-FIXED map, then MAP_FIXED-places PT_LOAD segments inside
 // it. Address-space accounting is a coalescing free list (static node pool, so nothing here re-enters
-// box64's allocator). Single-threaded for the M1 scope.
+// box64's allocator). The free-list/heap-table mutations are serialized by vm_lock (M2.2 guest threads).
 
 #ifdef __SWITCH__
 
@@ -135,6 +135,11 @@ static vm_span_t* vm_nodefree = NULL;
 static vm_span_t* vm_free     = NULL;   // free intervals, sorted by start, coalesced
 static uintptr_t  vm_base = 0, vm_end = 0;
 static VirtmemReservation* vm_resv = NULL;
+
+// M2.2: guest threads call mmap/munmap concurrently (glibc arenas, per-thread stacks), so the free
+// list + node pool + heap-block table must be serialized. vm_init/vm_try run once at startup (before
+// any guest thread), so they stay unlocked; only the runtime mmap/munmap mutation sites take this.
+static Mutex vm_lock;   // libnx Mutex; zero-initialized == unlocked
 
 static vm_span_t* node_get(uintptr_t start, size_t len) {
     if (!vm_nodefree) return NULL;
@@ -315,10 +320,10 @@ static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {
         memset(addr, 0, rounded);
         return addr;
     }
-    void* p = memalign(VM_PAGE, rounded);
+    void* p = memalign(VM_PAGE, rounded);   // newlib malloc is itself thread-safe
     if (!p) { errno = ENOMEM; return MAP_FAILED; }
     if (flags & MAP_ANONYMOUS) memset(p, 0, rounded);
-    hb_track((uintptr_t)p, rounded);
+    mutexLock(&vm_lock); hb_track((uintptr_t)p, rounded); mutexUnlock(&vm_lock);
     return p;
 }
 
@@ -370,14 +375,16 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
         return addr;
     }
 
+    mutexLock(&vm_lock);
     uintptr_t a = vm_reserve(rounded);
+    mutexUnlock(&vm_lock);
     if (!a) { errno = ENOMEM; return MAP_FAILED; }
     if (R_FAILED(vm_map((void*)a, rounded))) {
-        vm_release(a, rounded);
+        mutexLock(&vm_lock); vm_release(a, rounded); mutexUnlock(&vm_lock);
         errno = ENOMEM;
         return MAP_FAILED;
     }
-    if (flags & MAP_ANONYMOUS) memset((void*)a, 0, rounded);
+    if (flags & MAP_ANONYMOUS) memset((void*)a, 0, rounded);   // page already reserved to this thread
     return (void*)a;
 }
 
@@ -388,10 +395,11 @@ int nx_munmap(void* addr, unsigned long length) {
 
     if (vm_backend != VM_HEAP && vm_in_arena(a, rounded)) {
         vm_unmap(addr, rounded);   // real reclaim of the physical pages...
-        vm_release(a, rounded);    // ...and the address range
+        mutexLock(&vm_lock); vm_release(a, rounded); mutexUnlock(&vm_lock);   // ...and the address range
         return 0;
     }
-    if (hb_untrack(a)) free(addr); // heap-fallback whole-block reclaim
+    mutexLock(&vm_lock); int found = hb_untrack(a); mutexUnlock(&vm_lock);
+    if (found) free(addr);         // heap-fallback whole-block reclaim
     return 0;
 }
 
