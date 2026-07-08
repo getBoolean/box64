@@ -758,12 +758,43 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
         emu = thread_get_emu();
     if(sig<=0 || sig>MAX_SIGNAL)
         return;
+    uintptr_t h = my_context->signals[sig];
+    if(h==1)                        // SIG_IGN
+        return;
+    if(h==0) {                      // SIG_DFL -> terminate (matches RunFunctionHandler's fnc==0 path)
+        printf_log(LOG_NONE, "Unhandled signal %d (SIG_DFL), aborting\n", sig);
+        abort();
+    }
     x64_siginfo_t info = {0};
     info.si_signo = sig;
     info.si_code = X64_SI_TKILL;    // sent by tkill/tgkill (matches glibc raise())
     if(defer_signal(emu, sig, &info))
         return;                     // deferrable + inside a critical section: run it on leave
-    my_sigactionhandler_oldcode(emu, sig, 0, &info, NULL, NULL, NULL, R_RIP);
+
+    // Synchronous self-signal delivery. box64's host-signal-shaped delivery core (_64) rebuilds the guest
+    // from a sigcontext it lays on the guest stack; here (a nested call from inside the tgkill syscall) the
+    // handler's own stack use clobbers that frame and corrupts the resume. So deliver directly: run the
+    // guest handler via RunFunctionHandler with siginfo+ucontext kept OFF the guest stack (per-thread
+    // buffers are guest-readable — box64 maps guest memory 1:1 with the host). Preserve the caller-saved
+    // GPRs EmuCall does NOT (RAX/RCX/RDX/R8-R11) + eflags so glibc's post-syscall code resumes intact
+    // (RBX/RDI/RSI/RBP/RSP/RIP are already saved/restored by EmuCall). FP/xmm are not preserved here; a
+    // handler that changes control flow via longjmp isn't honored — both are follow-ups for wider programs.
+    uint64_t s_rax=R_RAX, s_rcx=R_RCX, s_rdx=R_RDX, s_r8=R_R8, s_r9=R_R9, s_r10=R_R10, s_r11=R_R11;
+    x64flags_t s_eflags = emu->eflags;
+    int exits = 0;
+    if(my_context->is_sigaction[sig]) {
+        static __thread x64_siginfo_t  si_buf;
+        static __thread x64_ucontext_t uc_buf;
+        si_buf = info;
+        memset(&uc_buf, 0, sizeof(uc_buf));
+        emu2mctx(&uc_buf.uc_mcontext, emu);   // give an SA_SIGINFO handler a real mcontext to inspect
+        RunFunctionHandler(emu, &exits, 1, NULL, h, 3, (uint64_t)sig,
+                           (uint64_t)(uintptr_t)&si_buf, (uint64_t)(uintptr_t)&uc_buf);
+    } else {
+        RunFunctionHandler(emu, &exits, 1, NULL, h, 1, (uint64_t)sig);
+    }
+    R_RAX=s_rax; R_RCX=s_rcx; R_RDX=s_rdx; R_R8=s_r8; R_R9=s_r9; R_R10=s_r10; R_R11=s_r11;
+    emu->eflags = s_eflags;
 }
 
 int my_kill(x64emu_t* emu, int pid, int sig)
