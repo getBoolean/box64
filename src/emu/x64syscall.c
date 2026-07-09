@@ -653,8 +653,23 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                 int kx_to = nx_tee_origin(S_EDI);
                 if (kx_to) nx_guest_output(kx_to, (const void*)R_RSI, (size_t)R_RDX);
             }
+            // Fast registry save: discard writes to a wineserver reg*.tmp fd (report full success). A
+            // real fsdev save-all is 25 s+ of ms-slow 8 KiB writes that pin the single-threaded server
+            // and starve the wine client; persistence is irrelevant to `cmd /c echo`. See nx_vfd.c.
+            // Checked BEFORE the WR< trace so a discarded save doesn't re-flood the log under KX_REQLOG.
+            { extern int nx_regtmp_is(int); if (nx_regtmp_is((int)S_EDI)) { S_RAX = (int)R_RDX; break; } }
+            { static int on = -1; if (on < 0) { extern char* getenv(const char*); on = getenv("KX_REQLOG") ? 1 : 0; }
+              if (on && (int)S_EDI > 2) { char b[80]; extern int nx_guest_pid(void);
+                int n = snprintf(b, sizeof b, "nx: WR< pid=%d fd=%d len=%d\n", nx_guest_pid(), (int)S_EDI, (int)R_RDX);
+                svcOutputDebugString(b, n); } }
 #endif
             S_RAX = write(S_EDI, (void*)R_RSI, (size_t)R_RDX);
+#ifdef __SWITCH__
+            { static int on = -1; if (on < 0) { extern char* getenv(const char*); on = getenv("KX_REQLOG") ? 1 : 0; }
+              if (on && (int)S_EDI > 2) { char b[80]; extern int nx_guest_pid(void);
+                int n = snprintf(b, sizeof b, "nx: WR> pid=%d fd=%d ret=%d\n", nx_guest_pid(), (int)S_EDI, (int)S_RAX);
+                svcOutputDebugString(b, n); } }
+#endif
             if(S_RAX==-1)
                 S_RAX = -errno;
             break;

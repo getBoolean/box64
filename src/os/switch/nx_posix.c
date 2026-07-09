@@ -934,17 +934,24 @@ long syscall(long number, ...) {
             int fd = open(hp, (int)a2, (mode_t)a3);
             if (fd < 0) { nx_warnf("nx: openat '%s' -> '%s' FAIL e=%d\n", p, hp, errno); return -1; }
             nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, hp, fd);
+            // Fast registry save: mark a wineserver reg*.tmp fd so its writes are discarded (the file
+            // stays empty and its save rename is short-circuited) — else a slow fsdev save-all starves
+            // the wine client. See nx_vfd.c nx_regtmp_*.
+            { extern int nx_regtmp_name(const char*); extern void nx_regtmp_mark(int);
+              if (nx_regtmp_name(p)) nx_regtmp_mark(fd); }
             return fd;
         }
         case 57:                                                 // close
             if (nx_vfd_is((int)a0)) return nx_vfd_close((int)a0);
             { extern void nx_tee_forget(int fd); nx_tee_forget((int)a0); }  // drop stale stdout/err dup flag
+            { extern void nx_regtmp_forget(int fd); nx_regtmp_forget((int)a0); }  // drop reg*.tmp sink flag
             return close((int)a0);
         case 63:                                                 // read
             if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
             return read((int)a0, (void*)a1, (size_t)a2);
         case 64:                                                 // write (vfd; real fds hand-cased in x64syscall)
             if (nx_vfd_is((int)a0)) return nx_vfd_write((int)a0, (const void*)a1, (size_t)a2);
+            { extern int nx_regtmp_is(int); if (nx_regtmp_is((int)a0)) return (long)a2; }  // fast registry save
             return write((int)a0, (void*)a1, (size_t)a2);
         case 50: return nx_vfd_fchdir((int)a0);                  // fchdir
         case 61: return nx_vfd_getdents64((int)a0, (void*)a1, (size_t)a2);   // getdents64

@@ -117,6 +117,38 @@ static void tee_mark(int newfd, int fromfd) {
 // throttled Ryujinx to a crawl and starved the wine client.
 void nx_tee_forget(int fd) { if (fd >= 0 && fd < 1024) g_tee[fd] = 0; }
 
+// M2.7 fast registry save: the wineserver flushes each registry branch by writing a `reg<pid>.tmp`
+// file then renaming it over the real `.reg`. Through fsdev+dynarec each 8 KiB write is ms-slow, so
+// one save-all (system/user/userdef.reg) pins the SINGLE-THREADED server for 25 s+ inside write()/
+// rename() — it never returns to select(), and the wine client starves mid-startup (confirmed by a
+// timestamped trace: client quiescent after MapOwner @43 s while the server logged nonstop 8192-byte
+// writes to reg20000.tmp through 69 s+). Registry PERSISTENCE is irrelevant to `cmd /c echo`, so make
+// the save near-instant: discard writes to a reg*.tmp fd (nx_regtmp_is) and short-circuit the
+// reg*.tmp->*.reg rename (below) so the real .reg files stay intact for a fast next-run startup.
+// Keyed on (pid,fd): the client and wineserver are separate guests with independent fd tables, so a
+// bare fd number aliases across them — only the owning instance's reg*.tmp fd must be discarded.
+int nx_regtmp_name(const char* p) {
+    if (!p) return 0;
+    const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
+    size_t n = strlen(b);
+    return n >= 8 && !strncmp(b, "reg", 3) && !strcmp(b + n - 4, ".tmp");
+}
+static struct { int pid, fd; } g_regtmp[64];
+static int g_regtmp_n = 0;
+void nx_regtmp_mark(int fd) {
+    if (g_regtmp_n < 64) { g_regtmp[g_regtmp_n].pid = nx_guest_pid(); g_regtmp[g_regtmp_n].fd = fd; g_regtmp_n++; }
+}
+int nx_regtmp_is(int fd) {
+    int pid = nx_guest_pid();
+    for (int i = 0; i < g_regtmp_n; i++) if (g_regtmp[i].fd == fd && g_regtmp[i].pid == pid) return 1;
+    return 0;
+}
+void nx_regtmp_forget(int fd) {
+    int pid = nx_guest_pid();
+    for (int i = 0; i < g_regtmp_n; i++)
+        if (g_regtmp[i].fd == fd && g_regtmp[i].pid == pid) { g_regtmp[i] = g_regtmp[--g_regtmp_n]; return; }
+}
+
 static inline int  is_vfd(int fd)  { return fd >= NX_VFD_BASE && fd < NX_VFD_BASE + NX_VFD_MAX; }
 static inline vfd_t* V(int fd)     { return &g_v[fd - NX_VFD_BASE]; }
 static inline size_t rused(vfd_t* v){ return v->wr - v->rd; }
@@ -418,6 +450,8 @@ long nx_vfd_write(int fd, const void* buf, size_t n) {
             vlog("nx_vfd: REQ pid=%d fd=%d code=%d n=%zu\n", nx_guest_pid(), fd, rq, n); }
     }
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
+    { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+      if (on) vlog("nx_vfd: VW pid=%d fd=%d peer=%d n=%zu\n", nx_guest_pid(), fd, V(fd)->peer, n); }
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
     if (v->kind != VK_PIPE && v->kind != VK_SOCK) { pthread_mutex_unlock(&g_mx); errno = EINVAL; return -1; }
@@ -801,6 +835,9 @@ int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
         }
         if (ready || timeout_ms == 0 || has_real) { pthread_mutex_unlock(&g_mx); return ready; }
         if (timeout_ms < 0) {
+            { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+              if (on) { char b[128]; int m = snprintf(b, sizeof b, "nx_vfd: POLLBLK pid=%d n=%lu fd0=%d fd1=%d\n",
+                  nx_guest_pid(), n, n>0?pf[0].fd:-1, n>1?pf[1].fd:-1); svcOutputDebugString(b, m); } }
             pthread_cond_wait(&g_cv, &g_mx);
             pthread_mutex_unlock(&g_mx);
         } else {
@@ -906,6 +943,11 @@ int nx_rename_guest(const char* a, const char* b) {
     if (!a || !b) { errno = EFAULT; return -1; }
     if (nx_translate_path(a, ha, sizeof ha) != 0) return -1;
     if (nx_translate_path(b, hb, sizeof hb) != 0) return -1;
+    // Fast registry save: the reg*.tmp source was written empty (writes discarded, see nx_regtmp_is),
+    // so DON'T clobber the real .reg with it — report success and drop the empty temp. The in-memory
+    // registry the server already loaded is authoritative for this run; the on-disk .reg stays valid
+    // for a fast next-run startup. (Applies only to the reg*.tmp->*.reg save rename.)
+    if (nx_regtmp_name(a)) { unlink(ha); return 0; }
     int r = rename(ha, hb);
     if (r != 0) {
         // fsdev's rename does NOT atomically replace an existing target (POSIX rename overwrites; fsdev
