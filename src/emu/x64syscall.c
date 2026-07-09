@@ -551,6 +551,13 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     if (s == 231 || s == 60) {
         R_EAX = R_EDI;
         emu->quit = 1;
+        emu->exit = 1;   // box64-nx (M2.2c2): mark a REAL guest exit, not just a loop-unwind. Needed when
+                         // the guest reaches exit_group from INSIDE a nested DynaCall — e.g. a signal
+                         // handler that siglongjmp()s out and runs the program to completion within the
+                         // delivery context. DynaCall resets emu->quit=0 on return, so quit alone unwinds
+                         // only ONE EmuRun level and the guest resumes stale; emu->exit propagates via
+                         // RunFunctionHandler's *exit so the delivery core / nx_deliver_self exit(ret).
+                         // (Matches box64's own exit handling in x86syscall.c:269-274.)
         return;
     }
     // glibc 2.34+ pthread_create issues clone3 (435) first and falls back to legacy clone (56) ONLY

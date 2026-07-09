@@ -26,3 +26,8 @@
 // (dynarec_native.c), which on Switch cleans the D-cache on the `rw` alias and invalidates the
 // I-cache on the `rx` alias after each block is emitted — so there is no separate sync entry point.
 void* nx_jit_alloc(size_t size, int64_t* out_rw_bias);
+
+// box64-nx (M2.2c2): translate an EXECUTABLE (`rx`) address inside a JIT chunk to its WRITABLE (`rw`)
+// alias (rw = rx + rw_bias). Used by the Horizon CPU-exception handler to map a faulting native PC to
+// the rw alias that the dynablock index and getX64Address expect. Returns NULL if `rx` is not JIT code.
+void* nx_jit_rx_to_rw(void* rx);

@@ -23,6 +23,7 @@ static int nx_jit_seq = 0;
 // the M1 scope). A small intrusive list is enough — chunk creation is rare (2 MiB at a time).
 typedef struct nx_jit_node_s {
     Jit                    jit;
+    size_t                 size;   // page-aligned chunk size (for the rx->rw reverse lookup)
     struct nx_jit_node_s*  next;
 } nx_jit_node_t;
 
@@ -52,6 +53,7 @@ void* nx_jit_alloc(size_t size, int64_t* out_rw_bias)
         return NULL;
     }
 
+    node->size = size;
     node->next = nx_jit_list;
     nx_jit_list = node;
 
@@ -63,6 +65,24 @@ void* nx_jit_alloc(size_t size, int64_t* out_rw_bias)
     if (out_rw_bias)
         *out_rw_bias = (int64_t)((intptr_t)rw - (intptr_t)rx);
     return rw;
+}
+
+// box64-nx (M2.2c2): reverse of the rw->rx bias. A CPU fault inside JIT code reports the EXECUTABLE
+// (`rx`) PC, but the dynablock index (rbt_dynmem) and getX64Address are keyed on the WRITABLE (`rw`)
+// alias, so we must translate rx->rw before looking the fault up. rbt_dynmem has no rx key, so walk
+// the chunk list (chunk creation is rare — 2 MiB at a time — and this only runs on a real fault) and
+// map the rx address into its chunk's rw alias: rw = rx + (rw_base - rx_base). Returns NULL if `rx`
+// is not inside any JIT chunk (the fault is in box64's own code or in guest data, not generated code).
+void* nx_jit_rx_to_rw(void* rx)
+{
+    for (nx_jit_node_t* n = nx_jit_list; n; n = n->next) {
+        uint8_t* rxb = (uint8_t*)jitGetRxAddr(&n->jit);
+        if ((uint8_t*)rx >= rxb && (uint8_t*)rx < rxb + n->size) {
+            intptr_t bias = (intptr_t)jitGetRwAddr(&n->jit) - (intptr_t)rxb;   // rw_base - rx_base
+            return (void*)((intptr_t)rx + bias);
+        }
+    }
+    return NULL;
 }
 
 #endif // __SWITCH__

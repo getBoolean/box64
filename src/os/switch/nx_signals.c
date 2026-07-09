@@ -66,6 +66,8 @@
 #define X64_SI_KERNEL    128
 #define X64_SI_TKILL     (-6)
 
+extern void nx_result_log(const char*);   // nx_main.c: heap-free SD result line (for signal-context exit visibility)
+
 int  my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_siginfo_t* info, void* ucntx, int* old_code, void* cur_db);
 void my_sigactionhandler_oldcode(x64emu_t* emu, int32_t sig, int simple, x64_siginfo_t* info, void* ucntx, int* old_code, void* cur_db, uintptr_t x64pc);
 
@@ -553,10 +555,33 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
     #undef GO
     emu->eflags.x64 = old_eflags;
 
+#ifdef __SWITCH__
+    // box64-nx (M2.2c2): if the guest EXITED inside the handler — i.e. it did a non-local jump (siglongjmp)
+    // out of the handler and ran the program all the way to exit_group(), which on Horizon sets emu->exit
+    // (=> exits) and RETURNS here rather than terminating (there is no host exit syscall) — then there is
+    // NOTHING to resume: the guest is gone. Terminate NOW with its code. This MUST come before the
+    // memcmp/siglongjmp resume block below: the guest's exit-path execution dirties the on-stack sigcontext
+    // (changed!=0), so that block would otherwise siglongjmp back to the (already-exited) faulting RIP and
+    // re-fault forever. `ret` is RunFunctionHandler's return = the guest's exit code (captured pre-restore).
+    if(exits) {
+        char b[64]; snprintf(b, sizeof b, "guest exited=%d (in signal handler)", (int)ret); nx_result_log(b);
+        #ifdef DYNAREC
+        if(Locks & is_dyndump_locked) CancelBlock64(1);
+        #endif
+        exit((int)ret);
+    }
+#endif
     if(memcmp(sigcontext, &sigcontext_copy, sizeof(x64_ucontext_t))) {
         #if defined(DYNAREC)
         if(db || emu->jmpbuf)
             mctx2emu(emu, &sigcontext->uc_mcontext);
+        #ifndef __SWITCH__
+        // box64-nx (M2.2c2): the native_next resume relies on a KERNEL sigreturn restoring the modified
+        // host context (copyEmu2USignalCTXreg writes emu back into the host regs[]/pc, then the handler
+        // returns and the kernel resumes at native_next). Horizon has no sigreturn from a CPU exception —
+        // libnx's return path goes to svcBreak. So on Switch we skip this and fall through to the
+        // siglongjmp(emu->jmpbuf) branch below, which resumes the guest by re-entering EmuRun on the
+        // faulting thread's own stack at the (already-updated) R_RIP.
         if(db && !ACCESS_FLAG(F_TF)) {
             // if signal was inside a dynablock, just mirror all the new regs in the right place to simple run native_next
             mctx2emu(emu, &sigcontext->uc_mcontext);
@@ -564,6 +589,7 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
             printf_log((sig==10)?LOG_DEBUG:log_minimum, "Context has been changed in Sigactionhanlder, jumping to native_next from DynaBlock at %p, RSP=%p\n", (void*)R_RIP, (void*)R_RSP);
             return 1;
         }
+        #endif // !__SWITCH__
         #endif
         if(emu->jmpbuf) {
             #ifndef DYNAREC
@@ -634,6 +660,10 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
         if(Locks & is_dyndump_locked)
             CancelBlock64(1);
         #endif
+        // box64-nx (M2.2c2): the guest exited from inside the handler (siglongjmp-out then ran to
+        // exit_group). This is the correct terminate-now path; log the code since nx_main's
+        // "guest exited=N" line is skipped when we exit() from this nested delivery context.
+        { char b[64]; snprintf(b, sizeof b, "guest exited=%d (in signal handler)", (int)ret); nx_result_log(b); }
         exit(ret);
     }
 #ifndef __SWITCH__
@@ -782,16 +812,25 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     uint64_t s_rax=R_RAX, s_rcx=R_RCX, s_rdx=R_RDX, s_r8=R_R8, s_r9=R_R9, s_r10=R_R10, s_r11=R_R11;
     x64flags_t s_eflags = emu->eflags;
     int exits = 0;
+    uint64_t hret;
     if(my_context->is_sigaction[sig]) {
         static __thread x64_siginfo_t  si_buf;
         static __thread x64_ucontext_t uc_buf;
         si_buf = info;
         memset(&uc_buf, 0, sizeof(uc_buf));
         emu2mctx(&uc_buf.uc_mcontext, emu);   // give an SA_SIGINFO handler a real mcontext to inspect
-        RunFunctionHandler(emu, &exits, 1, NULL, h, 3, (uint64_t)sig,
-                           (uint64_t)(uintptr_t)&si_buf, (uint64_t)(uintptr_t)&uc_buf);
+        hret = RunFunctionHandler(emu, &exits, 1, NULL, h, 3, (uint64_t)sig,
+                                  (uint64_t)(uintptr_t)&si_buf, (uint64_t)(uintptr_t)&uc_buf);
     } else {
-        RunFunctionHandler(emu, &exits, 1, NULL, h, 1, (uint64_t)sig);
+        hret = RunFunctionHandler(emu, &exits, 1, NULL, h, 1, (uint64_t)sig);
+    }
+    // box64-nx (M2.2c2): if the handler (or code it siglongjmp()'d into) ran the guest all the way to
+    // exit()/exit_group(), the exit propagates here as emu->exit (=> *exits). We must terminate NOW —
+    // returning would restore the pre-signal regs and resume the (already-exited) guest into garbage
+    // (glibc then trips its stack canary -> "stack smashing detected"). hret carries the exit code.
+    if(exits) {
+        char b[64]; snprintf(b, sizeof b, "guest exited=%d (in signal handler)", (int)hret); nx_result_log(b);
+        exit((int)hret);
     }
     R_RAX=s_rax; R_RCX=s_rcx; R_RDX=s_rdx; R_R8=s_r8; R_R9=s_r9; R_R10=s_r10; R_R11=s_r11;
     emu->eflags = s_eflags;
