@@ -26,6 +26,10 @@ int   nx_vm_status(uintptr_t *base, size_t *size, unsigned long long *sysres);
 int nx_gettid(void);
 int nx_sched_yield(void);
 
+// M2.3: translate a host (newlib) errno number to the Linux errno the guest glibc expects. Applied
+// at the syscall-return seam (emu/x64syscall.c). Identity for values that already match Linux.
+int nx_errno_h2l(int host_errno);
+
 #ifdef __cplusplus
 }
 #endif

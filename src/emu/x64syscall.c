@@ -2,6 +2,7 @@
 #include <stdint.h>
 #ifdef __SWITCH__
 #include <switch.h>         /* svcOutputDebugString — mirror guest stdout to the debug log */
+int nx_errno_h2l(int host_errno);   /* src/os/switch/nx_posix.c — host(newlib)->Linux errno (M2.3) */
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -605,7 +606,11 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                 return;
         }
         if(S_EAX==-1 && errno>0)
+#ifdef __SWITCH__
+            S_RAX = -nx_errno_h2l(errno);   // M2.3: newlib host errno -> the Linux errno the guest expects
+#else
             S_RAX = -errno;
+#endif
         if(log) snprintf(buffret, 127, "0x%x%s", R_EAX, buff2);
         if(log && !BOX64ENV(rolling_log)) printf_log_prefix(0, LOG_NONE, "=> %s\n", buffret);
         return;
@@ -1052,6 +1057,15 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             S_RAX = -ENOSYS;
             break;
     }
+#ifdef __SWITCH__
+    // M2.3: every case above stored S_RAX = -host(newlib)_errno on failure. Kernel ABI reserves the
+    // range [-4095,-1] for -errno (exactly glibc's error-vs-success test), so translate any RAX in that
+    // range to the Linux errno the guest glibc expects. Success returns (>=0, or a pointer < -4095 such
+    // as MAP_FAILED's identity-mapped -1) are untouched; the wrapper path (above) already translated and
+    // returned before reaching here, as does clone3's early -38. (No-op on non-newlib hosts.)
+    if ((int64_t)R_RAX <= -1 && (int64_t)R_RAX >= -4095)
+        R_RAX = (uint64_t)(int64_t)(-nx_errno_h2l((int)(-(int64_t)R_RAX)));
+#endif
     if(log) {
         if(BOX64ENV(rolling_log))
             snprintf(buffret, 127, "0x%lx%s", R_RAX, buff2);
