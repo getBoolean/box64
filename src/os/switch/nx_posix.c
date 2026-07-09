@@ -53,6 +53,7 @@ typedef struct nx_clone_s {
     int    flags;
     int*   ctid;         // CLONE_CHILD_CLEARTID target, or NULL
     int    tid;          // our positive, unique tid (== the value written to *ptid)
+    int    gpid;         // creator's guest-instance pid (M2.5) — the child inherits it
 } nx_clone_t;
 
 static _Atomic int          g_nx_next_tid = 2;     // 1 is the main thread
@@ -290,9 +291,18 @@ int lstat64(const char *p, struct stat64 *b)  { return lstat(p, (struct stat *)b
 #endif
 int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     int r;
+    extern int nx_vfd_is(int fd);
+    extern int nx_vfd_stat(int fd, struct stat* st);
+    extern const char* nx_vfd_dir_guest(int fd);
     if ((flags & AT_EMPTY_PATH) || !path || !path[0])
-        r = fstat(dirfd, b);                             // fstat via the open fd
+        r = nx_vfd_is(dirfd) ? nx_vfd_stat(dirfd, b)     // M2.5: dir/socket vfds
+                             : fstat(dirfd, b);          // fstat via the open fd
     else {
+        char gp[512];                                    // M2.5: relative to a dir vfd
+        if (path[0] != '/' && nx_vfd_is(dirfd) && nx_vfd_dir_guest(dirfd)) {
+            snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest(dirfd), path);
+            path = gp;
+        }
         char hp[512];                                    // M2.4: rootfs VFS (was flat-lib basename)
         if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
         r = stat(hp, b);
@@ -651,9 +661,36 @@ static const char kx_cpuinfo[] =
     "sse sse2 ht syscall nx lm constant_tsc rep_good nopl cpuid pni ssse3 cx16 sse4_1 sse4_2 "
     "popcnt aes xsave avx\nbogomips\t: 2040.00\n\n";
 
+// Normalize a guest path: resolve a relative path against the guest CWD (nx_cwd, set by
+// chdir/fchdir) and collapse "." / ".." / duplicate slashes, so "sdmc:..." never sees them
+// (fsdev chokes on "/dir/." forms). Output is an absolute guest path.
+extern char nx_cwd[512];
+static void nx_normalize_guest(const char* p, char* out, size_t outn) {
+    char joined[1024];
+    if (p[0] == '/') snprintf(joined, sizeof joined, "%s", p);
+    else snprintf(joined, sizeof joined, "%s/%s", (nx_cwd[0] == '/') ? nx_cwd : "/", p);
+    // segment-wise collapse
+    char* segs[64]; int n = 0;
+    char work[1024]; snprintf(work, sizeof work, "%s", joined);
+    for (char* t = strtok(work, "/"); t; t = strtok(NULL, "/")) {
+        if (!strcmp(t, ".") || !t[0]) continue;
+        if (!strcmp(t, "..")) { if (n) n--; continue; }
+        if (n < 64) segs[n++] = t;
+    }
+    size_t o = 0;
+    for (int i = 0; i < n && o + 1 < outn; i++) {
+        int w = snprintf(out + o, outn - o, "/%s", segs[i]);
+        if (w < 0) break; o += (size_t)w;
+    }
+    if (!n) snprintf(out, outn, "/");
+}
+
 int nx_translate_path(const char* p, char* out, size_t outn) {
     if (!p || !p[0]) { errno = ENOENT; return -1; }
     if (!strncmp(p, "sdmc:", 5)) { snprintf(out, outn, "%s", p); return 0; }   // already Horizon
+    char norm[512];
+    nx_normalize_guest(p, norm, sizeof norm);
+    p = norm;
     // Synthetic pseudo-files, backed by a materialized SD temp file.
     if (!strcmp(p, "/proc/cpuinfo"))
         return nx_materialize("proc-cpuinfo", kx_cpuinfo, sizeof kx_cpuinfo - 1, out, outn);
@@ -663,9 +700,9 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
     }
     if (!strcmp(p, "/dev/null"))
         return nx_materialize("dev-null", "", 0, out, outn);
-    // Absolute path: rootfs tree first, then the flat lib/<basename> fallback, else the rootfs path
+    // Rootfs tree first, then the flat lib/<basename> fallback, else the rootfs path
     // (so an O_CREAT of a new file still lands somewhere sane under the rootfs).
-    if (p[0] == '/') {
+    {
         struct stat st;
         snprintf(out, outn, "%s%s", NX_ROOTFS, p);
         if (stat(out, &st) == 0) return 0;
@@ -675,8 +712,6 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
         snprintf(out, outn, "%s%s", NX_ROOTFS, p);
         return 0;
     }
-    snprintf(out, outn, "%s/%s", NX_ROOTFS, p);                   // relative -> under the rootfs
-    return 0;
 }
 
 // M2.1 libos: the guest's real ld.so/glibc issue raw Linux syscalls; box64 translates the x86-64 number
@@ -685,6 +720,47 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
 // gap. NUMBERS ARE aarch64/generic-Linux NRs (box64 already translated from x86-64).
 static uint8_t *g_brk_base = NULL, *g_brk_cur = NULL, *g_brk_end = NULL;   // simple bump arena for brk()
 char nx_cwd[512] = "/";   // M2.7: guest CWD (VFS resolves against the rootfs; this is just for getcwd)
+
+// M2.5: per-"process" guest pid. One Horizon process hosts multiple guest INSTANCES (the wine client
+// + the wineserver thread), which must see different getpid()s — wineserver keys its process table on
+// the client pid (SO_PEERCRED + the init_first_thread handshake). Thread-local, inherited via clone().
+static pthread_key_t g_pidkey;
+static pthread_once_t g_pidonce = PTHREAD_ONCE_INIT;
+static void nx_pidkey_init(void) { pthread_key_create(&g_pidkey, NULL); }
+int nx_guest_pid(void) {
+    pthread_once(&g_pidonce, nx_pidkey_init);
+    void* v = pthread_getspecific(g_pidkey);
+    return v ? (int)(uintptr_t)v : 100;                 // main guest instance = pid 100
+}
+void nx_set_guest_pid(int pid) {
+    pthread_once(&g_pidonce, nx_pidkey_init);
+    pthread_setspecific(g_pidkey, (void*)(uintptr_t)pid);
+}
+
+// nx_vfd.c (M2.5): virtual fds — dirs, pipes, in-process AF_UNIX sockets
+int  nx_vfd_is(int fd);
+int  nx_vfd_open_dir(const char* guest, const char* host);
+const char* nx_vfd_dir_host(int fd);
+const char* nx_vfd_dir_guest(int fd);
+int  nx_vfd_close(int fd);
+long nx_vfd_read(int fd, void* buf, size_t n);
+long nx_vfd_write(int fd, const void* buf, size_t n);
+int  nx_vfd_stat(int fd, struct stat* st);
+long nx_vfd_getdents64(int fd, void* buf, size_t count);
+int  nx_vfd_fchdir(int fd);
+int  nx_pipe2(int fds[2], int linux_flags);
+int  nx_socket(int domain, int type, int protocol);
+int  nx_socketpair(int domain, int type, int protocol, int sv[2]);
+int  nx_bind(int fd, const void* addr, unsigned alen);
+int  nx_listen(int fd, int backlog);
+int  nx_connect(int fd, const void* addr, unsigned alen);
+int  nx_accept4(int fd, void* addr, unsigned* alen, int flags);
+long nx_sendmsg(int fd, const void* msg, int flags);
+long nx_recvmsg(int fd, void* msg, int flags);
+int  nx_getsockopt(int fd, int level, int opt, void* val, unsigned* len);
+int  nx_setsockopt(int fd, int level, int opt, const void* val, unsigned len);
+int  nx_getsockname(int fd, void* addr, unsigned* alen);
+int  nx_poll(void* pfds, unsigned long n, int timeout_ms);
 long syscall(long number, ...) {
     va_list ap; va_start(ap, number);
     unsigned long a0 = va_arg(ap, unsigned long);
@@ -718,18 +794,71 @@ long syscall(long number, ...) {
             const char* p = (const char*)a1;
             if (!p) { errno = EFAULT; return -1; }
             // M2.4 rootfs VFS: map the guest Linux path to a Horizon path (rootfs tree, flat-lib
-            // fallback, or a synthetic /proc,/dev file) and open with the guest's flags converted to
-            // newlib's. dirfd is AT_FDCWD for the absolute lookups ld.so/glibc/Wine issue. Keep
-            // open()'s errno (translated to Linux at the syscall-return seam) so ENOENT propagates.
+            // fallback, or a synthetic /proc,/dev file). FLAGS ARRIVE HOST-CONVERTED: box64's
+            // openat case (x64syscall.c) applies of_convert() before this host syscall, so a2 is
+            // already newlib bits — do NOT re-convert (double conversion silently drops O_CREAT;
+            // cost a bring-up cycle). Keep open()'s errno for the Linux-errno return seam.
+            // M2.5: a relative path with a dir vfd resolves against that dir; opening a DIRECTORY
+            // returns a dir vfd (newlib open() can't open dirs — glibc opendir needs this).
+            char gp[512];
+            if (p[0] != '/' && nx_vfd_is((int)a0) && nx_vfd_dir_guest((int)a0)) {
+                snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest((int)a0), p);
+                p = gp;
+            }
             char hp[512];
             if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
-            int fd = open(hp, nx_oflags_l2h((int)a2), (mode_t)a3);
+            struct stat st;
+            if (stat(hp, &st) == 0 && S_ISDIR(st.st_mode)) {
+                if ((a2 & 3) != 0) { errno = EISDIR; return -1; }        // write access on a dir
+                int dfd = nx_vfd_open_dir(p, hp);
+                nx_warnf("nx: openat dir '%s' -> vfd=%d\n", p, dfd);
+                return dfd;
+            }
+#ifdef O_DIRECTORY
+            if (a2 & O_DIRECTORY) { errno = ENOTDIR; return -1; }        // O_DIRECTORY on a non-dir
+#endif
+            int fd = open(hp, (int)a2, (mode_t)a3);
             if (fd < 0) { nx_warnf("nx: openat '%s' -> '%s' FAIL e=%d\n", p, hp, errno); return -1; }
             nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, hp, fd);
             return fd;
         }
-        case 57: return close((int)a0);                          // close
-        case 63: return read((int)a0, (void*)a1, (size_t)a2);    // read
+        case 57: return nx_vfd_is((int)a0) ? nx_vfd_close((int)a0) : close((int)a0);   // close
+        case 63:                                                 // read
+            if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
+            return read((int)a0, (void*)a1, (size_t)a2);
+        case 64:                                                 // write (vfd; real fds hand-cased in x64syscall)
+            if (nx_vfd_is((int)a0)) return nx_vfd_write((int)a0, (const void*)a1, (size_t)a2);
+            return write((int)a0, (void*)a1, (size_t)a2);
+        case 50: return nx_vfd_fchdir((int)a0);                  // fchdir
+        case 61: return nx_vfd_getdents64((int)a0, (void*)a1, (size_t)a2);   // getdents64
+        case 32: return 0;                                       // flock -> single fs user, accept
+        case 59: return nx_pipe2((int*)a0, (int)a1);             // pipe2
+        case 73: {  // ppoll(fds, n, timespec*, sigmask) -> nx_poll
+            struct kx_ts { long s, ns; } *ts = (struct kx_ts*)a2;
+            int ms = ts ? (int)(ts->s * 1000 + ts->ns / 1000000) : -1;
+            return nx_poll((void*)a0, (unsigned long)a1, ms);
+        }
+        // ---- M2.5 in-process AF_UNIX sockets (aarch64 NRs; box64 scwrap routes here) ----
+        case 198: return nx_socket((int)a0, (int)a1, (int)a2);
+        case 199: return nx_socketpair((int)a0, (int)a1, (int)a2, (int*)a3);
+        case 200: return nx_bind((int)a0, (const void*)a1, (unsigned)a2);
+        case 201: return nx_listen((int)a0, (int)a1);
+        case 202: return nx_accept4((int)a0, (void*)a1, (unsigned*)a2, 0);
+        case 242: return nx_accept4((int)a0, (void*)a1, (unsigned*)a2, (int)a3);   // accept4
+        case 203: return nx_connect((int)a0, (const void*)a1, (unsigned)a2);
+        case 204: return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);
+        case 205: return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);        // getpeername
+        case 206:   // sendto (unix stream: addr ignored)
+            if (nx_vfd_is((int)a0)) return nx_vfd_write((int)a0, (const void*)a1, (size_t)a2);
+            errno = EBADF; return -1;
+        case 207:   // recvfrom
+            if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
+            errno = EBADF; return -1;
+        case 208: return nx_setsockopt((int)a0, (int)a1, (int)a2, (const void*)a3, (unsigned)a4);
+        case 209: return nx_getsockopt((int)a0, (int)a1, (int)a2, (void*)a3, (unsigned*)a4);
+        case 210: return 0;                                      // shutdown -> accept
+        case 211: return nx_sendmsg((int)a0, (const void*)a1, (int)a2);
+        case 212: return nx_recvmsg((int)a0, (void*)a1, (int)a2);
         case 62: return (long)lseek((int)a0, (off_t)a1, (int)a2);// lseek
         case 67: {  // pread64(fd, buf, count, offset) — ld.so reads ELF headers at offsets
             off_t cur = lseek((int)a0, 0, SEEK_CUR);             // save position (newlib may lack pread)
@@ -752,7 +881,7 @@ long syscall(long number, ...) {
         }
         case 135: return 0;                          // rt_sigprocmask -> accept (no signals yet)
         case 178: return nx_gettid();                // gettid
-        case 172: return 1;                          // getpid (single process)
+        case 172: return nx_guest_pid();             // getpid (per guest INSTANCE — M2.5)
         case 124: svcSleepThread(0); return 0;       // sched_yield
         case 98:  return nx_futex((int*)a0, (int)a1, (unsigned)a2, (const void*)a3, (int*)a4, (unsigned)a5);
         // M2.7 (Wine): the WINEPREFIX. box64-nx's VFS resolves paths against the rootfs (not a real CWD),
@@ -781,13 +910,8 @@ long syscall(long number, ...) {
             return 0;
         }
         case 34: {   // mkdirat(dirfd, path, mode) — create a dir in the rootfs (Wine: server tmpdir)
-            const char* p = (const char*)a1;
-            if (!p) { errno = EFAULT; return -1; }
-            char hp[512];
-            if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
-            int r = mkdir(hp, (mode_t)a2);
-            if (r < 0 && errno == EEXIST) return 0;
-            return r;
+            extern int nx_mkdir_guest(const char* p, unsigned mode);
+            return nx_mkdir_guest((const char*)a1, (unsigned)a2);
         }
         default:
             nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
@@ -804,6 +928,7 @@ long syscall(long number, ...) {
 static void* nx_clone_trampoline(void* p) {
     nx_clone_t* c = (nx_clone_t*)p;
     g_nx_self = c;                          // publish tid/ctid before running the guest
+    { extern void nx_set_guest_pid(int); nx_set_guest_pid(c->gpid); }   // same guest "process"
     c->fn(c->arg);                          // clone_fn_syscall: DynaRun the guest, FreeX64Emu, then return
                                             // here (on __SWITCH__ it returns instead of _exit; x64syscall.c)
     if (c->ctid) {                          // CLONE_CHILD_CLEARTID: zero the tid + wake pthread_join
@@ -835,6 +960,7 @@ int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
     c->flags = flags;
     c->ctid  = (flags & CLONE_CHILD_CLEARTID) ? ctid : NULL;
     c->tid   = atomic_fetch_add_explicit(&g_nx_next_tid, 1, memory_order_relaxed);
+    { extern int nx_guest_pid(void); c->gpid = nx_guest_pid(); }   // child stays in this guest "process"
     if ((flags & CLONE_PARENT_SETTID) && ptid) *ptid = c->tid;   // == the value glibc caches as pd->tid
 
     pthread_attr_t attr;

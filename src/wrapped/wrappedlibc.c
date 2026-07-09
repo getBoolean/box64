@@ -1737,7 +1737,13 @@ EXPORT int my_stat(x64emu_t *emu, void* filename, void* buf)
 {
     (void)emu;
     struct stat st;
+#ifdef __SWITCH__
+    // route through the nx fstatat (nx_posix.c) so the guest path is rootfs-translated (M2.4)
+    // and gets the st_dev/st_ino identity fix; newlib stat would see the raw Linux path
+    int r = fstatat(-100 /*AT_FDCWD*/, filename, &st, 0);
+#else
     int r = stat(filename, &st);
+#endif
     if(!r)
         UnalignStat64(&st, buf);
     return r;
@@ -1748,18 +1754,30 @@ EXPORT int my_lstat(x64emu_t *emu, void* filename, void* buf)
 {
     (void)emu;
     struct stat st;
+#ifdef __SWITCH__
+    int r = fstatat(-100 /*AT_FDCWD*/, filename, &st, 0);   // no symlinks on fsdev — lstat == stat
+#else
     int r = lstat(filename, &st);
+#endif
     if(!r)
         UnalignStat64(&st, buf);
     return r;
 }
 EXPORT int my_lstat64(x64emu_t *emu, void* filename, void* buf) __attribute__((alias("my_lstat")));
 
+#ifdef __SWITCH__
+int nx_vfd_is(int fd);                       // nx_vfd.c (M2.5): dir/pipe/socket virtual fds
+int nx_vfd_stat(int fd, struct stat* st);
+#endif
 EXPORT int my_fstat(x64emu_t *emu, int fd, void* buf)
 {
     (void)emu;
     struct stat st;
+#ifdef __SWITCH__
+    int r = nx_vfd_is(fd) ? nx_vfd_stat(fd, &st) : fstat(fd, &st);
+#else
     int r = fstat(fd, &st);
+#endif
     if(!r)
         UnalignStat64(&st, buf);
     return r;

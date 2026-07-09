@@ -4,6 +4,8 @@
 #include <switch.h>         /* svcOutputDebugString — mirror guest stdout to the debug log */
 int nx_errno_h2l(int host_errno);   /* src/os/switch/nx_posix.c — host(newlib)->Linux errno (M2.3) */
 void nx_guest_output(int fd, const void *buf, size_t len);  /* nx_main.c — debug log + result-file tee */
+int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
+                   unsigned long a4, unsigned long a5, unsigned long a6, long* ret); /* nx_vfd.c (M2.5) */
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -575,6 +577,17 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     if (s == 62)  { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // kill(pid,sig)
     if (s == 200) { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // tkill(tid,sig)
     if (s == 234) { S_RAX = my_tgkill(emu, (int)R_RDI, (int)R_RSI, (int)R_RDX); return; }   // tgkill(tgid,tid,sig)
+    // M2.5: virtual fds (dirs/pipes/unix sockets, nx_vfd.c) + the raw-guest-path fallback cases
+    // (mkdir/unlink/rename/access/...). Handled BEFORE the big switch, which would hand these to
+    // newlib verbatim. Returns 0 for real fds/unhandled NRs so the normal paths still run.
+    {
+        long pr;
+        if (nx_x64_precase(s, R_RDI, R_RSI, R_RDX, R_R10, R_R8, R_R9, &pr)) {
+            if (pr < 0 && pr > -4096) pr = -(long)nx_errno_h2l((int)-pr);   // host->Linux errno (M2.3)
+            S_RAX = (uint64_t)pr;
+            return;
+        }
+    }
 #endif
     // check wrapper first
     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);
@@ -1095,6 +1108,17 @@ long EXPORT my_syscall(x64emu_t *emu)
         }
         return 0;
     }
+#ifdef __SWITCH__
+    // M2.5: same virtual-fd/raw-path pre-dispatch as x64Syscall (libc syscall() wrapper form:
+    // args shifted one register; -1/errno convention like the cases below)
+    {
+        long pr;
+        if (nx_x64_precase(s, R_RSI, R_RDX, R_RCX, R_R8, R_R9, u64(0), &pr)) {
+            if (pr < 0 && pr > -4096) { errno = (int)-pr; return -1; }
+            return pr;
+        }
+    }
+#endif
     // check wrapper first
     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);
     if(s<cnt && syscallwrap[s].nats) {
