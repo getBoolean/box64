@@ -304,6 +304,11 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
             snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest(dirfd), path);
             path = gp;
         }
+        // M2.5: the wineserver `socket` (a bound vfd) and lock/tmpmap (shared objects) have no fsdev
+        // file, but Wine stat()s the socket before connecting — return a synthetic S_IFSOCK/regular
+        // stat so it doesn't see ENOENT and give up ("cannot connect").
+        { extern int nx_vfd_path_stat(const char* guestpath, struct stat* st);
+          if (nx_vfd_path_stat(path, b) == 0) return 0; }
         if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
         have_hp = 1;
         r = stat(hp, b);
@@ -806,6 +811,10 @@ int  nx_getsockopt(int fd, int level, int opt, void* val, unsigned* len);
 int  nx_setsockopt(int fd, int level, int opt, const void* val, unsigned len);
 int  nx_getsockname(int fd, void* addr, unsigned* alen);
 int  nx_poll(void* pfds, unsigned long n, int timeout_ms);
+int  nx_vfd_open_shared(const char* guestpath, int is_lock);   // wineserver lock/tmpmap (M2.5)
+int  nx_vfd_flock(int fd, int op);
+int  nx_vfd_ftruncate(int fd, off_t len);
+long nx_vfd_lseek(int fd, off_t off, int whence);
 long syscall(long number, ...) {
     va_list ap; va_start(ap, number);
     unsigned long a0 = va_arg(ap, unsigned long);
@@ -864,6 +873,20 @@ long syscall(long number, ...) {
                 snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest((int)a0), p);
                 p = gp;
             }
+            // Canonicalize to an absolute guest path (resolves a relative "lock"/"tmpmap-*" against the
+            // per-instance cwd) so the wineserver-runtime detection below and the shared-object key are
+            // stable across the client and wineserver instances.
+            char np[512]; nx_normalize_guest(p, np, sizeof np); p = np;
+            // M2.5: the wineserver runtime files (its `lock` + `tmpmap-*` shared memory) are shared
+            // between the in-process client and wineserver. fsdev can't open the same file from both
+            // instances and file-backed mmap copies per instance, so back them with in-process shared
+            // state (nx_vfd_open_shared): a pid-owned lock, and a single shared buffer both mmaps see.
+            { const char* base = strrchr(p, '/'); base = base ? base + 1 : p;
+              if (strstr(p, "/wine/server-")) {
+                  if (!strcmp(base, "lock"))            return nx_vfd_open_shared(p, 1);
+                  if (!strncmp(base, "tmpmap", 6))      return nx_vfd_open_shared(p, 0);
+              }
+            }
             char hp[512];
             if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
             struct stat st;
@@ -890,7 +913,12 @@ long syscall(long number, ...) {
             return write((int)a0, (void*)a1, (size_t)a2);
         case 50: return nx_vfd_fchdir((int)a0);                  // fchdir
         case 61: return nx_vfd_getdents64((int)a0, (void*)a1, (size_t)a2);   // getdents64
-        case 32: return 0;                                       // flock -> single fs user, accept
+        case 46:                                                 // ftruncate (wineserver shmem sizing)
+            if (nx_vfd_is((int)a0)) return nx_vfd_ftruncate((int)a0, (off_t)a1);
+            return ftruncate((int)a0, (off_t)a1);
+        case 32:                                                 // flock -> VK_LOCK owner protocol, else accept
+            if (nx_vfd_is((int)a0)) return nx_vfd_flock((int)a0, (int)a1);
+            return 0;
         case 59: return nx_pipe2((int*)a0, (int)a1);             // pipe2
         case 73: {  // ppoll(fds, n, timespec*, sigmask) -> nx_poll
             struct kx_ts { long s, ns; } *ts = (struct kx_ts*)a2;
@@ -918,7 +946,9 @@ long syscall(long number, ...) {
         case 210: return 0;                                      // shutdown -> accept
         case 211: return nx_sendmsg((int)a0, (const void*)a1, (int)a2);
         case 212: return nx_recvmsg((int)a0, (void*)a1, (int)a2);
-        case 62: return (long)lseek((int)a0, (off_t)a1, (int)a2);// lseek
+        case 62:                                                 // lseek
+            if (nx_vfd_is((int)a0)) return nx_vfd_lseek((int)a0, (off_t)a1, (int)a2);
+            return (long)lseek((int)a0, (off_t)a1, (int)a2);
         case 67: {  // pread64(fd, buf, count, offset) — ld.so reads ELF headers at offsets
             off_t cur = lseek((int)a0, 0, SEEK_CUR);             // save position (newlib may lack pread)
             if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) return -1;
@@ -976,6 +1006,12 @@ long syscall(long number, ...) {
             if (!ts) { errno = EFAULT; return -1; }
             u64 ns = armTicksToNs(armGetSystemTick());
             ts->tv_sec = (long)(ns / 1000000000ULL); ts->tv_nsec = (long)(ns % 1000000000ULL);
+            return 0;
+        }
+        case 169: {  // gettimeofday(tv, tz) — wineserver + the client poll loop use it for timing
+            struct kx_tv { long tv_sec, tv_usec; } *tv = (struct kx_tv*)a0;
+            if (tv) { u64 ns = armTicksToNs(armGetSystemTick());
+                      tv->tv_sec = (long)(ns / 1000000000ULL); tv->tv_usec = (long)((ns / 1000ULL) % 1000000ULL); }
             return 0;
         }
         case 34: {   // mkdirat(dirfd, path, mode) — create a dir in the rootfs (Wine: server tmpdir)

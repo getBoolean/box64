@@ -48,9 +48,23 @@ static void vlog(const char* fmt, ...) {
 #define RING_CAP    (256*1024)
 #define FDQ_MAX     32
 
-typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN } vkind_t;
+// VK_LOCK / VK_SHMEM (M2.5): the wineserver runtime files (lock, tmpmap-*) that the client and the
+// in-process wineserver share. fsdev can't open the same file from both instances (2nd open -> EIO)
+// and file-backed mmap copies per instance, so back them with IN-PROCESS shared state keyed by path.
+typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN, VK_LOCK, VK_SHMEM } vkind_t;
 
 typedef struct { int fd; uint64_t at; } fdpass_t;
+
+// A backing object shared by all vfds that opened the same wineserver runtime path.
+typedef struct {
+    int      refs;                // open vfds referencing it (0 = free)
+    char     path[256];
+    uint8_t* mem;                 // VK_SHMEM: page-aligned shared buffer (guest RAM); NULL until sized
+    size_t   size;
+    int      lock_owner;          // VK_LOCK: guest pid holding LOCK_EX (0 = unlocked)
+} shobj_t;
+#define NX_SHOBJ_MAX 48
+static shobj_t g_sh[NX_SHOBJ_MAX];
 
 typedef struct {
     vkind_t  kind;
@@ -72,6 +86,9 @@ typedef struct {
     char     bpath[256];
     int      backlog[8];
     int      backlog_n;
+    // VK_LOCK / VK_SHMEM
+    int      shobj;               // index into g_sh
+    size_t   fpos;                // per-fd position (shmem read/write/lseek)
 } vfd_t;
 
 static vfd_t g_v[NX_VFD_MAX];
@@ -174,9 +191,124 @@ int nx_vfd_stat(int fd, struct stat* st) {
     }
     memset(st, 0, sizeof *st);
     st->st_dev = 1; st->st_ino = v->ino; st->st_nlink = 1;
-    st->st_mode = (v->kind == VK_PIPE) ? (S_IFIFO | 0600) : (S_IFSOCK | 0777);
     st->st_blksize = 4096;
+    if (v->kind == VK_SHMEM || v->kind == VK_LOCK) {
+        st->st_mode = S_IFREG | 0600;
+        st->st_size = (v->shobj >= 0) ? (off_t)g_sh[v->shobj].size : 0;
+    } else {
+        st->st_mode = (v->kind == VK_PIPE) ? (S_IFIFO | 0600) : (S_IFSOCK | 0777);
+    }
     return 0;
+}
+
+// ---- VK_LOCK / VK_SHMEM: shared wineserver runtime files ---------------------------------------
+
+// find-or-create a backing object for `path` (g_mx held); refs++
+static int shobj_get(const char* path) {
+    for (int i = 0; i < NX_SHOBJ_MAX; i++)
+        if (g_sh[i].refs && !strcmp(g_sh[i].path, path)) { g_sh[i].refs++; return i; }
+    for (int i = 0; i < NX_SHOBJ_MAX; i++)
+        if (!g_sh[i].refs) { memset(&g_sh[i], 0, sizeof g_sh[i]); g_sh[i].refs = 1;
+                             snprintf(g_sh[i].path, sizeof g_sh[i].path, "%s", path); return i; }
+    return -1;
+}
+
+// Open a wineserver runtime file (lock or tmpmap-*) as a shared vfd. is_lock selects VK_LOCK vs SHMEM.
+int nx_vfd_open_shared(const char* guestpath, int is_lock) {
+    pthread_mutex_lock(&g_mx);
+    int i = slot_alloc();
+    if (i < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
+    int si = shobj_get(guestpath);
+    if (si < 0) { g_v[i].kind = VK_FREE; pthread_mutex_unlock(&g_mx); errno = ENFILE; return -1; }
+    g_v[i].kind  = is_lock ? VK_LOCK : VK_SHMEM;
+    g_v[i].shobj = si;
+    g_v[i].fpos  = 0;
+    pthread_mutex_unlock(&g_mx);
+    vlog("nx_vfd: open %s '%s' -> vfd=%d pid=%d\n", is_lock ? "LOCK" : "SHMEM",
+         guestpath, NX_VFD_BASE + i, nx_guest_pid());
+    return NX_VFD_BASE + i;
+}
+
+// flock(fd, op): LOCK_SH=1, LOCK_EX=2, LOCK_UN=8, LOCK_NB=4. Wine's server holds LOCK_EX on the lock
+// file; a client's LOCK_EX|LOCK_NB then fails EWOULDBLOCK ("server is running"), which is how it
+// decides to connect instead of starting a server. In-process pid-owned lock (no fsdev).
+int nx_vfd_flock(int fd, int op) {
+    if (!nx_vfd_is(fd) || V(fd)->kind != VK_LOCK) { errno = EBADF; return -1; }
+    pthread_mutex_lock(&g_mx);
+    shobj_t* o = &g_sh[V(fd)->shobj];
+    int pid = nx_guest_pid();
+    int r = 0;
+    if (op & 8) {                                   // LOCK_UN
+        if (o->lock_owner == pid) o->lock_owner = 0;
+    } else if (op & 3) {                            // LOCK_SH or LOCK_EX
+        if (o->lock_owner && o->lock_owner != pid) { errno = EWOULDBLOCK; r = -1; }
+        else o->lock_owner = pid;
+    }
+    pthread_mutex_unlock(&g_mx);
+    vlog("nx_vfd: flock vfd=%d op=%d pid=%d owner=%d -> %d\n", fd, op, pid, o->lock_owner, r);
+    return r;
+}
+
+// Ensure a VK_SHMEM object has a page-aligned shared buffer of at least `need` bytes (guest RAM).
+// The buffer is allocated ONCE at its final size (ftruncate/first mmap set it) so the pointer is
+// stable — both instances' mmaps return the SAME address, giving real shared memory in the one AS.
+extern void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssize_t offset);
+extern void  setProtection(uintptr_t addr, size_t size, uint32_t prot);
+static int shmem_ensure(shobj_t* o, size_t need) {   // g_mx held
+    if (o->mem && o->size >= need) return 0;
+    if (o->mem) return 0;                            // already allocated (don't move — would break maps)
+    size_t sz = (need + 0xffff) & ~(size_t)0xffff;   // 64KB granularity
+    if (sz < 0x10000) sz = 0x10000;
+    void* p = nx_mmap(NULL, sz, 3 /*RW*/, 0x22 /*MAP_ANON|PRIVATE*/, -1, 0);
+    if (p == (void*)-1) { errno = ENOMEM; return -1; }
+    setProtection((uintptr_t)p, sz, 3);
+    o->mem = (uint8_t*)p; o->size = sz;
+    return 0;
+}
+
+int nx_vfd_ftruncate(int fd, off_t len) {
+    if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&g_mx);
+    int r = shmem_ensure(&g_sh[V(fd)->shobj], (size_t)len);
+    pthread_mutex_unlock(&g_mx);
+    return r;
+}
+
+// mmap of a VK_SHMEM fd: return the shared buffer + offset (same address for every mapper).
+void* nx_vfd_mmap(int fd, size_t length, off_t offset) {
+    if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = EACCES; return (void*)-1; }
+    pthread_mutex_lock(&g_mx);
+    shobj_t* o = &g_sh[V(fd)->shobj];
+    if (shmem_ensure(o, (size_t)offset + length) != 0) { pthread_mutex_unlock(&g_mx); return (void*)-1; }
+    void* ret = o->mem + offset;
+    pthread_mutex_unlock(&g_mx);
+    vlog("nx_vfd: mmap SHMEM vfd=%d off=0x%lx len=0x%lx -> %p pid=%d\n",
+         fd, (unsigned long)offset, (unsigned long)length, ret, nx_guest_pid());
+    return ret;
+}
+
+long nx_vfd_lseek(int fd, off_t off, int whence) {
+    if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = ESPIPE; return -1; }
+    pthread_mutex_lock(&g_mx);
+    vfd_t* v = V(fd); shobj_t* o = &g_sh[v->shobj];
+    size_t np = (whence == 1) ? v->fpos + off : (whence == 2) ? o->size + off : (size_t)off;
+    v->fpos = np;
+    pthread_mutex_unlock(&g_mx);
+    return (long)np;
+}
+
+static long shmem_rw(int fd, void* buf, size_t n, int write) {
+    pthread_mutex_lock(&g_mx);
+    vfd_t* v = V(fd); shobj_t* o = &g_sh[v->shobj];
+    if (write && shmem_ensure(o, v->fpos + n) != 0) { pthread_mutex_unlock(&g_mx); return -1; }
+    if (!o->mem) { pthread_mutex_unlock(&g_mx); return 0; }
+    size_t avail = (v->fpos < o->size) ? o->size - v->fpos : 0;
+    size_t k = n < avail ? n : avail;
+    if (write) memcpy(o->mem + v->fpos, buf, k);
+    else       memcpy(buf, o->mem + v->fpos, k);
+    v->fpos += k;
+    pthread_mutex_unlock(&g_mx);
+    return (long)k;
 }
 
 // ---- close / read / write ----------------------------------------------------------------------
@@ -186,6 +318,11 @@ int nx_vfd_close(int fd) {
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
     if (--v->refs > 0) { pthread_mutex_unlock(&g_mx); return 0; }
+    if ((v->kind == VK_LOCK || v->kind == VK_SHMEM) && v->shobj >= 0) {
+        shobj_t* o = &g_sh[v->shobj];
+        if (v->kind == VK_LOCK && o->lock_owner == nx_guest_pid()) o->lock_owner = 0;
+        if (o->refs > 0) o->refs--;   // keep mem/lock alive while other fds reference it
+    }
     if (v->kind == VK_DIR && v->d) closedir(v->d);
     if ((v->kind == VK_PIPE || v->kind == VK_SOCK) && v->peer >= 0 && g_v[v->peer].kind != VK_FREE)
         g_v[v->peer].peer = -1;              // peer sees EOF/EPIPE
@@ -204,6 +341,7 @@ int nx_vfd_close(int fd) {
 
 long nx_vfd_read(int fd, void* buf, size_t n) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, buf, n, 0);
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
     if (v->kind == VK_DIR) { pthread_mutex_unlock(&g_mx); errno = EISDIR; return -1; }
@@ -227,6 +365,7 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
 // write lands in the PEER's inbound ring
 long nx_vfd_write(int fd, const void* buf, size_t n) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
     if (v->kind != VK_PIPE && v->kind != VK_SOCK) { pthread_mutex_unlock(&g_mx); errno = EINVAL; return -1; }
@@ -294,6 +433,29 @@ static void norm_spath(const char* in, char* out, size_t outn) {
     if (in[0] == '/') snprintf(out, outn, "%s", in);
     else { const char* cwd = nx_cwd_buf();
            snprintf(out, outn, "%s/%s", (cwd[0] && strcmp(cwd, "/")) ? cwd : "", in); }
+}
+
+// stat() of a wineserver runtime path that is backed by a vfd (the bound unix `socket`, or the
+// `lock`/`tmpmap-*` shared objects) — no fsdev file exists for these, but Wine stat()s the socket
+// before connecting, so return a synthetic stat (S_IFSOCK for the socket) instead of ENOENT. Returns
+// 0 (st filled) if the resolved path names a live vfd/shared object, else -1.
+int nx_vfd_path_stat(const char* guestpath, struct stat* st) {
+    char want[512]; norm_spath(guestpath, want, sizeof want);   // resolve vs the per-instance cwd
+    pthread_mutex_lock(&g_mx);
+    mode_t mode = 0;
+    for (int i = 0; i < NX_VFD_MAX; i++) {
+        vfd_t* v = &g_v[i];
+        if ((v->kind == VK_LISTEN || v->kind == VK_SOCK) && v->bpath[0] && !strcmp(v->bpath, want)) {
+            mode = S_IFSOCK | 0777; break;
+        }
+    }
+    if (!mode) for (int i = 0; i < NX_SHOBJ_MAX; i++)
+        if (g_sh[i].refs && !strcmp(g_sh[i].path, want)) { mode = S_IFREG | 0600; break; }
+    pthread_mutex_unlock(&g_mx);
+    if (!mode) return -1;
+    memset(st, 0, sizeof *st);
+    st->st_dev = 1; st->st_ino = path_ino(want); st->st_mode = mode; st->st_nlink = 1; st->st_blksize = 4096;
+    return 0;
 }
 
 // Linux sockaddr_un: u16 family, char path[108]
@@ -436,7 +598,10 @@ long nx_recvmsg(int fd, l_msghdr* msg, int flags) {
         int nfit = (int)((msg->controllen - sizeof(l_cmsghdr)) / sizeof(int));
         int nout = 0;
         int* fda = (int*)((uint8_t*)msg->control + sizeof(l_cmsghdr));
-        while (v->fdq_n && nout < nfit && v->fdq[0].at < v->rd) {
+        // Deliver queued SCM_RIGHTS fds whose bytes have been reached (<=, so an fd stamped at the
+        // exact end of the just-consumed reply is still delivered — the client reads exactly the
+        // message bytes, so `<` would strand the reply/wait channel fds and deadlock wineserver).
+        while (v->fdq_n && nout < nfit && v->fdq[0].at <= v->rd) {
             fda[nout++] = v->fdq[0].fd;
             memmove(v->fdq, v->fdq + 1, --v->fdq_n * sizeof(fdpass_t));
         }
@@ -548,6 +713,9 @@ int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
 
 // ---- fcntl / ioctl (vfd subset) ------------------------------------------------------------------
 
+// Linux x86-64 struct flock: short l_type; short l_whence; off_t l_start; off_t l_len; pid_t l_pid;
+typedef struct { short l_type; short l_whence; long l_start; long l_len; int l_pid; } l_flock;
+
 long nx_vfd_fcntl(int fd, int cmd, long arg) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     vfd_t* v = V(fd);
@@ -556,6 +724,31 @@ long nx_vfd_fcntl(int fd, int cmd, long arg) {
         case 2:  return 0;                                        // F_SETFD (CLOEXEC — no exec)
         case 3:  return 2 /*O_RDWR*/ | (v->nonblock ? 0x800 : 0); // F_GETFL (Linux bits)
         case 4:  v->nonblock = (arg & 0x800) ? 1 : 0; return 0;   // F_SETFL
+        case 5: case 6: case 7: {   // F_GETLK / F_SETLK / F_SETLKW — Wine's server lock uses fcntl,
+            // not flock(). The server holds a WRLCK on the lock file; a client's WRLCK then fails EAGAIN
+            // ("server running") -> it connects instead of starting a server. Emulate as a pid-owned
+            // exclusive lock on the shared object (VK_LOCK), so it never reports "doesn't support locks".
+            if (v->kind != VK_LOCK) return 0;                     // record locks on non-lock vfds: accept
+            l_flock* fl = (l_flock*)arg;
+            if (!fl) { errno = EINVAL; return -1; }
+            pthread_mutex_lock(&g_mx);
+            shobj_t* o = &g_sh[v->shobj];
+            int pid = nx_guest_pid();
+            long r = 0;
+            if (cmd == 5) {                                       // F_GETLK: report the holder (or unlocked)
+                if (o->lock_owner && o->lock_owner != pid) { fl->l_type = 1 /*F_WRLCK*/; fl->l_pid = o->lock_owner; }
+                else fl->l_type = 2 /*F_UNLCK*/;
+            } else if (fl->l_type == 2 /*F_UNLCK*/) {
+                if (o->lock_owner == pid) o->lock_owner = 0;
+            } else {                                              // F_RDLCK/F_WRLCK acquire
+                if (o->lock_owner && o->lock_owner != pid) { errno = EAGAIN; r = -1; }
+                else o->lock_owner = pid;
+            }
+            pthread_mutex_unlock(&g_mx);
+            vlog("nx_vfd: fcntl F_SETLK vfd=%d type=%d pid=%d owner=%d -> %ld\n",
+                 fd, fl ? fl->l_type : -1, pid, o->lock_owner, r);
+            return r;
+        }
         default:
             vlog("nx_vfd: fcntl(%d, cmd=%d) unhandled\n", fd, cmd);
             errno = EINVAL; return -1;
@@ -639,9 +832,21 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             break;
         case 21: r = nx_access_guest((const char*)a1, (int)a2); break;
         case 22: r = nx_pipe2((int*)a1, 0); break;
+        case 8:   // lseek (vfd SHMEM only; real fds fall through to box64)
+            if (!nx_vfd_is((int)a1)) return 0;
+            r = nx_vfd_lseek((int)a1, (off_t)a2, (int)a3);
+            break;
         case 72:  // fcntl (vfd only)
             if (!nx_vfd_is((int)a1)) return 0;
             r = nx_vfd_fcntl((int)a1, (int)a2, (long)a3);
+            break;
+        case 73:  // flock (vfd LOCK only)
+            if (!nx_vfd_is((int)a1)) return 0;
+            r = nx_vfd_flock((int)a1, (int)a2);
+            break;
+        case 77:  // ftruncate (vfd SHMEM only)
+            if (!nx_vfd_is((int)a1)) return 0;
+            r = nx_vfd_ftruncate((int)a1, (off_t)a2);
             break;
         case 81:  // fchdir — wineserver saves/restores cwd around ops (open ".", fchdir back)
             if (nx_vfd_is((int)a1)) r = nx_vfd_fchdir((int)a1);

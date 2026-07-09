@@ -405,6 +405,12 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
     (void)prot;
     if (!length) return MAP_FAILED;
 
+    // M2.5: mmap of a wineserver SHMEM vfd (tmpmap-*) returns the SINGLE in-process shared buffer, so
+    // the client and wineserver map the SAME memory (real shared memory in the one address space).
+    extern int nx_vfd_is(int fd);
+    extern void* nx_vfd_mmap(int fd, size_t length, off_t offset);
+    if (fd >= 0 && nx_vfd_is(fd)) return nx_vfd_mmap(fd, (size_t)length, (off_t)offset);
+
     // M2.1: Horizon has no file-backed mmap. The guest's real ld.so maps libc's segments with
     // MAP_PRIVATE(|MAP_FIXED), fd, offset, so emulate it: map anonymous memory, then read the file
     // content at `offset` into it (the tail past EOF stays zero = bss). Mirrors box64's own elf-loader

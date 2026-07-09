@@ -3368,6 +3368,12 @@ EXPORT int32_t my_fcntl64(x64emu_t* emu, int32_t a, int32_t b, void* c)
 EXPORT int32_t my_fcntl(x64emu_t* emu, int32_t a, int32_t b, void* c)
 {
     (void)emu;
+#ifdef __SWITCH__
+    // M2.5: route virtual fds (dir/socket/pipe/lock/shmem) to the vfd fcntl — esp. F_SETLK on the
+    // wineserver lock file, which Wine calls via libc fcntl() (this wrapper), not the raw syscall.
+    { extern int nx_vfd_is(int fd); extern long nx_vfd_fcntl(int fd, int cmd, long arg);
+      if (nx_vfd_is(a)) return (int32_t)nx_vfd_fcntl(a, b, (long)(intptr_t)c); }
+#endif
     if(b==F_SETFL && (intptr_t)c==0xFFFFF7FF) {
         // special case for ~O_NONBLOCK...
         int flags = fcntl(a, F_GETFL);
