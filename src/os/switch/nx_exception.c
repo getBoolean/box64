@@ -35,6 +35,7 @@
 #include "signals.h"     // my_sigactionhandler_oldcode proto + x64_siginfo_t (via the shim)
 #include "sigtools.h"
 #include "nx_jit.h"
+#include "nx_resume.h"   // Stage 4: register-restore-and-branch trampoline for mid-block in-place resume
 #ifdef DYNAREC
 #include "dynablock.h"
 #include "dynarec/dynablock_private.h"
@@ -122,6 +123,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     uint32_t ec   = esr >> 26;
     uint32_t dfsc = esr & 0x3f;
     int sig, si_code;
+    int is_unaligned = 0;   // Stage 4: data-abort alignment fault -> try box64's in-place unaligned fixup
     switch (ctx->error_desc) {
         case ThreadExceptionDesc_MisalignedPC:
         case ThreadExceptionDesc_MisalignedSP:
@@ -133,6 +135,11 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
                 sig = X64_SIGBUS;  si_code = X64_BUS_ADRALN;
             } else if (ec == 0) {             // EC=0 undefined instruction
                 sig = X64_SIGILL;  si_code = X64_ILL_ILLOPC;
+            } else if ((ec == 0x24 || ec == 0x25) && dfsc == 0x21) {
+                // DFSC 0b100001 = alignment fault on a data access: box64's dynarec emitted an
+                // alignment-requiring ARM64 op (unaligned atomic LDAXR/STLXR, some vector ld/st) on an
+                // unaligned x86 address. Classify as SIGBUS but try the in-place fixup first (below).
+                sig = X64_SIGBUS; si_code = X64_BUS_ADRALN; is_unaligned = 1;
             } else {                          // EC 0x24/0x25 data abort (the common bad-deref)
                 sig = X64_SIGSEGV;
                 // DFSC 0b0011xx (0x0C..0x0F) = permission fault -> ACCERR; translation/etc -> MAPERR.
@@ -161,6 +168,34 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             }
         } else { last_far = ctx->far.x; last_rip = x64pc; repeat = 0; }
     }
+
+#ifdef DYNAREC
+    // 3b) Stage 4: unaligned data access that the dynarec lowered to an alignment-faulting ARM64 op
+    //     (unaligned atomic LDAXR/STLXR, some vector ld/st). box64 emulates the access byte-wise IN
+    //     PLACE and resumes at the NEXT native instruction — the mid-block resume Horizon can only do
+    //     via the register-restore trampoline (no kernel sigreturn; siglongjmp can't land mid-block).
+    //     This runs BEFORE guest-signal delivery: an unaligned access box64 can fix is transparent to
+    //     the guest, not a SIGBUS it should see. If sigbus_specialcases can't recognize the op it
+    //     returns 0 and we fall through to real SIGBUS delivery / crash (correct terminate semantics).
+    if (is_unaligned && emu) {
+        struct fpsimd_context* fpsimd = (struct fpsimd_context*)uctx.uc_mcontext.__reserved;
+        // Point sigbus at the rx (executable) alias: it reads the faulting opcode from `pc` and does
+        // uc_mcontext.pc += 4, so the resume target becomes rx+4 (rw is non-executable under W^X).
+        uctx.uc_mcontext.pc = ctx->pc.x;
+        if (sigbus_specialcases(NULL, &uctx, (void*)ctx->pc.x, fpsimd, cur_db, x64pc,
+                                emu->segs[_CS] == 0x23)) {
+            static int logged = 0;
+            if (!logged) { logged = 1; nx_result_log("nx_exc: unaligned access fixed in place (Stage 4)"); }
+            nx_resume_ctx_t rc;
+            for (int i = 0; i < 31; ++i) rc.x[i] = uctx.uc_mcontext.regs[i];
+            rc.sp   = uctx.uc_mcontext.sp;
+            rc.pc   = uctx.uc_mcontext.pc;              // rx + 4 (executable resume target)
+            rc.nzcv = uctx.uc_mcontext.pstate;
+            for (int i = 0; i < 32; ++i) rc.v[i] = fpsimd->vregs[i];
+            nx_resume_native(&rc);                      // reloads full state, branches to rx+4; NEVER returns
+        }
+    }
+#endif
 
     // 4) Deliver to the guest handler if one is installed. The core runs the guest handler and then either
     //    exit()s (the handler siglongjmp'd out and the program ran to exit_group) or siglongjmp()s back
