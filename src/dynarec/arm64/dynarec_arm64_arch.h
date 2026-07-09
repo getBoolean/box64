@@ -12,13 +12,16 @@
 size_t get_size_arch(dynarec_arm_t* dyn);
 //populate the array
 void* populate_arch(dynarec_arm_t* dyn, void* p, size_t sz);
-#if !defined(_WIN32) && !defined(__SWITCH__)
+#if !defined(_WIN32)
+// box64-nx (M2.2c2): re-enabled on Horizon. <ucontext.h> resolves to the Switch shim
+// (src/os/switch/shim/ucontext.h), which provides the Linux-aarch64 sigcontext + fpsimd_context /
+// FPSIMD_MAGIC this reads; the CPU-exception handler (nx_exception.c) populates uc_mcontext.pstate +
+// an FPSIMD record in __reserved[] from the ThreadExceptionDump so this reconstructs EFLAGS/SSE/x87.
 #include <ucontext.h>
 //adjust flags and more
 void adjust_arch(dynablock_t* db, x64emu_t* emu, ucontext_t* p, uintptr_t x64pc);
 #else
-// box64-nx (M1.2): Horizon has no signal-context fault reconstruction (signals are stubbed), and
-// newlib's <ucontext.h> lacks the Linux fpsimd_context extensions this needs — no-op like _WIN32.
+// _WIN32 has no signal-context fault reconstruction — no-op.
 #define adjust_arch(db, emu, p, x64pc)
 #endif
 // get if instruction can be regenerated for unaligned access

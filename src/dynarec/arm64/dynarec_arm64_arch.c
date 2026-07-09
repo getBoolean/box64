@@ -267,7 +267,7 @@ void* populate_arch(dynarec_arm_t* dyn, void* p, size_t tot_sz)
 // NZCV V
 #define NZCV_V      28
 
-#if !defined(_WIN32) && !defined(__SWITCH__) // TODO: Implemented this for Win32; Horizon has no signal fault ctx (M1.2)
+#if !defined(_WIN32) // box64-nx (M2.2c2): re-enabled on Horizon — fed a synthesized ucontext by nx_exception.c
 void adjust_arch(dynablock_t* db, x64emu_t* emu, ucontext_t* p, uintptr_t x64pc)
 {
     if(!db->arch_size || !db->arch)
