@@ -337,39 +337,48 @@ static int nx_lowva_covered(uintptr_t a, size_t len) {
 // reservations) with svcMapMemory (mirror fresh heap pages to the exact VA). Returns addr or MAP_FAILED
 // (Horizon rejects a non-mappable region). Guest pages are never executed natively, so RW backing +
 // box64's no-op mprotect is enough; a later commit at the same VA is already covered.
+static void nx_lowva_track(uintptr_t a, size_t len) {
+    if (g_lowva_n < NX_LOWVA_MAX) { g_lowva[g_lowva_n].base = a; g_lowva[g_lowva_n].end = a + len; g_lowva_n++; }
+}
 static void* nx_map_lowva_fixed(void* addr, size_t rounded) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); return addr; }
     void* src = memalign(VM_PAGE, rounded);
     if (!src) { errno = ENOMEM; return MAP_FAILED; }
-    // Try svcMapMemory (Stack region only) first, then svcMapProcessCodeMemory — the mechanism libnx's
-    // jit uses, which can target the broader ASLR region. If EITHER places memory at the exact low VA
-    // (Win32 KUSER_SHARED_DATA @0x7ffe0000, PE bases), Wine's Win32 address space becomes reachable.
-    Result rc = svcMapMemory(addr, src, rounded);
-    if (R_FAILED(rc)) {
-        Handle self = envGetOwnProcessHandle();
-        Result rc2 = svcMapProcessCodeMemory(self, (u64)(uintptr_t)addr, (u64)(uintptr_t)src, rounded);
+
+    // 1) Stack-region VAs: svcMapMemory (fast; fails for arbitrary ASLR like Wine's 0x7ffe0000).
+    if (R_SUCCEEDED(svcMapMemory(addr, src, rounded))) {
+        nx_lowva_track((uintptr_t)addr, rounded); memset(addr, 0, rounded); return addr;
+    }
+
+    // 2) Arbitrary ASLR VAs (Win32 KUSER_SHARED_DATA @0x7ffe0000, PE bases): the CodeMemory mechanism
+    // libnx's jit uses (svcCreateCodeMemory + svcControlCodeMemory MapOwner). It needs NO own-process
+    // handle (works on an installed NSP — the jit does this every run) and lets us choose the exact dst.
+    // MapOwner+Perm_Rw gives a writable mapping — exactly what Wine's shared user data needs.
+    Handle cm = INVALID_HANDLE;
+    Result rc = svcCreateCodeMemory(&cm, src, rounded);
+    if (R_SUCCEEDED(rc)) {
+        Result rc2 = svcControlCodeMemory(cm, CodeMapOperation_MapOwner, addr, rounded, Perm_Rw);
         if (R_SUCCEEDED(rc2)) {
-            svcSetProcessMemoryPermission(self, (u64)(uintptr_t)addr, rounded, Perm_Rw);  // code->data RW
             static int okd = 0;
             if (!okd) { okd = 1; char b[120];
-                int n = snprintf(b, sizeof b, "nx_vm: lowVA via svcMapProcessCodeMemory %p+0x%lx OK\n",
+                int n = snprintf(b, sizeof b, "nx_vm: lowVA via CodeMemory MapOwner %p+0x%lx OK\n",
                                  addr, (unsigned long)rounded); if (n > 0) svcOutputDebugString(b, n); }
-            if (g_lowva_n < NX_LOWVA_MAX) { g_lowva[g_lowva_n].base = (uintptr_t)addr;
-                                            g_lowva[g_lowva_n].end = (uintptr_t)addr + rounded; g_lowva_n++; }
+            nx_lowva_track((uintptr_t)addr, rounded);
             memset(addr, 0, rounded);
-            return addr;
+            return addr;   // keep cm + src alive (mapping persists for the run)
         }
-        static int warned = 0;
-        if (!warned) { warned = 1; char b[140];
-            int n = snprintf(b, sizeof b, "nx_vm: lowVA %p+0x%lx svcMapMemory=0x%x svcMapProcessCodeMemory=0x%x\n",
-                             addr, (unsigned long)rounded, (unsigned)rc, (unsigned)rc2);
-            if (n > 0) svcOutputDebugString(b, n); }
-        free(src); errno = ENOMEM; return MAP_FAILED;
+        svcCloseHandle(cm);   // MapOwner failed -> return src to normal memory
+        static int w2 = 0;
+        if (!w2) { w2 = 1; char b[140];
+            int n = snprintf(b, sizeof b, "nx_vm: lowVA %p+0x%lx CodeMemory MapOwner=0x%x\n",
+                             addr, (unsigned long)rounded, (unsigned)rc2); if (n > 0) svcOutputDebugString(b, n); }
+    } else {
+        static int w1 = 0;
+        if (!w1) { w1 = 1; char b[140];
+            int n = snprintf(b, sizeof b, "nx_vm: lowVA %p+0x%lx svcCreateCodeMemory=0x%x\n",
+                             addr, (unsigned long)rounded, (unsigned)rc); if (n > 0) svcOutputDebugString(b, n); }
     }
-    if (g_lowva_n < NX_LOWVA_MAX) { g_lowva[g_lowva_n].base = (uintptr_t)addr;
-                                    g_lowva[g_lowva_n].end = (uintptr_t)addr + rounded; g_lowva_n++; }
-    memset(addr, 0, rounded);
-    return addr;
+    free(src); errno = ENOMEM; return MAP_FAILED;
 }
 
 static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {

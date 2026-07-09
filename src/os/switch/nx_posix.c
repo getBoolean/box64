@@ -683,6 +683,7 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
 // here. Implement the milestone-1 set over Horizon SVCs; log the rest so the bring-up loop sees the next
 // gap. NUMBERS ARE aarch64/generic-Linux NRs (box64 already translated from x86-64).
 static uint8_t *g_brk_base = NULL, *g_brk_cur = NULL, *g_brk_end = NULL;   // simple bump arena for brk()
+char nx_cwd[512] = "/";   // M2.7: guest CWD (VFS resolves against the rootfs; this is just for getcwd)
 long syscall(long number, ...) {
     va_list ap; va_start(ap, number);
     unsigned long a0 = va_arg(ap, unsigned long);
@@ -753,6 +754,40 @@ long syscall(long number, ...) {
         case 172: return 1;                          // getpid (single process)
         case 124: svcSleepThread(0); return 0;       // sched_yield
         case 98:  return nx_futex((int*)a0, (int)a1, (unsigned)a2, (const void*)a3, (int*)a4, (unsigned)a5);
+        // M2.7 (Wine): the WINEPREFIX. box64-nx's VFS resolves paths against the rootfs (not a real CWD),
+        // so accept chdir + report the requested dir back via getcwd. Wine chdir()s into /root/.wine.
+        case 49: {   // chdir(path) -> accept + remember
+            const char* p = (const char*)a0;
+            if (p) snprintf(nx_cwd, sizeof nx_cwd, "%s", p);
+            return 0;
+        }
+        case 17: {   // getcwd(buf, size) -> the remembered CWD (Linux returns length incl NUL)
+            char* buf = (char*)a0; size_t sz = (size_t)a1;
+            const char* c = nx_cwd[0] ? nx_cwd : "/";
+            size_t n = strlen(c) + 1;
+            if (!buf || n > sz) { errno = ERANGE; return -1; }
+            memcpy(buf, c, n); return (long)n;
+        }
+        case 174: return 0;                          // getuid  -> root
+        case 175: return 0;                          // geteuid -> root
+        case 176: return 0;                          // getgid  -> root
+        case 177: return 0;                          // getegid -> root
+        case 113: {  // clock_gettime(clockid, timespec*) — Horizon monotonic tick
+            struct kx_ts { long tv_sec, tv_nsec; } *ts = (struct kx_ts*)a1;
+            if (!ts) { errno = EFAULT; return -1; }
+            u64 ns = armTicksToNs(armGetSystemTick());
+            ts->tv_sec = (long)(ns / 1000000000ULL); ts->tv_nsec = (long)(ns % 1000000000ULL);
+            return 0;
+        }
+        case 34: {   // mkdirat(dirfd, path, mode) — create a dir in the rootfs (Wine: server tmpdir)
+            const char* p = (const char*)a1;
+            if (!p) { errno = EFAULT; return -1; }
+            char hp[512];
+            if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
+            int r = mkdir(hp, (mode_t)a2);
+            if (r < 0 && errno == EEXIST) return 0;
+            return r;
+        }
         default:
             nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
             errno = ENOSYS; return -1;
