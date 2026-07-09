@@ -2288,7 +2288,10 @@ int getNeedTest(uintptr_t addr)
     void* jblock = NULL;
     dynablock_t* db = getDBBlock(addr, &jblock);
     if(!db) return 0;
-    if(jblock==db->jmpnext) return 1;
+    // box64-nx (M2.2 SMC): jblock is the raw jump-table value = the EXECUTABLE (rx) target on Switch, but
+    // db->jmpnext is the canonical rw alias — so compare against dynarec_rx(jmpnext) (identity off-Switch).
+    // Without this, getNeedTest never fires and marked blocks (SMC/callret/always_test) never re-validate.
+    if(jblock==dynarec_rx(db->jmpnext)) return 1;
     return 0;
 }
 
@@ -2297,7 +2300,7 @@ dynablock_t* getDBnoTest(uintptr_t addr)
     void* jblock = NULL;
     dynablock_t* db = getDBBlock(addr, &jblock);
     if(!db) return NULL;
-    if(jblock==db->jmpnext) return NULL;
+    if(jblock==dynarec_rx(db->jmpnext)) return NULL;   // rx alias on Switch (see getNeedTest)
     return db;
 }
 
@@ -2393,6 +2396,19 @@ void protectDBJumpTable(uintptr_t addr, size_t size, void* jump, void* ref)
 }
 
 // Remove the Write flag from an adress range, so DB can be executed safely
+#ifdef __SWITCH__
+// box64-nx SMC (Stage 3): the general mprotect (nx_posix.c) is a deliberate no-op, but protectDB/unprotectDB
+// must ACTUALLY drop/restore write on box64's translated-code pages so a guest self-modifying write faults.
+// Route ONLY those code-page perm changes to real page permissions (svcSetMemoryPermission via
+// nx_vm_protect_code, R/Rw only — guest x86 pages are never executed natively); everything else keeps the
+// no-op mprotect. (protectDBJumpTable/neverprotectDB stay no-op for now — the core protect/unprotect pair
+// is what the SMC gate needs; extend later if a jump-table-target SMC case shows up.)
+extern int nx_vm_protect_code(void* addr, size_t len, int prot);
+#define MPROTECT_DB(a, l, p) nx_vm_protect_code((a), (l), (p))
+#else
+#define MPROTECT_DB(a, l, p) mprotect((a), (l), (p))
+#endif
+
 void protectDB(uintptr_t addr, uintptr_t size)
 {
     dynarec_log(LOG_DEBUG, "protectDB %p -> %p\n", (void*)addr, (void*)(addr+size-1));
@@ -2426,10 +2442,10 @@ void protectDB(uintptr_t addr, uintptr_t size)
                             dynarec_log(LOG_INFO, "protectDB: mixed code+data host page %p, using always_test instead of mprotect\n", (void*)host_page);
                             prot |= PROT_NEVERCLEAN;
                         } else {
-                            mprotect((void*)cur, bend-cur, prot&~PROT_WRITE);
+                            MPROTECT_DB((void*)cur, bend-cur, prot&~PROT_WRITE);
                         }
                     } else {
-                        mprotect((void*)cur, bend-cur, prot&~PROT_WRITE);
+                        MPROTECT_DB((void*)cur, bend-cur, prot&~PROT_WRITE);
                     }
                 }
                 prot |= PROT_DYNAREC;
@@ -2470,7 +2486,7 @@ void unprotectDB(uintptr_t addr, size_t size, int mark)
                 prot&=~PROT_DYN;
                 if(mark)
                     cleanDBFromAddressRange(cur, bend-cur, 0);
-                mprotect((void*)cur, bend-cur, prot);
+                MPROTECT_DB((void*)cur, bend-cur, prot);
             } else if(prot&PROT_DYNAREC_R) {
                 if(mark)
                     cleanDBFromAddressRange(cur, bend-cur, 0);

@@ -420,4 +420,31 @@ int nx_vm_protect(void* addr, size_t len, int prot) {
     return 0;
 }
 
+// SMC / Stage 3 (M2.2, 2026-07-09): apply REAL page permissions to box64's own translated-code pages ONLY —
+// called from custommem.c's protectDB/unprotectDB, NOT from the general nx_vm_protect above (which stays a
+// no-op: making that real destabilizes box64, as it would honor the guest's own RO mmap/RELRO and box64
+// native writes then fault). A guest write to a protected code page then Data-Aborts and nx_exception.c's
+// SMC branch unprotects it + re-runs the store. box64 never executes guest x86 pages natively (exec is the
+// jit path), so R (protect) / Rw (unprotect) are the only perms needed — which is exactly what
+// svcSetMemoryPermission accepts (it rejects X). addr/len arrive page-aligned from protectDB; align anyway.
+int nx_vm_protect_code(void* addr, size_t len, int prot) {
+    extern uintptr_t box64_pagesize;
+    uintptr_t a = (uintptr_t)addr & ~(box64_pagesize - 1);
+    uintptr_t e = ((uintptr_t)addr + len + box64_pagesize - 1) & ~(box64_pagesize - 1);
+    Permission perm = (prot & PROT_WRITE) ? Perm_Rw : Perm_R;
+    Result rc = svcSetMemoryPermission((void*)a, e - a, perm);
+    if (rc) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            char b[120];
+            int n = snprintf(b, sizeof b, "nx_vm: protectDB svcSetMemoryPermission(%p,0x%lx,%d)=0x%x\n",
+                             (void*)a, (unsigned long)(e - a), (int)perm, (unsigned)rc);
+            if (n > 0) svcOutputDebugString(b, n);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 #endif // __SWITCH__

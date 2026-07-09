@@ -39,6 +39,9 @@
 #ifdef DYNAREC
 #include "dynablock.h"
 #include "dynarec/dynablock_private.h"
+#include "dynarec_native.h"
+#include "emu/x64run_private.h"      // rex_t — dynarec_arch.h's arm64 functions header depends on it
+#include "dynarec/dynarec_arch.h"    // ARCH_ADJUST (adjust_arch) for the SMC re-run path
 #endif
 
 extern void nx_result_log(const char*);   // nx_main.c: heap-free SD result line — the ONLY HW-visible channel
@@ -168,6 +171,28 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             }
         } else { last_far = ctx->far.x; last_rip = x64pc; repeat = 0; }
     }
+
+#ifdef DYNAREC
+    // 3a) SMC (self-modifying code): a guest WRITE (ESR.WnR=1) to a page box64 write-protected as translated
+    //     code (PROT_DYNAREC — protectDB now applies a real svcSetMemoryPermission R on Switch). Restore
+    //     write on the page + mark its overlapping dynablocks dirty (unprotectDB), reconstruct guest state at
+    //     the faulting store (copyUCTXreg2Emu/adjustregs/ARCH_ADJUST — the same lift the delivery core uses),
+    //     then siglongjmp(2): EmuRun re-runs the store in the interpreter against the now-writable page and
+    //     regenerates any modified block on next entry. Runs BEFORE guest SIGSEGV delivery — an SMC write is
+    //     box64-internal, never a guest signal. Mirrors box64's autosmc path (signals.c:954).
+    if (sig == X64_SIGSEGV && ((esr >> 6) & 1) /*WnR*/ && cur_db && emu && emu->jmpbuf
+        && (getProtection(ctx->far.x) & PROT_DYNAREC)) {
+        dynablock_t* db = (dynablock_t*)cur_db;
+        unprotectDB(ctx->far.x, 1, 1);                 // page -> real Rw + mark overlapping blocks dirty
+        { static int logged = 0; if (!logged) { logged = 1; nx_result_log("nx_exc: SMC write -> unprotect + re-run (Stage 3)"); } }
+        copyUCTXreg2Emu(emu, &uctx, x64pc);            // lift host regs -> emu, set R_RIP = faulting store
+        adjustregs(emu, rw);                           // rewind any partial x86-instruction effect
+        if (db->arch_size) ARCH_ADJUST(db, emu, &uctx, x64pc);   // reconstruct flags/x87/SSE at the fault
+        dynablock_leave_runtime(db);
+        cancel_deferred_signal_processing(emu);
+        siglongjmp(emu->jmpbuf, 2);                    // re-run the store in interp, then resume; NEVER returns
+    }
+#endif
 
 #ifdef DYNAREC
     // 3b) Stage 4: unaligned data access that the dynarec lowered to an alignment-faulting ARM64 op
