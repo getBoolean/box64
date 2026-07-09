@@ -148,13 +148,35 @@ int main(int argc, char **argv) {
 
     // box64 rewrites argv in place assuming the strings are contiguous (as a Linux kernel lays
     // them out): it computes diff = prog - argv[0] and shifts. Separate string literals break that
-    // (garbage diff -> huge memset), so pack "box64\0<guest path>\0" into one buffer.
-    static char argbuf[600];
-    size_t o = 0;
-    char *a0 = &argbuf[o]; o += 1 + (size_t)snprintf(a0, sizeof(argbuf) - o, "box64");
-    char *a1 = &argbuf[o]; o += 1 + (size_t)snprintf(a1, sizeof(argbuf) - o, "%s", guest);
-    (void)o;
-    const char *b_argv[] = { a0, a1, NULL };
+    // (garbage diff -> huge memset), so pack "box64\0<guest path>\0<arg>\0..." into one buffer.
+    static char  argbuf[4096];
+    static char *b_argv[64];
+    size_t o = 0; int ac = 0;
+    #define NX_PUSH_ARG(...) do { \
+        b_argv[ac++] = &argbuf[o]; \
+        o += 1 + (size_t)snprintf(&argbuf[o], sizeof(argbuf) - o, __VA_ARGS__); \
+    } while (0)
+    NX_PUSH_ARG("box64");
+    NX_PUSH_ARG("%s", guest);
+    // Extra GUEST args from sdmc:/box64/box64-args (one per line) — FTP-flippable without a rebuild.
+    // e.g. to run `wine64 --version`: stage the wine64 loader as box64-guest and put "--version" here.
+    { int afd = open("sdmc:/box64/box64-args", O_RDONLY);
+      if (afd >= 0) {
+        static char fb[2048]; ssize_t n = read(afd, fb, sizeof fb - 1); close(afd);
+        if (n > 0) { fb[n] = '\0'; char *p = fb;
+          while (*p && ac < 62) {
+            while (*p=='\n'||*p=='\r'||*p==' '||*p=='\t') p++;   // skip leading whitespace
+            char *s = p;
+            while (*p && *p!='\n' && *p!='\r') p++;              // to end of line
+            char *e = p; if (*p) *p++ = '\0';
+            while (e>s && (e[-1]==' '||e[-1]=='\t')) *--e = '\0'; // trim trailing whitespace
+            if (*s) NX_PUSH_ARG("%s", s);
+          }
+        }
+      }
+    }
+    b_argv[ac] = NULL;
+    { char b[128]; snprintf(b, sizeof b, "guest argc=%d argv1=%s", ac, ac>2?b_argv[2]:"(none)"); rlog(b); }
     x64emu_t   *emu = NULL;
     elfheader_t *elf = NULL;
     int code = -1;
@@ -165,7 +187,7 @@ int main(int argc, char **argv) {
     // TODO(M2.1 close-out): gate behind a compile flag / lower once the dynamic-glibc path is green.
     setenv("BOX64_LOG", "2", 1);
     load_env_file();   // FTP-flippable overrides (e.g. BOX64_DYNAREC=0 to force the interpreter on HW)
-    if (initialize(2, b_argv, environ, &emu, &elf, 1)) {
+    if (initialize(ac, (const char **)b_argv, environ, &emu, &elf, 1)) {
         kdbg("nx_main: initialize failed\n");
         kout("box64: initialize failed (guest missing or not a valid x86-64 ELF?)\n");
         rlog("initialize FAILED");

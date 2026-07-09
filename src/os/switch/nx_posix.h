@@ -30,6 +30,13 @@ int nx_sched_yield(void);
 // at the syscall-return seam (emu/x64syscall.c). Identity for values that already match Linux.
 int nx_errno_h2l(int host_errno);
 
+// M2.4: rootfs VFS. Translate a guest Linux path to a Horizon (sdmc:) path or a materialized
+// pseudo-file. Guest "/" is rooted at sdmc:/box64/rootfs/, with a flat sdmc:/box64/lib/<basename>
+// fallback and synthetic /proc,/dev entries. out[outn] receives the Horizon path. 0 ok, -1 (ENOENT).
+int nx_translate_path(const char *guest_path, char *out, size_t outn);
+// Convert Linux open()/openat() flags (what the guest passes) to newlib/host <fcntl.h> flags.
+int nx_oflags_l2h(int linux_flags);
+
 #ifdef __cplusplus
 }
 #endif

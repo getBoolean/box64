@@ -292,9 +292,9 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     if ((flags & AT_EMPTY_PATH) || !path || !path[0])
         r = fstat(dirfd, b);                             // fstat via the open fd
     else {
-        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-        char sd[128]; snprintf(sd, sizeof sd, "sdmc:/box64/lib/%s", base);
-        r = stat(sd, b);
+        char hp[512];                                    // M2.4: rootfs VFS (was flat-lib basename)
+        if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
+        r = stat(hp, b);
     }
     // fsdev/newlib returns st_dev=st_ino=0 for every file. ld.so dedups loaded objects by (dev,ino),
     // so 0/0 makes libc.so.6 look "already loaded" (same 0/0 as ld.so/the main exe), ld.so skips
@@ -579,6 +579,86 @@ int nx_errno_h2l(int e) {
     return e;                                                   // names identical to Linux (or unknown)
 }
 
+// --- M2.4: rootfs path translation + synthetic /proc,/dev pseudo-files -------------------------
+// The guest (real ld.so/glibc, and later Wine) issues Linux absolute paths (/lib/..., /usr/..., the
+// WINEPREFIX, /proc, /dev). None exist on Horizon. Root the guest FS at sdmc:/box64/rootfs/ and
+// materialize a few pseudo-files to a temp file so the ordinary open/read/lseek path serves them.
+// A flat sdmc:/box64/lib/<basename> fallback keeps the M2.1/M2.2 tests (which stage libc.so.6 there)
+// working. Every file syscall (openat/stat/...) funnels through nx_translate_path for one policy.
+#include <sys/stat.h>   // mkdir
+
+#define NX_ROOTFS "sdmc:/box64/rootfs"
+#define NX_LIBDIR "sdmc:/box64/lib"
+#define NX_TMPDIR "sdmc:/box64/tmp"
+
+// Linux open() flags (guest) -> newlib/host <fcntl.h> flags. Low 2 bits (RD/WR/RDWR) match; the rest
+// differ (Linux O_CREAT=0100, newlib O_CREAT=0x200, etc.). Left = Linux octal, right = host macro.
+int nx_oflags_l2h(int lf) {
+    int hf = lf & 3;
+    if (lf & 000100) hf |= O_CREAT;
+    if (lf & 000200) hf |= O_EXCL;
+    if (lf & 000400) hf |= O_NOCTTY;
+    if (lf & 001000) hf |= O_TRUNC;
+    if (lf & 002000) hf |= O_APPEND;
+    if (lf & 004000) hf |= O_NONBLOCK;
+#ifdef O_DIRECTORY
+    if (lf & 0200000) hf |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    if (lf & 02000000) hf |= O_CLOEXEC;
+#endif
+    return hf;
+}
+
+// Write a pseudo-file's bytes to sdmc:/box64/tmp/<slug> and return that path, so a real seekable SD
+// file backs /proc + /dev entries (the plain open/read/lseek path then serves them unchanged).
+static int nx_materialize(const char* slug, const void* content, size_t len, char* out, size_t outn) {
+    mkdir(NX_TMPDIR, 0777);                                       // no-op if it already exists
+    snprintf(out, outn, "%s/%s", NX_TMPDIR, slug);
+    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    const char* c = (const char*)content; size_t w = 0;
+    while (w < len) { ssize_t r = write(fd, c + w, len - w); if (r <= 0) break; w += (size_t)r; }
+    close(fd);
+    return (w == len) ? 0 : -1;
+}
+
+static const char kx_cpuinfo[] =
+    "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 60\n"
+    "model name\t: box64-nx on Tegra X1 (Cortex-A57)\nstepping\t: 3\ncpu MHz\t\t: 1020.000\n"
+    "cache size\t: 256 KB\nphysical id\t: 0\nsiblings\t: 3\ncore id\t\t: 0\ncpu cores\t: 3\n"
+    "flags\t\t: fpu vme de pse tsc msr pae cx8 apic sep mtrr pge cmov pat pse36 clflush mmx fxsr "
+    "sse sse2 ht syscall nx lm constant_tsc rep_good nopl cpuid pni ssse3 cx16 sse4_1 sse4_2 "
+    "popcnt aes xsave avx\nbogomips\t: 2040.00\n\n";
+
+int nx_translate_path(const char* p, char* out, size_t outn) {
+    if (!p || !p[0]) { errno = ENOENT; return -1; }
+    if (!strncmp(p, "sdmc:", 5)) { snprintf(out, outn, "%s", p); return 0; }   // already Horizon
+    // Synthetic pseudo-files, backed by a materialized SD temp file.
+    if (!strcmp(p, "/proc/cpuinfo"))
+        return nx_materialize("proc-cpuinfo", kx_cpuinfo, sizeof kx_cpuinfo - 1, out, outn);
+    if (!strcmp(p, "/dev/urandom") || !strcmp(p, "/dev/random") || !strcmp(p, "/dev/hwrng")) {
+        unsigned char rb[4096]; randomGet(rb, sizeof rb);
+        return nx_materialize("dev-urandom", rb, sizeof rb, out, outn);
+    }
+    if (!strcmp(p, "/dev/null"))
+        return nx_materialize("dev-null", "", 0, out, outn);
+    // Absolute path: rootfs tree first, then the flat lib/<basename> fallback, else the rootfs path
+    // (so an O_CREAT of a new file still lands somewhere sane under the rootfs).
+    if (p[0] == '/') {
+        struct stat st;
+        snprintf(out, outn, "%s%s", NX_ROOTFS, p);
+        if (stat(out, &st) == 0) return 0;
+        const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
+        char lib[512]; snprintf(lib, sizeof lib, "%s/%s", NX_LIBDIR, b);
+        if (stat(lib, &st) == 0) { snprintf(out, outn, "%s", lib); return 0; }
+        snprintf(out, outn, "%s%s", NX_ROOTFS, p);
+        return 0;
+    }
+    snprintf(out, outn, "%s/%s", NX_ROOTFS, p);                   // relative -> under the rootfs
+    return 0;
+}
+
 // M2.1 libos: the guest's real ld.so/glibc issue raw Linux syscalls; box64 translates the x86-64 number
 // to the aarch64 NR and routes the tail (whatever it does NOT hand-case in emu/x64syscall.c) through
 // here. Implement the milestone-1 set over Horizon SVCs; log the rest so the bring-up loop sees the next
@@ -616,14 +696,15 @@ long syscall(long number, ...) {
         case 56: {  // openat(dirfd, path, flags, mode)
             const char* p = (const char*)a1;
             if (!p) { errno = EFAULT; return -1; }
-            // M2.1 rootfs shim: the guest's real ld.so/glibc search Linux paths (/usr/lib/..., /lib/...)
-            // for the .so's we staged at sdmc:/box64/lib/. Translate by basename (all guest opens here
-            // are absolute lib lookups; dirfd is AT_FDCWD). Missing files -> ENOENT (ld.so tolerates it).
-            const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
-            char sd[128]; snprintf(sd, sizeof sd, "sdmc:/box64/lib/%s", b);
-            int fd = open(sd, O_RDONLY);
-            if (fd < 0) { errno = ENOENT; return -1; }
-            nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, sd, fd);
+            // M2.4 rootfs VFS: map the guest Linux path to a Horizon path (rootfs tree, flat-lib
+            // fallback, or a synthetic /proc,/dev file) and open with the guest's flags converted to
+            // newlib's. dirfd is AT_FDCWD for the absolute lookups ld.so/glibc/Wine issue. Keep
+            // open()'s errno (translated to Linux at the syscall-return seam) so ENOENT propagates.
+            char hp[512];
+            if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
+            int fd = open(hp, nx_oflags_l2h((int)a2), (mode_t)a3);
+            if (fd < 0) { nx_warnf("nx: openat '%s' -> '%s' FAIL e=%d\n", p, hp, errno); return -1; }
+            nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, hp, fd);
             return fd;
         }
         case 57: return close((int)a0);                          // close
