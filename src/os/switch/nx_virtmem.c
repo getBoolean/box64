@@ -403,10 +403,14 @@ int nx_munmap(void* addr, unsigned long length) {
     return 0;
 }
 
-// Page permissions. Real svcSetMemoryPermission works on arena pages (None/R/RW), but enforcing RO
-// before the SMC fault handler exists would crash box64's protectDB path — so this stays a no-op until
-// that lands. Surface any executable request once (box64 never executes guest pages; exec is the jit
-// code-memory path, not this).
+// Page permissions. DE-RISKED (M2.2c2, 2026-07-09): svcSetMemoryPermission DOES work on the guest's
+// heap-backed/file-mmap'd pages on real HW (R and Rw both return 0x0). BUT making this real for ALL mprotect
+// destabilizes box64: it also honors the guest's own read-only mappings (mmap PROT_READ / ld.so RELRO), and
+// box64's native loader/helpers then Data-Abort writing into those pages (seen: a WnR=1 fault at a
+// non-PROT_DYNAREC guest addr from box64 native code -> unhandled -> crash). So this stays a no-op: the SMC
+// backend must protect ONLY box64's protectDB code pages (a dedicated svcSetMemoryPermission path in
+// custommem.c's protectDB/unprotectDB), NOT the guest's own mappings. [full-c2 Stage 3 — focused follow-up;
+// see tests/m2/smc.c + docs/porting-log.md]. box64 never executes guest pages (exec is the jit path).
 int nx_vm_protect(void* addr, size_t len, int prot) {
     (void)addr; (void)len;
     if (prot & PROT_EXEC) {
