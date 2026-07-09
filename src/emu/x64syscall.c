@@ -7,6 +7,8 @@ void nx_guest_output(int fd, const void *buf, size_t len);  /* nx_main.c — deb
 int nx_tee_origin(int fd);  /* nx_vfd.c — 1/2 or a dup chained from them (Wine writes to a dup of 1) */
 int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                    unsigned long a4, unsigned long a5, unsigned long a6, long* ret); /* nx_vfd.c (M2.5) */
+volatile int kx_sctrace = 0;   /* armed by nx_posix.c openat(drive_c/windows) under KX_REQLOG: trace the
+                                  syscalls the wine client makes just before it wedges post-DLL-load */
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -526,6 +528,12 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
 {
     RESET_FLAGS(emu);
     uint32_t s = R_EAX; // EAX? (syscalls only go up to 547 anyways)
+#ifdef __SWITCH__
+    if (kx_sctrace) { static int cap = 0; if (cap < 3000) { cap++; extern int nx_guest_pid(void); char b[96];
+        int n = snprintf(b, sizeof b, "nx: SC pid=%d nr=%u rdi=0x%lx rsi=0x%lx\n", nx_guest_pid(), s,
+            (unsigned long)R_RDI, (unsigned long)R_RSI);
+        svcOutputDebugString(b, n); } }
+#endif
     int log = 0;
     char t_buff[256] = "\0";
     char t_buffret[128] = "\0";

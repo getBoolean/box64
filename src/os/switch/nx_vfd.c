@@ -904,9 +904,19 @@ long nx_vfd_fcntl(int fd, int cmd, long arg) {
 long nx_vfd_ioctl(int fd, unsigned long req, void* arg) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     vfd_t* v = V(fd);
+    { static int cnt = 0; static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+      if (on && cnt < 60) { cnt++; vlog("nx_vfd: IOCTL pid=%d fd=%d req=0x%lx kind=%d\n",
+          nx_guest_pid(), fd, req, (int)v->kind); } }
     switch (req) {
         case 0x5421: v->nonblock = arg && *(int*)arg ? 1 : 0; return 0;  // FIONBIO
         case 0x541B: if (arg) *(int*)arg = (int)rused(v); return 0;      // FIONREAD
+        // Terminal ioctls on a vfd (a pipe/dir/socket is NOT a tty): report ENOTTY, exactly as the
+        // real-fd path does. Returning 0 (success) told Wine's isatty() the vfd WAS a tty, so Wine
+        // drove it as a console and spun forever (3.26M ioctls on the drive_c/windows dir vfd -> the
+        // "console-stage hang"). ENOTTY -> isatty=false -> Wine uses the non-console path.
+        case 0x5401: case 0x5402: case 0x5403: case 0x5404: case 0x5413: case 0x5414:
+        case 0x540F: case 0x5410: case 0x5411: case 0x5412:
+            errno = ENOTTY; return -1;
         default: return 0;                                               // accept quietly
     }
 }
