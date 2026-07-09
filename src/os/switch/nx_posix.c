@@ -1005,8 +1005,13 @@ long syscall(long number, ...) {
             // anything else hits the host fd.
             struct kx_iovec { const char* base; size_t len; };
             const struct kx_iovec* v = (const struct kx_iovec*)a1;
-            extern int nx_tee_origin(int fd);   // nx_vfd.c — 1/2 or a dup chained from them
+            extern int nx_tee_origin(int fd);            // nx_vfd.c — 1/2 or a dup chained from them
+            extern long nx_vfd_writev(int fd, const void* iov, int iovcnt);  // atomic vfd scatter-write
             int wfd = (int)a0;
+            // A vfd (wineserver request/reply pipe) MUST land the whole writev atomically — the server
+            // reads a request's fixed header then its variable data in a blocking loop and relies on the
+            // full request arriving as one unit. Route vfds through the atomic writev.
+            if (nx_vfd_is(wfd)) return nx_vfd_writev(wfd, (const void*)a1, (int)a2);
             int to  = nx_tee_origin(wfd);
             long total = 0;
             for (unsigned i = 0; i < (unsigned)a2 && v; ++i) {
@@ -1014,7 +1019,6 @@ long syscall(long number, ...) {
                 long r;
                 if (to) nx_guest_output(to, v[i].base, v[i].len);
                 if (wfd == 1 || wfd == 2) r = (long)v[i].len;   // the tee IS the console channel
-                else if (nx_vfd_is(wfd))  r = nx_vfd_write(wfd, v[i].base, v[i].len);
                 else                      r = write(wfd, v[i].base, v[i].len);
                 if (r < 0) return total ? total : -1;
                 total += r;

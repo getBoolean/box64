@@ -439,6 +439,42 @@ long nx_vfd_write(int fd, const void* buf, size_t n) {
     }
 }
 
+// Atomic scatter-write: put ALL iovs into the peer's ring under ONE lock with ONE wakeup, so a reader
+// can never observe a partial message. Wine's wineserver reads a request's FIXED header (poll-gated)
+// then its VARIABLE data in a BLOCKING loop — it relies on the client's single writev() landing the
+// whole request atomically (a <PIPE_BUF pipe write is atomic on Linux). Writing the iovs as separate
+// nx_vfd_write()s let the server wake after the header, read it, then block reading data not yet
+// written → deadlock. Returns total bytes, or -1/EPIPE. Blocks only if the ring can't hold the burst.
+long nx_vfd_writev(int fd, const void* iov, int iovcnt) {
+    struct kx_iovec { const void* base; size_t len; };
+    const struct kx_iovec* v = (const struct kx_iovec*)iov;
+    size_t want = 0;
+    for (int i = 0; i < iovcnt; i++) if (v[i].base) want += v[i].len;
+    if (!want) return 0;
+    if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    pthread_mutex_lock(&g_mx);
+    vfd_t* s = V(fd);
+    if (s->kind != VK_PIPE && s->kind != VK_SOCK) { pthread_mutex_unlock(&g_mx); errno = EINVAL; return -1; }
+    for (;;) {
+        if (s->peer < 0) { pthread_mutex_unlock(&g_mx); errno = EPIPE; return -1; }
+        vfd_t* p = &g_v[s->peer];
+        if (!p->buf) { p->buf = (uint8_t*)malloc(RING_CAP); if (!p->buf) { pthread_mutex_unlock(&g_mx); errno = ENOMEM; return -1; } }
+        if (RING_CAP - rused(p) >= want) {                 // whole burst fits: write it all atomically
+            for (int i = 0; i < iovcnt; i++) {
+                if (!v[i].base) continue;
+                const uint8_t* b = (const uint8_t*)v[i].base;
+                for (size_t j = 0; j < v[i].len; j++) p->buf[(p->wr + j) % RING_CAP] = b[j];
+                p->wr += v[i].len;
+            }
+            pthread_cond_broadcast(&g_cv);
+            pthread_mutex_unlock(&g_mx);
+            return (long)want;
+        }
+        if (s->nonblock) { pthread_mutex_unlock(&g_mx); errno = EAGAIN; return -1; }
+        pthread_cond_wait(&g_cv, &g_mx);                   // ring full: wait for the reader to drain
+    }
+}
+
 // ---- pipes & sockets ----------------------------------------------------------------------------
 
 static int make_pair(vkind_t kind, int fds[2], int nonblock) {
