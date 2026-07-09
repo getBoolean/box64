@@ -341,12 +341,28 @@ static void* nx_map_lowva_fixed(void* addr, size_t rounded) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); return addr; }
     void* src = memalign(VM_PAGE, rounded);
     if (!src) { errno = ENOMEM; return MAP_FAILED; }
+    // Try svcMapMemory (Stack region only) first, then svcMapProcessCodeMemory — the mechanism libnx's
+    // jit uses, which can target the broader ASLR region. If EITHER places memory at the exact low VA
+    // (Win32 KUSER_SHARED_DATA @0x7ffe0000, PE bases), Wine's Win32 address space becomes reachable.
     Result rc = svcMapMemory(addr, src, rounded);
     if (R_FAILED(rc)) {
+        Handle self = envGetOwnProcessHandle();
+        Result rc2 = svcMapProcessCodeMemory(self, (u64)(uintptr_t)addr, (u64)(uintptr_t)src, rounded);
+        if (R_SUCCEEDED(rc2)) {
+            svcSetProcessMemoryPermission(self, (u64)(uintptr_t)addr, rounded, Perm_Rw);  // code->data RW
+            static int okd = 0;
+            if (!okd) { okd = 1; char b[120];
+                int n = snprintf(b, sizeof b, "nx_vm: lowVA via svcMapProcessCodeMemory %p+0x%lx OK\n",
+                                 addr, (unsigned long)rounded); if (n > 0) svcOutputDebugString(b, n); }
+            if (g_lowva_n < NX_LOWVA_MAX) { g_lowva[g_lowva_n].base = (uintptr_t)addr;
+                                            g_lowva[g_lowva_n].end = (uintptr_t)addr + rounded; g_lowva_n++; }
+            memset(addr, 0, rounded);
+            return addr;
+        }
         static int warned = 0;
-        if (!warned) { warned = 1; char b[120];
-            int n = snprintf(b, sizeof b, "nx_vm: lowVA svcMapMemory(%p,0x%lx)=0x%x\n",
-                             addr, (unsigned long)rounded, (unsigned)rc);
+        if (!warned) { warned = 1; char b[140];
+            int n = snprintf(b, sizeof b, "nx_vm: lowVA %p+0x%lx svcMapMemory=0x%x svcMapProcessCodeMemory=0x%x\n",
+                             addr, (unsigned long)rounded, (unsigned)rc, (unsigned)rc2);
             if (n > 0) svcOutputDebugString(b, n); }
         free(src); errno = ENOMEM; return MAP_FAILED;
     }
