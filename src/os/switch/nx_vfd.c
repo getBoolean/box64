@@ -33,7 +33,7 @@
 
 // nx_posix.c
 extern int  nx_translate_path(const char* p, char* out, size_t outn);
-extern char nx_cwd[512];
+extern char* nx_cwd_buf(void);   // nx_posix.c — per-instance guest cwd
 extern int  nx_guest_pid(void);
 void nx_guest_output(int fd, const void *buf, size_t len);   // nx_main.c
 
@@ -115,7 +115,7 @@ const char* nx_vfd_dir_guest(int fd) { return nx_vfd_is(fd) ? V(fd)->guest : NUL
 
 int nx_vfd_fchdir(int fd) {
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_DIR) { errno = ENOTDIR; return -1; }
-    snprintf(nx_cwd, sizeof nx_cwd, "%s", V(fd)->guest);
+    snprintf(nx_cwd_buf(), 512, "%s", V(fd)->guest);
     return 0;
 }
 
@@ -152,13 +152,24 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
     return (long)off;
 }
 
+// FNV-1a 64 of the host path — MUST match nx_posix.c fstatat's identity so a dir opened as a vfd and
+// fstat'd yields the same (dev,ino) as stat(path). wineserver's post-chdir check compares them.
+static unsigned long path_ino(const char* hp) {
+    unsigned long h = 1469598103934665603UL;
+    for (const char* c = hp; c && *c; ++c) { h ^= (unsigned char)*c; h *= 1099511628211UL; }
+    return h ? h : 1;
+}
+
 // host-format stat for a vfd (caller converts to guest layout via UnalignStat64)
 int nx_vfd_stat(int fd, struct stat* st) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     vfd_t* v = V(fd);
     if (v->kind == VK_DIR) {
         int r = stat(v->host, st);
-        if (r == 0) { st->st_dev = 1; if (!st->st_ino) st->st_ino = v->ino; }
+        if (r == 0) {
+            st->st_dev = 1; st->st_ino = path_ino(v->host);   // == fstatat's hash of the same host path
+            st->st_uid = 0; st->st_gid = 0; st->st_mode &= ~(mode_t)077;
+        }
         return r;
     }
     memset(st, 0, sizeof *st);
@@ -258,6 +269,7 @@ int nx_pipe2(int fds[2], int linux_flags) {
 
 int nx_socket(int domain, int type, int protocol) {
     (void)protocol;
+    vlog("nx_vfd: socket pid=%d domain=%d type=0x%x\n", nx_guest_pid(), domain, type);
     if (domain != 1 /*AF_UNIX*/) { errno = EAFNOSUPPORT; return -1; }
     if ((type & 0xff) != 1 /*SOCK_STREAM*/) { errno = EPROTONOSUPPORT; return -1; }
     pthread_mutex_lock(&g_mx);
@@ -280,7 +292,8 @@ int nx_socketpair(int domain, int type, int protocol, int sv[2]) {
 // connect("/root/.wine/wineserver/socket") meet in the registry
 static void norm_spath(const char* in, char* out, size_t outn) {
     if (in[0] == '/') snprintf(out, outn, "%s", in);
-    else snprintf(out, outn, "%s/%s", (nx_cwd[0] && strcmp(nx_cwd, "/")) ? nx_cwd : "", in);
+    else { const char* cwd = nx_cwd_buf();
+           snprintf(out, outn, "%s/%s", (cwd[0] && strcmp(cwd, "/")) ? cwd : "", in); }
 }
 
 // Linux sockaddr_un: u16 family, char path[108]
@@ -292,6 +305,7 @@ int nx_bind(int fd, const void* addr, unsigned alen) {
     return 0;
 }
 
+void nx_spawn_note_listen(const char* bpath);   // nx_spawn.c — wineserver-ready handshake
 int nx_listen(int fd, int backlog) {
     (void)backlog;
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SOCK) { errno = EBADF; return -1; }
@@ -300,13 +314,18 @@ int nx_listen(int fd, int backlog) {
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mx);
     vlog("nx_vfd: listen '%s'\n", V(fd)->bpath);
+    nx_spawn_note_listen(V(fd)->bpath);
     return 0;
 }
 
 int nx_connect(int fd, const void* addr, unsigned alen) {
-    if (!nx_vfd_is(fd) || V(fd)->kind != VK_SOCK) { errno = EBADF; return -1; }
+    if (!nx_vfd_is(fd) || V(fd)->kind != VK_SOCK) {
+        vlog("nx_vfd: connect fd=%d NOT-A-SOCK-VFD (is_vfd=%d) pid=%d\n", fd, nx_vfd_is(fd), nx_guest_pid());
+        errno = EBADF; return -1;
+    }
     if (!addr || alen < 3) { errno = EINVAL; return -1; }
     char want[256]; norm_spath((const char*)addr + 2, want, sizeof want);
+    vlog("nx_vfd: connect pid=%d raw='%s' want='%s'\n", nx_guest_pid(), (const char*)addr + 2, want);
     pthread_mutex_lock(&g_mx);
     int li = -1;
     for (int i = 0; i < NX_VFD_MAX; i++)
@@ -479,11 +498,14 @@ static short vfd_ready(vfd_t* v, short events) {
     if (v->kind == VK_LISTEN) {
         if (v->backlog_n) re |= 0x001;                                   // POLLIN
     } else if (v->kind == VK_SOCK || v->kind == VK_PIPE) {
-        if (rused(v)) re |= 0x001;
-        if (v->peer < 0) { re |= 0x010; re |= 0x001; }                   // POLLHUP (+wake readers)
+        if (rused(v)) re |= 0x001;                                       // POLLIN: buffered data
+        if (v->peer < 0) re |= 0x010;                                    // POLLHUP: peer closed
         else if (RING_CAP - rused(&g_v[v->peer]) > 0) re |= 0x004;       // POLLOUT
+        // wineserver's sock_check_pollhup expects EXACTLY POLLHUP on a drained hung-up socket, so
+        // do NOT add POLLIN on hangup — POLLHUP alone is in the always-report set below and wakes
+        // readers; a hangup WITH unread data still reports POLLIN (from rused above), as Linux does.
     } else re |= 0x020;                                                  // POLLNVAL
-    return re & (events | 0x010 | 0x020 | 0x008);
+    return re & (events | 0x010 | 0x020 | 0x008);                        // HUP/NVAL/ERR always reported
 }
 
 int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
@@ -620,6 +642,10 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
         case 72:  // fcntl (vfd only)
             if (!nx_vfd_is((int)a1)) return 0;
             r = nx_vfd_fcntl((int)a1, (int)a2, (long)a3);
+            break;
+        case 81:  // fchdir — wineserver saves/restores cwd around ops (open ".", fchdir back)
+            if (nx_vfd_is((int)a1)) r = nx_vfd_fchdir((int)a1);
+            else r = 0;                              // real fd: accept (nx_cwd is the only cwd we track)
             break;
         case 82: r = nx_rename_guest((const char*)a1, (const char*)a2); break;
         case 83: r = nx_mkdir_guest((const char*)a1, (unsigned)a2); break;

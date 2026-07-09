@@ -294,6 +294,7 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     extern int nx_vfd_is(int fd);
     extern int nx_vfd_stat(int fd, struct stat* st);
     extern const char* nx_vfd_dir_guest(int fd);
+    char hp[512]; int have_hp = 0;
     if ((flags & AT_EMPTY_PATH) || !path || !path[0])
         r = nx_vfd_is(dirfd) ? nx_vfd_stat(dirfd, b)     // M2.5: dir/socket vfds
                              : fstat(dirfd, b);          // fstat via the open fd
@@ -303,14 +304,36 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
             snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest(dirfd), path);
             path = gp;
         }
-        char hp[512];                                    // M2.4: rootfs VFS (was flat-lib basename)
         if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
+        have_hp = 1;
         r = stat(hp, b);
     }
-    // fsdev/newlib returns st_dev=st_ino=0 for every file. ld.so dedups loaded objects by (dev,ino),
-    // so 0/0 makes libc.so.6 look "already loaded" (same 0/0 as ld.so/the main exe), ld.so skips
-    // mapping it, and __libc_start_main is then undefined. Give each stat a unique non-zero identity.
-    if (r == 0) { static unsigned long g_ino = 2; b->st_dev = 1; if (!b->st_ino) b->st_ino = __atomic_add_fetch(&g_ino, 1, __ATOMIC_RELAXED); }
+    // Every stat MUST return a non-zero st_ino: ld.so dedups loaded objects by (dev,ino), so a zero
+    // ino makes libc/ntdll/... all look like the SAME already-loaded object and ld.so drops them
+    // (ntdll's __wine_main then vanishes — this was THE cmd.exe bring-up bug). Two cases:
+    //  - PATH stat (have_hp): FNV-1a of the CANONICAL host path — deterministic AND stable across guest
+    //    instances, so wineserver's stat(server_dir) == its later stat(".") and the client + wineserver
+    //    derive the SAME `server-<dev>-<ino>` socket name (M2.5).
+    //  - FD stat (fstat / AT_EMPTY_PATH — no path available): a unique non-zero counter. ld.so dedups
+    //    the fd form by soname anyway, so it need not match the path form; it just must be != 0.
+    //    (Pre-M2.5 used the counter for BOTH branches; gating it on have_hp left fd stats at ino 0.)
+    if (r == 0) {
+        b->st_dev = 1;
+        if (!b->st_ino) {
+            if (have_hp) {
+                unsigned long h = 1469598103934665603UL;     // FNV-1a 64 of the host path
+                for (const char* c = hp; *c; ++c) { h ^= (unsigned char)*c; h *= 1099511628211UL; }
+                b->st_ino = h ? h : 1;
+            } else {
+                static unsigned long g_fdino = 2;
+                b->st_ino = __atomic_add_fetch(&g_fdino, 1, __ATOMIC_RELAXED);
+            }
+        }
+        // Everything runs as root (uid/gid 0). Clear group/other perm bits so Wine's wineserver
+        // security check passes: it fatals unless its runtime dir (/run/user/0/wine) is owned by
+        // getuid() with (st_mode & 077)==0. fsdev reports 0777 for everything, so strip 077.
+        b->st_uid = 0; b->st_gid = 0; b->st_mode &= ~(mode_t)077;
+    }
     return r;
 }
 int fstatat64(int d, const char *p, struct stat64 *b, int f) { return fstatat(d, p, (struct stat *)b, f); }
@@ -664,11 +687,13 @@ static const char kx_cpuinfo[] =
 // Normalize a guest path: resolve a relative path against the guest CWD (nx_cwd, set by
 // chdir/fchdir) and collapse "." / ".." / duplicate slashes, so "sdmc:..." never sees them
 // (fsdev chokes on "/dir/." forms). Output is an absolute guest path.
-extern char nx_cwd[512];
+char* nx_cwd_buf(void);        // per-instance cwd accessor (defined below)
+int   nx_guest_pid(void);      // per-instance guest pid (defined below)
 static void nx_normalize_guest(const char* p, char* out, size_t outn) {
     char joined[1024];
+    const char* cwd = nx_cwd_buf();
     if (p[0] == '/') snprintf(joined, sizeof joined, "%s", p);
-    else snprintf(joined, sizeof joined, "%s/%s", (nx_cwd[0] == '/') ? nx_cwd : "/", p);
+    else snprintf(joined, sizeof joined, "%s/%s", (cwd[0] == '/') ? cwd : "/", p);
     // segment-wise collapse
     char* segs[64]; int n = 0;
     char work[1024]; snprintf(work, sizeof work, "%s", joined);
@@ -700,6 +725,12 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
     }
     if (!strcmp(p, "/dev/null"))
         return nx_materialize("dev-null", "", 0, out, outn);
+    // glibc-hwcaps: box64 advertises AVX2 (x86-64-v3) via CPUID/HWCAP, so the guest's ld.so probes
+    // .../glibc-hwcaps/x86-64-v3/libc.so.6 FIRST. If our flat-lib fallback answered that with the base
+    // libc, ld.so would load libc TWICE under two host paths (base + hwcaps) -> two inodes -> a split
+    // symbol scope (ntdll's __wine_main becomes unresolvable). Force ENOENT for hwcaps variant paths so
+    // ld.so falls back to the single base libc. (Must precede the flat-basename fallback below.)
+    if (strstr(p, "/glibc-hwcaps/")) { errno = ENOENT; return -1; }
     // Rootfs tree first, then the flat lib/<basename> fallback, else the rootfs path
     // (so an O_CREAT of a new file still lands somewhere sane under the rootfs).
     {
@@ -718,8 +749,22 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
 // to the aarch64 NR and routes the tail (whatever it does NOT hand-case in emu/x64syscall.c) through
 // here. Implement the milestone-1 set over Horizon SVCs; log the rest so the bring-up loop sees the next
 // gap. NUMBERS ARE aarch64/generic-Linux NRs (box64 already translated from x86-64).
-static uint8_t *g_brk_base = NULL, *g_brk_cur = NULL, *g_brk_end = NULL;   // simple bump arena for brk()
-char nx_cwd[512] = "/";   // M2.7: guest CWD (VFS resolves against the rootfs; this is just for getcwd)
+// M2.7/M2.5: guest CWD — PER guest INSTANCE (the wine client and the in-process wineserver each have
+// their own cwd; a shared one would cross-contaminate relative-path resolution). nx_cwd_buf() returns
+// the calling instance's 512-byte cwd, keyed by nx_guest_pid(). Threads within one instance share it.
+static char nx_cwd_main[512] = "/";
+char* nx_cwd_buf(void) {
+    int pid = nx_guest_pid();
+    if (pid == 100) return nx_cwd_main;                       // the primary guest (fast path)
+    static struct { int pid; char cwd[512]; } t[8];
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mx);
+    for (int i = 0; i < 8; i++) if (t[i].pid == pid) { pthread_mutex_unlock(&mx); return t[i].cwd; }
+    for (int i = 0; i < 8; i++) if (!t[i].pid) { t[i].pid = pid; t[i].cwd[0] = '/'; t[i].cwd[1] = 0;
+                                                 pthread_mutex_unlock(&mx); return t[i].cwd; }
+    pthread_mutex_unlock(&mx);
+    return nx_cwd_main;
+}
 
 // M2.5: per-"process" guest pid. One Horizon process hosts multiple guest INSTANCES (the wine client
 // + the wineserver thread), which must see different getpid()s — wineserver keys its process table on
@@ -772,16 +817,30 @@ long syscall(long number, ...) {
     va_end(ap);
     switch (number) {
         case 214: {   // brk(addr): glibc/ld.so bump allocator. Linux returns the resulting break.
-            if (!g_brk_base) {
-                size_t sz = 64UL * 1024 * 1024;     // 64 MiB arena is ample for ld.so + a hello's heap
+            // M2.5: brk is PER guest INSTANCE — the client (pid 100) and the in-process wineserver
+            // (pid 2) each have their own glibc that assumes it owns the break, so a single shared
+            // arena would corrupt both heaps. Keep a tiny per-pid arena table.
+            struct kx_brk { int pid; uint8_t *base, *cur, *end; };
+            static struct kx_brk g_brks[8];
+            static pthread_mutex_t g_brkmx = PTHREAD_MUTEX_INITIALIZER;
+            int pid = nx_guest_pid();
+            pthread_mutex_lock(&g_brkmx);
+            struct kx_brk* b = NULL;
+            for (int i = 0; i < 8; i++) if (g_brks[i].pid == pid) { b = &g_brks[i]; break; }
+            if (!b) for (int i = 0; i < 8; i++) if (!g_brks[i].pid) { b = &g_brks[i]; b->pid = pid; break; }
+            if (!b) { pthread_mutex_unlock(&g_brkmx); errno = ENOMEM; return -1; }
+            if (!b->base) {
+                size_t sz = 64UL * 1024 * 1024;     // 64 MiB per instance
                 void* p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-                if (p == MAP_FAILED) { nx_warnf("nx: brk arena mmap failed\n"); errno = ENOMEM; return -1; }
-                g_brk_base = g_brk_cur = (uint8_t*)p; g_brk_end = g_brk_base + sz;
+                if (p == MAP_FAILED) { pthread_mutex_unlock(&g_brkmx); nx_warnf("nx: brk arena mmap failed\n"); errno = ENOMEM; return -1; }
+                b->base = b->cur = (uint8_t*)p; b->end = b->base + sz;
             }
             uint8_t* req = (uint8_t*)a0;
-            if (!req) return (long)(uintptr_t)g_brk_cur;                     // query current break
-            if (req >= g_brk_base && req <= g_brk_end) g_brk_cur = req;       // grow/shrink within the arena
-            return (long)(uintptr_t)g_brk_cur;                               // else unchanged (grow failed)
+            long ret;
+            if (!req) ret = (long)(uintptr_t)b->cur;                          // query current break
+            else { if (req >= b->base && req <= b->end) b->cur = req; ret = (long)(uintptr_t)b->cur; }
+            pthread_mutex_unlock(&g_brkmx);
+            return ret;
         }
         case 96:  return nx_gettid();                // set_tid_address -> this thread's tid
         case 99:  return 0;                          // set_robust_list -> accept
@@ -867,6 +926,13 @@ long syscall(long number, ...) {
             lseek((int)a0, cur, SEEK_SET);                       // restore
             return (long)r;
         }
+        case 68: {  // pwrite64(fd, buf, count, offset) — wineserver sizes/inits its shared-mem file
+            off_t cur = lseek((int)a0, 0, SEEK_CUR);
+            if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) return -1;
+            ssize_t r = write((int)a0, (const void*)a1, (size_t)a2);
+            lseek((int)a0, cur, SEEK_SET);
+            return (long)r;
+        }
         case 66: {  // writev(fd, iov, iovcnt) — surface guest stderr/stdout (glibc/ld.so error text)
             struct kx_iovec { const char* base; size_t len; };
             const struct kx_iovec* v = (const struct kx_iovec*)a1;
@@ -886,14 +952,17 @@ long syscall(long number, ...) {
         case 98:  return nx_futex((int*)a0, (int)a1, (unsigned)a2, (const void*)a3, (int*)a4, (unsigned)a5);
         // M2.7 (Wine): the WINEPREFIX. box64-nx's VFS resolves paths against the rootfs (not a real CWD),
         // so accept chdir + report the requested dir back via getcwd. Wine chdir()s into /root/.wine.
-        case 49: {   // chdir(path) -> accept + remember
+        case 49: {   // chdir(path) -> accept + remember the CANONICAL absolute cwd (resolve relative
+                     // against the current cwd + collapse ./.. ), so getcwd + a later stat(".") agree
+                     // with an absolute stat of the same dir (wineserver's post-chdir identity check).
             const char* p = (const char*)a0;
-            if (p) snprintf(nx_cwd, sizeof nx_cwd, "%s", p);
+            if (p) { char norm[512]; nx_normalize_guest(p, norm, sizeof norm);
+                     snprintf(nx_cwd_buf(), 512, "%s", norm); }
             return 0;
         }
         case 17: {   // getcwd(buf, size) -> the remembered CWD (Linux returns length incl NUL)
             char* buf = (char*)a0; size_t sz = (size_t)a1;
-            const char* c = nx_cwd[0] ? nx_cwd : "/";
+            const char* nc = nx_cwd_buf(); const char* c = nc[0] ? nc : "/";
             size_t n = strlen(c) + 1;
             if (!buf || n > sz) { errno = ERANGE; return -1; }
             memcpy(buf, c, n); return (long)n;

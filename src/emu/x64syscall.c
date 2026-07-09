@@ -577,6 +577,14 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     if (s == 62)  { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // kill(pid,sig)
     if (s == 200) { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // tkill(tid,sig)
     if (s == 234) { S_RAX = my_tgkill(emu, (int)R_RDI, (int)R_RSI, (int)R_RDX); return; }   // tgkill(tgid,tid,sig)
+    if (s == 61) { // wait4(pid, status*, options, rusage) — pair with the fork() no-op (M2.5): the
+                   // "child" (fake pid 4242 from server_connect's start_server) reports exited 0.
+        if (R_RSI) *(int*)R_RSI = 0;   // WIFEXITED, code 0
+        S_RAX = R_RDI ? R_RDI : 4242; return;
+    }
+    if (s == 247) { // waitid — Wine may use it; report the fake child exited
+        S_RAX = 0; return;
+    }
     // M2.5: virtual fds (dirs/pipes/unix sockets, nx_vfd.c) + the raw-guest-path fallback cases
     // (mkdir/unlink/rename/access/...). Handled BEFORE the big switch, which would hand these to
     // newlib verbatim. Returns 0 for real fds/unhandled NRs so the normal paths still run.
@@ -802,18 +810,36 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                     S_RAX = ret;
                 }
                 else
+#ifdef __SWITCH__
+                    // M2.5: clone with stack=0 == glibc fork() (a new PROCESS, not a thread). Horizon
+                    // has no fork. Wine only forks in server_connect's start_server (when it can't yet
+                    // connect); we pre-start wineserver in-process (nx_spawn.c), so return a fake child
+                    // pid — start_server treats it as launched, then its connect RETRY finds our
+                    // already-listening socket. wait4 (x64syscall.c) reports this pid exited 0.
+                    S_RAX = 4242;
+#else
                     #ifdef NOALIGN
                     S_RAX = syscall(__NR_clone, R_RDI, R_RSI, R_RDX, R_R10, R_R8);
                     #else
                     S_RAX = syscall(__NR_clone, R_RDI, R_RSI, R_RDX, R_R8, R_R10);    // invert R_R8/R_R10 on Aarch64 and most other
                     #endif
+#endif
             }
             break;
         #ifndef __NR_fork
         case 57:
+#ifdef __SWITCH__
+            // M2.5: Horizon has no fork. Wine's server_connect() forks+execs wineserver ONLY when
+            // it can't connect; we pre-start wineserver as an in-process guest thread (nx_spawn.c),
+            // so make fork() a benign no-op returning a fake child pid — Wine's start_server treats
+            // it as "server launched", then its connect RETRY finds our already-listening socket.
+            // waitpid on this pid returns "exited 0" (nx_posix wait4). Never actually duplicates.
+            S_RAX = 4242;
+#else
             S_RAX = fork();
             if(S_RAX==-1)
                 S_RAX = -errno;
+#endif
             break;
         #endif
         case 58:   // vfork

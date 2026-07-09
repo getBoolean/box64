@@ -232,6 +232,21 @@ int main(int argc, char **argv) {
     } else {
         kdbg("nx_main: emulate\n");
         rlog("initialize ok, emulate");
+        // M2.5 process model: if this is a Wine run that will need the wineserver (WINEPREFIX set),
+        // pre-start wineserver64 as an in-process second guest (nx_spawn.c) and wait briefly for it
+        // to bind+listen, so the wine client's server_connect() finds the socket and never forks.
+        // Gated on KX_WINESERVER=1 in box64.env so plain guests are unaffected.
+        if (getenv("KX_WINESERVER")) {
+            extern int nx_spawn_wineserver(const char** envp);
+            extern int nx_spawn_server_ready(void);
+            if (nx_spawn_wineserver((const char**)environ) == 0) {
+                rlog("nx_spawn: wineserver launched, waiting for listen");
+                for (int i = 0; i < 400 && !nx_spawn_server_ready(); ++i)
+                    svcSleepThread(10000000ULL);   // up to ~4 s
+                rlog(nx_spawn_server_ready() ? "nx_spawn: wineserver LISTENING"
+                                             : "nx_spawn: wineserver not listening (continuing anyway)");
+            }
+        }
         code = emulate(emu, elf);
         kout("\nguest exited: %d\n", code);
         { char b[48]; snprintf(b, sizeof b, "nx_main: guest exited %d\n", code); kdbg(b); }
