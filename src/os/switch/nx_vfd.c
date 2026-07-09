@@ -906,7 +906,16 @@ int nx_rename_guest(const char* a, const char* b) {
     if (!a || !b) { errno = EFAULT; return -1; }
     if (nx_translate_path(a, ha, sizeof ha) != 0) return -1;
     if (nx_translate_path(b, hb, sizeof hb) != 0) return -1;
-    return rename(ha, hb);
+    int r = rename(ha, hb);
+    if (r != 0) {
+        // fsdev's rename does NOT atomically replace an existing target (POSIX rename overwrites; fsdev
+        // fails EEXIST). The wineserver's registry save renames reg*.tmp OVER system.reg every flush —
+        // a failed rename left the registry "unsaved" (dirty), so its flush timer re-saved FOREVER,
+        // starving the single-threaded server and the wine client. Remove the target and retry.
+        unlink(hb);
+        r = rename(ha, hb);
+    }
+    return r;
 }
 
 // ---- x86-64 big-switch pre-dispatch ---------------------------------------------------------------

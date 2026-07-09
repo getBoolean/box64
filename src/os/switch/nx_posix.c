@@ -1069,6 +1069,16 @@ long syscall(long number, ...) {
             extern int nx_mkdir_guest(const char* p, unsigned mode);
             return nx_mkdir_guest((const char*)a1, (unsigned)a2);
         }
+        // No-op-and-succeed file ops that fsdev has no semantics for. As ENOSYS they made the
+        // wineserver's file_set_error() choke (ENOSYS has no NT mapping) and stall its service loop,
+        // starving the wine client mid-startup. Accept them: perms/times/flush are irrelevant to us.
+        case 82:  return 0;   // fsync
+        case 83:  return 0;   // fdatasync
+        case 52:  return 0;   // fchmod
+        case 53:  return 0;   // fchmodat
+        case 88:  return 0;   // utimensat / futimens
+        case 55:  return 0;   // fchown
+        case 54:  return 0;   // fchownat
         case 44: {   // fstatfs(fd, buf) / statfs — Wine + the wineserver query the FS; ENOSYS made the
                      // wineserver's file_set_error() choke (can't map ENOSYS to an NT status) and stall a
                      // client request. Report a plausible ext-like filesystem so the mapping proceeds.
