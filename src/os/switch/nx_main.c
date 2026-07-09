@@ -144,6 +144,23 @@ int main(int argc, char **argv) {
            name, heap_sz, memtot, memuse, sr, (unsigned long long)vb, (unsigned long long)vs);
       char rb[256]; snprintf(rb, sizeof rb, "backend=%s heap=0x%llx memtotal=0x%llx memused=0x%llx sysres=0x%llx base=0x%llx size=0x%llx",
            name, heap_sz, memtot, memuse, sr, (unsigned long long)vb, (unsigned long long)vs); rlog(rb); }
+    // M2.7 (Wine address-space diagnosis): dump the process memory regions so we know whether Wine's
+    // fixed low VAs (KUSER_SHARED_DATA @0x7ffe0000, the low-4GB reservation) fall inside any region that
+    // svcMapMemory can target (Alias/Stack). If they don't, box64-nx's 1:1 mapping can't satisfy Wine.
+    { u64 aslr_a=0,aslr_s=0,stk_a=0,stk_s=0,ali_a=0,ali_s=0,heap_a=0,heap_s=0;
+      svcGetInfo(&aslr_a, InfoType_AslrRegionAddress,  CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&aslr_s, InfoType_AslrRegionSize,     CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&stk_a,  InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&stk_s,  InfoType_StackRegionSize,    CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&ali_a,  InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&ali_s,  InfoType_AliasRegionSize,    CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&heap_a, InfoType_HeapRegionAddress,  CUR_PROCESS_HANDLE, 0);
+      svcGetInfo(&heap_s, InfoType_HeapRegionSize,     CUR_PROCESS_HANDLE, 0);
+      char rb[256]; snprintf(rb, sizeof rb,
+        "regions aslr=[0x%llx+0x%llx) stack=[0x%llx+0x%llx) alias=[0x%llx+0x%llx) heap=[0x%llx+0x%llx)",
+        (unsigned long long)aslr_a,(unsigned long long)aslr_s,(unsigned long long)stk_a,(unsigned long long)stk_s,
+        (unsigned long long)ali_a,(unsigned long long)ali_s,(unsigned long long)heap_a,(unsigned long long)heap_s);
+      rlog(rb); }
     consoleUpdate(NULL);
 
     // box64 rewrites argv in place assuming the strings are contiguous (as a Linux kernel lays
