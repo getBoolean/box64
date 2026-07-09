@@ -46,7 +46,8 @@ static void vlog(const char* fmt, ...) {
 #define NX_VFD_BASE 0x40000000
 #define NX_VFD_MAX  256
 #define RING_CAP    (256*1024)
-#define FDQ_MAX     32
+#define FDQ_MAX     256   // wine can queue many pending fds on the main socket before the client
+                          // drains them via receive_fd; 32 overflowed and silently dropped fds
 
 // VK_LOCK / VK_SHMEM (M2.5): the wineserver runtime files (lock, tmpmap-*) that the client and the
 // in-process wineserver share. fsdev can't open the same file from both instances (2nd open -> EIO)
@@ -399,6 +400,9 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
         }
         if (v->peer < 0) { pthread_mutex_unlock(&g_mx); return 0; }      // EOF
         if (v->nonblock) { pthread_mutex_unlock(&g_mx); errno = EAGAIN; return -1; }
+        { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+          if (on) vlog("nx_vfd: RDBLK pid=%d fd=%d kind=%d peer=%d n=%zu\n",
+                       nx_guest_pid(), fd, (int)v->kind, v->peer, n); }
         pthread_cond_wait(&g_cv, &g_mx);
     }
 }
@@ -406,6 +410,13 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
 // write lands in the PEER's inbound ring
 long nx_vfd_write(int fd, const void* buf, size_t n) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    // M2.5 deadlock diag (gated on KX_REQLOG): a wine request header starts with a small int `req`;
+    // logging it per write traces the client's LAST server call before a hang — cheap, unlike +server.
+    if (buf && n >= 12 && n <= 65536 && nx_vfd_is(fd)) {
+        static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+        if (on) { int rq = *(const int*)buf; if (rq > 0 && rq < 256)
+            vlog("nx_vfd: REQ pid=%d fd=%d code=%d n=%zu\n", nx_guest_pid(), fd, rq, n); }
+    }
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
@@ -617,6 +628,9 @@ long nx_sendmsg(int fd, const l_msghdr* msg, int flags) {
                     p->fdq[p->fdq_n].fd = passfd;
                     p->fdq[p->fdq_n].at = p->wr;   // END of this message (iov already written above)
                     p->fdq_n++;
+                    { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+                      if (on) vlog("nx_vfd: FDQ+ pid=%d peer=%d fd=%d at=%zu q=%d\n",
+                                   nx_guest_pid(), v->peer, passfd, (size_t)p->wr, p->fdq_n); }
                 }
             }
             size_t adv = (cm->len + 7) & ~(size_t)7;
@@ -659,6 +673,9 @@ long nx_recvmsg(int fd, l_msghdr* msg, int flags) {
             fda[nout++] = v->fdq[0].fd;
             memmove(v->fdq, v->fdq + 1, --v->fdq_n * sizeof(fdpass_t));
         }
+        { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+          if (on && (v->fdq_n || nout)) vlog("nx_vfd: FDQ- pid=%d fd=%d rd=%zu front_at=%zu nout=%d q=%d nfit=%d\n",
+                   nx_guest_pid(), fd, (size_t)v->rd, v->fdq_n ? (size_t)v->fdq[0].at : 0, nout, v->fdq_n, nfit); }
         if (nout) {
             l_cmsghdr* cm = (l_cmsghdr*)msg->control;
             cm->len = sizeof(l_cmsghdr) + nout * sizeof(int);
