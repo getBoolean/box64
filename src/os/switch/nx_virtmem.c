@@ -453,12 +453,26 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
         if (p == MAP_FAILED) return MAP_FAILED;
         off_t save = lseek(fd, 0, SEEK_CUR);
         if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1) {
+            // Read via a HEAP bounce buffer, not directly into the mapped region. The region is
+            // CodeMemory (svcControlCodeMemory MapOwner) on Horizon; fsdev's ReadFile IPC receive
+            // buffer must be in a Normal/heap memory state. Passing a Code-state buffer makes
+            // svcSendSyncRequest fail — Ryujinx returns InvalidCurrentMemory and, for a
+            // get_handle_fd-passed section fd, the read HANGS instead of returning an error, wedging
+            // the wine client mid-DLL-load (e.g. the 0x8330000 section after kernelbase). A heap
+            // bounce buffer is always a valid IPC state; memcpy into the region afterwards (CPU, no
+            // IPC). If the tiny malloc ever fails, fall back to the old direct read.
             size_t done = 0;
+            size_t bufsz = 256 * 1024; if (bufsz > length) bufsz = length;
+            char* bounce = (char*)malloc(bufsz);
             while (done < length) {
-                ssize_t r = read(fd, (char*)p + done, length - done);
+                size_t want = length - done; if (want > bufsz) want = bufsz;
+                ssize_t r = bounce ? read(fd, bounce, want)
+                                   : read(fd, (char*)p + done, length - done);
                 if (r <= 0) break;
+                if (bounce) memcpy((char*)p + done, bounce, (size_t)r);
                 done += (size_t)r;
             }
+            free(bounce);
         }
         if (save != (off_t)-1) lseek(fd, save, SEEK_SET);
         // KUSER_SHARED_DATA is file-backed MAP_SHARED at 0x7ffe0000; the file read above just wrote

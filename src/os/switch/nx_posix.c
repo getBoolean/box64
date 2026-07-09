@@ -541,6 +541,10 @@ static long nx_futex(int* uaddr, int op, unsigned val, const void* timeout,
                     if (timeout_ns < 0) timeout_ns = 0;
                 }
             }
+            { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+              if (on) { char b[112]; extern int nx_guest_pid(void); int n = snprintf(b, sizeof b,
+                  "nx: FUTEXW pid=%d uaddr=%p val=%u *u=%d to=%lld\n", nx_guest_pid(), (void*)uaddr,
+                  val, uaddr ? *(volatile int*)uaddr : 0, (long long)timeout_ns); svcOutputDebugString(b, n); } }
             Result rc = svcWaitForAddress(uaddr, ArbitrationType_WaitIfEqual, (s64)(s32)val, timeout_ns);
             if (R_SUCCEEDED(rc)) return 0;
             switch (R_DESCRIPTION(rc)) {

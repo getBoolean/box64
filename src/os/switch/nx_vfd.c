@@ -195,6 +195,8 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     vfd_t* v = V(fd);
     if (v->kind != VK_DIR) { errno = ENOTDIR; return -1; }
+    { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+      if (on) vlog("nx_vfd: GETDENTS pid=%d fd=%d dir='%s'\n", nx_guest_pid(), fd, v->guest); }
     if (!v->d) { v->d = opendir(v->host); if (!v->d) { errno = ENOENT; return -1; } }
     uint8_t* out = (uint8_t*)ubuf; size_t off = 0; long ord = 1;
     for (;;) {
