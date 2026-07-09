@@ -340,45 +340,78 @@ static int nx_lowva_covered(uintptr_t a, size_t len) {
 static void nx_lowva_track(uintptr_t a, size_t len) {
     if (g_lowva_n < NX_LOWVA_MAX) { g_lowva[g_lowva_n].base = a; g_lowva[g_lowva_n].end = a + len; g_lowva_n++; }
 }
-static void* nx_map_lowva_fixed(void* addr, size_t rounded) {
-    if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); return addr; }
-    void* src = memalign(VM_PAGE, rounded);
-    if (!src) { errno = ENOMEM; return MAP_FAILED; }
 
-    // 1) Stack-region VAs: svcMapMemory (fast; fails for arbitrary ASLR like Wine's 0x7ffe0000).
-    if (R_SUCCEEDED(svcMapMemory(addr, src, rounded))) {
-        nx_lowva_track((uintptr_t)addr, rounded); memset(addr, 0, rounded); return addr;
+// KUSER_SHARED_DATA lives at the immutable Win32 VA 0x7ffe0000. Its `SystemCall` field (+0x308) is a
+// wineserver-set constant: 1 = "route NT syscalls through the dispatcher pointer at 0x7ffe1000"
+// (`call *0x7ffe1000` in every PE ntdll thunk), 0 = "raw x86-64 `syscall` and rely on seccomp/SIGSYS".
+// On KurokoNX raw NT syscalls are meaningless (box64 would read the Windows NT number as a Linux one),
+// and the wineserver's write never reaches the client (file-backed mmap copies per instance; the
+// client's KUSER page is a fresh CodeMemory page). So force SystemCall=1 the moment box64-nx backs the
+// KUSER page for the client — semantically exactly what the wineserver intends, and the ONLY viable
+// dispatch mode here. (The dispatcher-pointer page 0x7ffe1000 is wine's own anon_mmap_fixed.)
+#define NX_KUSER_VA        0x7ffe0000UL
+#define NX_KUSER_SYSCALL   0x308
+static void nx_kuser_fixup(void* addr, size_t rounded) {
+    uintptr_t a = (uintptr_t)addr;
+    if (a <= NX_KUSER_VA && a + rounded > NX_KUSER_VA + NX_KUSER_SYSCALL + 4) {
+        *(volatile uint32_t*)(NX_KUSER_VA + NX_KUSER_SYSCALL) = 1;   // SystemCall = 1 (use dispatcher)
+        char b[80]; int n = snprintf(b, sizeof b, "nx_vm: KUSER SystemCall=1 @0x7ffe0308\n");
+        if (n > 0) svcOutputDebugString(b, n);
     }
-
-    // 2) Arbitrary ASLR VAs (Win32 KUSER_SHARED_DATA @0x7ffe0000, PE bases): the CodeMemory mechanism
-    // libnx's jit uses (svcCreateCodeMemory + svcControlCodeMemory MapOwner). It needs NO own-process
-    // handle (works on an installed NSP — the jit does this every run) and lets us choose the exact dst.
-    // MapOwner+Perm_Rw gives a writable mapping — exactly what Wine's shared user data needs.
+}
+// Back ONE chunk [addr, addr+len) with a CodeMemory MapOwner mapping (Perm_Rw). len must be page-
+// rounded. Returns 0 on success (keeps cm+src alive for the run), -1 on failure.
+static int nx_lowva_map_one(uintptr_t addr, size_t len) {
+    void* src = memalign(VM_PAGE, len);
+    if (!src) return -1;
+    if (R_SUCCEEDED(svcMapMemory((void*)addr, src, len))) {   // Stack-region VAs: fast path
+        memset((void*)addr, 0, len); return 0;
+    }
     Handle cm = INVALID_HANDLE;
-    Result rc = svcCreateCodeMemory(&cm, src, rounded);
+    Result rc = svcCreateCodeMemory(&cm, src, len);
     if (R_SUCCEEDED(rc)) {
-        Result rc2 = svcControlCodeMemory(cm, CodeMapOperation_MapOwner, addr, rounded, Perm_Rw);
-        if (R_SUCCEEDED(rc2)) {
-            static int okd = 0;
-            if (!okd) { okd = 1; char b[120];
-                int n = snprintf(b, sizeof b, "nx_vm: lowVA via CodeMemory MapOwner %p+0x%lx OK\n",
-                                 addr, (unsigned long)rounded); if (n > 0) svcOutputDebugString(b, n); }
-            nx_lowva_track((uintptr_t)addr, rounded);
-            memset(addr, 0, rounded);
-            return addr;   // keep cm + src alive (mapping persists for the run)
-        }
-        svcCloseHandle(cm);   // MapOwner failed -> return src to normal memory
-        static int w2 = 0;
-        if (!w2) { w2 = 1; char b[140];
-            int n = snprintf(b, sizeof b, "nx_vm: lowVA %p+0x%lx CodeMemory MapOwner=0x%x\n",
-                             addr, (unsigned long)rounded, (unsigned)rc2); if (n > 0) svcOutputDebugString(b, n); }
+        Result rc2 = svcControlCodeMemory(cm, CodeMapOperation_MapOwner, (void*)addr, len, Perm_Rw);
+        if (R_SUCCEEDED(rc2)) { memset((void*)addr, 0, len); return 0; }   // keep cm+src alive
+        svcCloseHandle(cm);
+        MemoryInfo mi; u32 pi;   // diagnose WHY the dest is InvalidCurrentMemory: what occupies it?
+        Result qr = svcQueryMemory(&mi, &pi, addr);
+        char b[200]; int n = snprintf(b, sizeof b,
+                     "nx_vm: lowVA 0x%lx+0x%lx MapOwner=0x%x | q=0x%x region[0x%lx+0x%lx] type=0x%x perm=0x%x attr=0x%x\n",
+                     (unsigned long)addr, (unsigned long)len, (unsigned)rc2, (unsigned)qr,
+                     (unsigned long)mi.addr, (unsigned long)mi.size, (unsigned)mi.type, (unsigned)mi.perm, (unsigned)mi.attr);
+        if (n>0) svcOutputDebugString(b,n);
     } else {
-        static int w1 = 0;
-        if (!w1) { w1 = 1; char b[140];
-            int n = snprintf(b, sizeof b, "nx_vm: lowVA %p+0x%lx svcCreateCodeMemory=0x%x\n",
-                             addr, (unsigned long)rounded, (unsigned)rc); if (n > 0) svcOutputDebugString(b, n); }
+        char b[140]; int n = snprintf(b, sizeof b, "nx_vm: lowVA 0x%lx+0x%lx CreateCodeMemory=0x%x\n",
+                     (unsigned long)addr, (unsigned long)len, (unsigned)rc); if (n>0) svcOutputDebugString(b,n);
     }
-    free(src); errno = ENOMEM; return MAP_FAILED;
+    free(src); return -1;
+}
+
+// Back a low VA (outside the heap: Win32 KUSER_SHARED_DATA @0x7ffe0000, PE image bases, Wine's low
+// reservations) with CodeMemory MapOwner. svcControlCodeMemory MapOwner refuses a single map at/above
+// ~0x400000 bytes (InvalidCurrentMemory), and Wine reserves multi-MB PROT_NONE ranges (e.g. a 4 MiB
+// process-heap reserve at 0x8330000), so map in <=2 MiB chunks — each chunk is its own CodeMemory
+// object. (Guest pages are never executed natively, so RW backing + box64's no-op mprotect suffices;
+// a later commit at the same VA is already covered via g_lowva.)
+#define NX_LOWVA_CHUNK  (2UL*1024*1024)
+static void* nx_map_lowva_fixed(void* addr, size_t rounded) {
+    if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
+    uintptr_t base = (uintptr_t)addr;
+    size_t done = 0;
+    while (done < rounded) {
+        size_t len = rounded - done;
+        if (len > NX_LOWVA_CHUNK) len = NX_LOWVA_CHUNK;
+        if (nx_lowva_map_one(base + done, len) != 0) {
+            // roll back nothing (chunks persist harmlessly); report failure
+            errno = ENOMEM; return MAP_FAILED;
+        }
+        done += len;
+    }
+    { char b[120]; int n = snprintf(b, sizeof b, "nx_vm: lowVA MapOwner %p+0x%lx OK (chunked)\n",
+                   addr, (unsigned long)rounded); if (n > 0) svcOutputDebugString(b, n); }
+    nx_lowva_track(base, rounded);
+    nx_kuser_fixup(addr, rounded);
+    return addr;
 }
 
 static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {
@@ -428,6 +461,10 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
             }
         }
         if (save != (off_t)-1) lseek(fd, save, SEEK_SET);
+        // KUSER_SHARED_DATA is file-backed MAP_SHARED at 0x7ffe0000; the file read above just wrote
+        // the wineserver's per-instance copy (SystemCall=0) over the page, so re-assert SystemCall=1
+        // AFTER the read (see nx_kuser_fixup — the client must use the dispatcher, not raw syscalls).
+        nx_kuser_fixup(p, VM_ROUND(length));
         // Marker: the guest ld.so file-backs libc's (and other .so) segments here. On real HW this is
         // the only way to learn the runtime load base of libc, so a creport's guest RIP (X[27]) can be
         // resolved to libc+offset. Cheap: only a handful of these per run (one per PT_LOAD of each .so).

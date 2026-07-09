@@ -4,6 +4,7 @@
 #include <switch.h>         /* svcOutputDebugString — mirror guest stdout to the debug log */
 int nx_errno_h2l(int host_errno);   /* src/os/switch/nx_posix.c — host(newlib)->Linux errno (M2.3) */
 void nx_guest_output(int fd, const void *buf, size_t len);  /* nx_main.c — debug log + result-file tee */
+int nx_tee_origin(int fd);  /* nx_vfd.c — 1/2 or a dup chained from them (Wine writes to a dup of 1) */
 int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                    unsigned long a4, unsigned long a5, unsigned long a6, long* ret); /* nx_vfd.c (M2.5) */
 #endif
@@ -647,8 +648,11 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
 #ifdef __SWITCH__
             // Mirror guest stdout/stderr to the debug log (Ryujinx) and, bounded, to the result
             // file — the only channel an installed title has on real HW (no debug capture there).
-            if ((S_EDI == 1 || S_EDI == 2) && R_RDX)
-                nx_guest_output(S_EDI, (const void*)R_RSI, (size_t)R_RDX);
+            // nx_tee_origin also matches dups chained from 1/2 (Wine's std handles hold a dup of 1).
+            if (R_RDX) {
+                int kx_to = nx_tee_origin(S_EDI);
+                if (kx_to) nx_guest_output(kx_to, (const void*)R_RSI, (size_t)R_RDX);
+            }
 #endif
             S_RAX = write(S_EDI, (void*)R_RSI, (size_t)R_RDX);
             if(S_RAX==-1)

@@ -727,6 +727,24 @@ static void nx_normalize_guest(const char* p, char* out, size_t outn) {
         if (w < 0) break; o += (size_t)w;
     }
     if (!n) snprintf(out, outn, "/");
+    // Wine DOS-drive symlinks: fsdev/NTFS cannot hold a "c:"-named file, so the dosdevices/<x>:
+    // links exist only synthetically (readlink/getdents). A path THROUGH the link component
+    // (".../.wine/dosdevices/c:/windows/...") must be resolved here, in normalization, or every
+    // \??\C:\ lookup fails EINVAL on the colon: z: -> "/", <x>: -> "<prefix>/drive_<x>".
+    char* dd = strstr(out, "/dosdevices/");
+    if (dd) {
+        char l = dd[12];
+        if (l >= 'a' && l <= 'z' && dd[13] == ':' && (dd[14] == '/' || dd[14] == 0)) {
+            char rest[512]; snprintf(rest, sizeof rest, "%s", dd + 14);       // "/rest" or ""
+            if (l == 'z') {
+                char tmp[512]; snprintf(tmp, sizeof tmp, "%s", rest[0] ? rest : "/");
+                snprintf(out, outn, "%s", tmp);
+            } else {
+                char tmp[512]; snprintf(tmp, sizeof tmp, "drive_%c%s", l, rest);
+                snprintf(dd + 1, outn - (size_t)(dd + 1 - out), "%s", tmp);
+            }
+        }
+    }
 }
 
 int nx_translate_path(const char* p, char* out, size_t outn) {
@@ -918,7 +936,10 @@ long syscall(long number, ...) {
             nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, hp, fd);
             return fd;
         }
-        case 57: return nx_vfd_is((int)a0) ? nx_vfd_close((int)a0) : close((int)a0);   // close
+        case 57:                                                 // close
+            if (nx_vfd_is((int)a0)) return nx_vfd_close((int)a0);
+            { extern void nx_tee_forget(int fd); nx_tee_forget((int)a0); }  // drop stale stdout/err dup flag
+            return close((int)a0);
         case 63:                                                 // read
             if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
             return read((int)a0, (void*)a1, (size_t)a2);
@@ -977,15 +998,27 @@ long syscall(long number, ...) {
             lseek((int)a0, cur, SEEK_SET);
             return (long)r;
         }
-        case 66: {  // writev(fd, iov, iovcnt) — surface guest stderr/stdout (glibc/ld.so error text)
+        case 66: {  // writev(fd, iov, iovcnt) — REAL scatter write. fds 1/2 tee to the debug log +
+            // result file (that tee IS the guest-console channel); a vfd routes to the vfd layer —
+            // Wine's wine_server_call sends every payload-carrying request via writev(request_fd),
+            // so swallowing those here silently ate server requests and deadlocked the client;
+            // anything else hits the host fd.
             struct kx_iovec { const char* base; size_t len; };
             const struct kx_iovec* v = (const struct kx_iovec*)a1;
+            extern int nx_tee_origin(int fd);   // nx_vfd.c — 1/2 or a dup chained from them
+            int wfd = (int)a0;
+            int to  = nx_tee_origin(wfd);
             long total = 0;
             for (unsigned i = 0; i < (unsigned)a2 && v; ++i) {
-                if (v[i].base && v[i].len) {
-                    nx_guest_output((int)a0, v[i].base, v[i].len);  // Ryujinx log + result-file tee
-                    total += (long)v[i].len;
-                }
+                if (!v[i].base || !v[i].len) continue;
+                long r;
+                if (to) nx_guest_output(to, v[i].base, v[i].len);
+                if (wfd == 1 || wfd == 2) r = (long)v[i].len;   // the tee IS the console channel
+                else if (nx_vfd_is(wfd))  r = nx_vfd_write(wfd, v[i].base, v[i].len);
+                else                      r = write(wfd, v[i].base, v[i].len);
+                if (r < 0) return total ? total : -1;
+                total += r;
+                if ((size_t)r < v[i].len) break;
             }
             return total;
         }
@@ -1031,6 +1064,31 @@ long syscall(long number, ...) {
         case 34: {   // mkdirat(dirfd, path, mode) — create a dir in the rootfs (Wine: server tmpdir)
             extern int nx_mkdir_guest(const char* p, unsigned mode);
             return nx_mkdir_guest((const char*)a1, (unsigned)a2);
+        }
+        case 44: {   // fstatfs(fd, buf) / statfs — Wine + the wineserver query the FS; ENOSYS made the
+                     // wineserver's file_set_error() choke (can't map ENOSYS to an NT status) and stall a
+                     // client request. Report a plausible ext-like filesystem so the mapping proceeds.
+                     // Linux struct statfs (x86-64): f_type,f_bsize,f_blocks,f_bfree,f_bavail,f_files,
+                     // f_ffree,f_fsid[2],f_namelen,f_frsize,f_flags,f_spare[4] — all 8-byte on x86-64.
+            struct kx_statfs { long type, bsize, blocks, bfree, bavail, files, ffree;
+                               int fsid[2]; long namelen, frsize, flags, spare[4]; } *sf =
+                (struct kx_statfs*)a1;   // fstatfs: buf=a1; statfs: buf=a1 too (path=a0)
+            if (sf) { memset(sf, 0, sizeof *sf);
+                      sf->type = 0xEF53; sf->bsize = 4096; sf->frsize = 4096;
+                      sf->blocks = 0x100000; sf->bfree = 0x80000; sf->bavail = 0x80000;
+                      sf->files = 0x10000; sf->ffree = 0x8000; sf->namelen = 255; }
+            return 0;
+        }
+        case 269: case 439: {   // faccessat(dirfd,path,mode[,flags]) / faccessat2 — glibc access() tries
+                                // faccessat2 first; ENOSYS there stalled the wineserver's access check.
+                                // Route to an existence check against the rootfs (fsdev has no perms).
+            extern int nx_access_guest(const char* p, int mode);
+            const char* p = (const char*)a1;   // dirfd=a0, path=a1
+            if (p && p[0] != '/' && nx_vfd_is((int)a0) && nx_vfd_dir_guest((int)a0)) {
+                char full[1024]; snprintf(full, sizeof full, "%s/%s", nx_vfd_dir_guest((int)a0), p);
+                return nx_access_guest(full, (int)a2);
+            }
+            return nx_access_guest(p, (int)a2);
         }
         default:
             nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);

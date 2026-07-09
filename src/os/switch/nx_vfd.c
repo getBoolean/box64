@@ -51,7 +51,8 @@ static void vlog(const char* fmt, ...) {
 // VK_LOCK / VK_SHMEM (M2.5): the wineserver runtime files (lock, tmpmap-*) that the client and the
 // in-process wineserver share. fsdev can't open the same file from both instances (2nd open -> EIO)
 // and file-backed mmap copies per instance, so back them with IN-PROCESS shared state keyed by path.
-typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN, VK_LOCK, VK_SHMEM } vkind_t;
+typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN, VK_LOCK, VK_SHMEM,
+               VK_TAKEN } vkind_t;   // TAKEN: slot_alloc'd, real kind not yet set (never escapes g_mx)
 
 typedef struct { int fd; uint64_t at; } fdpass_t;
 
@@ -96,6 +97,25 @@ static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;   // broadcast on ANY state change
 static unsigned g_ino_next = 0x1000;
 
+// Guest-console tee origin: Wine hands the guest a DUP of unix fd 1/2 (fd 1 is SCM_RIGHTS-passed to
+// the wineserver at startup, dup'd there, dup'd again into every get_handle_fd reply), so the final
+// WriteFile lands on write(<dup>), not write(1). Track dup chains from 1/2 so the result-file tee
+// (nx_guest_output) still sees the output — on real HW that tee is the only proof channel.
+static unsigned char g_tee[1024];
+int nx_tee_origin(int fd) {
+    if (fd == 1 || fd == 2) return fd;
+    return (fd >= 0 && fd < 1024) ? g_tee[fd] : 0;
+}
+static void tee_mark(int newfd, int fromfd) {
+    int o = nx_tee_origin(fromfd);
+    if (o && newfd >= 0 && newfd < 1024) g_tee[newfd] = (unsigned char)o;
+}
+// Clear a stale tee flag when a real fd is closed: the number is about to be recycled, and if it were
+// left marked, a later unrelated file on that fd (e.g. the wineserver's reg*.tmp) would be spuriously
+// teed to svcOutputDebugString — dumping the whole 1.7 MiB registry to the log every save, which
+// throttled Ryujinx to a crawl and starved the wine client.
+void nx_tee_forget(int fd) { if (fd >= 0 && fd < 1024) g_tee[fd] = 0; }
+
 static inline int  is_vfd(int fd)  { return fd >= NX_VFD_BASE && fd < NX_VFD_BASE + NX_VFD_MAX; }
 static inline vfd_t* V(int fd)     { return &g_v[fd - NX_VFD_BASE]; }
 static inline size_t rused(vfd_t* v){ return v->wr - v->rd; }
@@ -108,9 +128,10 @@ static int slot_alloc(void) {          // g_mx held
             memset(&g_v[i], 0, sizeof g_v[i]);
             g_v[i].refs = 1; g_v[i].peer = -1;
             g_v[i].ino  = g_ino_next++;
-            return i;
-        }
-    return -1;
+            g_v[i].kind = VK_TAKEN;    // reserve NOW: a second slot_alloc under the same g_mx hold
+            return i;                  // must not return this slot again (make_pair got a==b: every
+        }                              // pipe/socketpair was ONE self-peered fd — no EOF/POLLHUP,
+    return -1;                         // and both guests shared one refcount on the "two" ends)
 }
 
 // ---- directories -------------------------------------------------------------------------------
@@ -419,6 +440,7 @@ static int make_pair(vkind_t kind, int fds[2], int nonblock) {
     g_v[a].pid = g_v[b].pid = nx_guest_pid();
     pthread_mutex_unlock(&g_mx);
     fds[0] = NX_VFD_BASE + a; fds[1] = NX_VFD_BASE + b;
+    vlog("nx_vfd: pair kind=%d [%d,%d] pid=%d\n", (int)kind, fds[0], fds[1], nx_guest_pid());
     return 0;
 }
 
@@ -557,11 +579,26 @@ typedef struct { size_t len; int level; int type; } l_cmsghdr;   // data follows
 long nx_sendmsg(int fd, const l_msghdr* msg, int flags) {
     (void)flags;
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SOCK) { errno = EBADF; return -1; }
-    vfd_t* v = V(fd);
-    // queue SCM_RIGHTS fds on the peer, stamped at the CURRENT stream position
+    // Write the iov bytes FIRST, THEN queue the SCM_RIGHTS fds stamped at the peer's ring position
+    // AFTER those bytes (= the END of this message). recvmsg then delivers a queued fd once the reader
+    // has consumed up to that mark (rd >= at). Stamping at the END (not the start) is what makes ALL
+    // of wine's fd-passing patterns work with one rule: an fd-only send (init reply/wait fds — no iov)
+    // stamps at the current position and is delivered the moment the reader reaches it; a "1 dummy byte
+    // + fd" send_client_fd stamps after that byte so exactly ONE fd is handed over per receive_fd; and
+    // a reply+fd stamps after the reply so the fd rides with that reply — with no over-delivery of a
+    // following message's fd and no stranding of an end-stamped fd.
+    long total = 0;
+    for (size_t i = 0; i < msg->iovlen; i++) {
+        if (!msg->iov[i].len) continue;
+        long r = nx_vfd_write(fd, msg->iov[i].base, msg->iov[i].len);
+        if (r < 0) return total ? total : -1;
+        total += r;
+        if ((size_t)r < msg->iov[i].len) break;
+    }
     if (msg->control && msg->controllen >= sizeof(l_cmsghdr)) {
         pthread_mutex_lock(&g_mx);
-        if (v->peer < 0) { pthread_mutex_unlock(&g_mx); errno = EPIPE; return -1; }
+        vfd_t* v = V(fd);
+        if (v->peer < 0) { pthread_mutex_unlock(&g_mx); errno = EPIPE; return total ? total : -1; }
         vfd_t* p = &g_v[v->peer];
         const uint8_t* c = (const uint8_t*)msg->control;
         size_t rem = msg->controllen;
@@ -574,9 +611,11 @@ long nx_sendmsg(int fd, const l_msghdr* msg, int flags) {
                 for (int i = 0; i < nfd && p->fdq_n < FDQ_MAX; i++) {
                     int passfd = fda[i];
                     if (nx_vfd_is(passfd)) g_v[passfd - NX_VFD_BASE].refs++;   // survive sender close
-                    else { int d = dup(passfd); if (d >= 0) passfd = d; else vlog("nx_vfd: dup(%d) fail e=%d\n", passfd, errno); }
+                    else { int d = dup(passfd);
+                           if (d >= 0) { tee_mark(d, passfd); passfd = d; }
+                           else vlog("nx_vfd: dup(%d) fail e=%d\n", passfd, errno); }
                     p->fdq[p->fdq_n].fd = passfd;
-                    p->fdq[p->fdq_n].at = p->wr;
+                    p->fdq[p->fdq_n].at = p->wr;   // END of this message (iov already written above)
                     p->fdq_n++;
                 }
             }
@@ -585,14 +624,6 @@ long nx_sendmsg(int fd, const l_msghdr* msg, int flags) {
             c += adv; rem -= adv;
         }
         pthread_mutex_unlock(&g_mx);
-    }
-    long total = 0;
-    for (size_t i = 0; i < msg->iovlen; i++) {
-        if (!msg->iov[i].len) continue;
-        long r = nx_vfd_write(fd, msg->iov[i].base, msg->iov[i].len);
-        if (r < 0) return total ? total : -1;
-        total += r;
-        if ((size_t)r < msg->iov[i].len) break;
     }
     return total;
 }
@@ -618,9 +649,12 @@ long nx_recvmsg(int fd, l_msghdr* msg, int flags) {
         int nfit = (int)((msg->controllen - sizeof(l_cmsghdr)) / sizeof(int));
         int nout = 0;
         int* fda = (int*)((uint8_t*)msg->control + sizeof(l_cmsghdr));
-        // Deliver queued SCM_RIGHTS fds whose bytes have been reached (<=, so an fd stamped at the
-        // exact end of the just-consumed reply is still delivered — the client reads exactly the
-        // message bytes, so `<` would strand the reply/wait channel fds and deadlock wineserver).
+        // Deliver queued SCM_RIGHTS fds whose stamped position has been reached (`at <= rd`). Wine
+        // sends most fds fd-only (no iov bytes) AFTER their reply — the init reply/wait fds and the
+        // get_handle_fd fds sit at the EXACT end of the consumed bytes, so `<` strands them and the
+        // client deadlocks waiting for a fd the server already sent (e.g. the locale.nls mapping fd).
+        // (An earlier attempt to also gate on `rused==0` to avoid over-delivering a pipelined next
+        // message's fd instead RE-STRANDED these end-stamped fds — `<=` is the correct, verified rule.)
         while (v->fdq_n && nout < nfit && v->fdq[0].at <= v->rd) {
             fda[nout++] = v->fdq[0].fd;
             memmove(v->fdq, v->fdq + 1, --v->fdq_n * sizeof(fdpass_t));
@@ -828,7 +862,7 @@ int nx_rename_guest(const char* a, const char* b) {
 
 int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                    unsigned long a4, unsigned long a5, unsigned long a6, long* ret) {
-    (void)a4; (void)a5; (void)a6;
+    (void)a5; (void)a6;
     long r = -1;
     switch (s) {
         case 0:   // read
@@ -840,14 +874,28 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             r = nx_vfd_write((int)a1, (const void*)a2, (size_t)a3);
             break;
         case 3:   // close
-            if (!nx_vfd_is((int)a1)) return 0;
+            if (!nx_vfd_is((int)a1)) { nx_tee_forget((int)a1); return 0; }  // clear stale tee flag, let box64 close
             r = nx_vfd_close((int)a1);
             break;
         case 7:   // poll
             r = nx_poll((l_pollfd*)a1, (unsigned long)a2, (int)a3);
             break;
-        case 16:  // ioctl (vfd only)
-            if (!nx_vfd_is((int)a1)) return 0;
+        case 16:  // ioctl
+            if (!nx_vfd_is((int)a1)) {
+                // Terminal ioctls on a REAL fd (the client's stdin/out/err): report NOT-a-tty. Wine's
+                // get_initial_console() calls isatty(0/1/2) (-> ioctl TCGETS); if it says "tty" Wine
+                // takes CONSOLE_HANDLE_SHELL and tries to spawn a conhost pseudo-console (impossible on
+                // Horizon -> cmd.exe spins). ENOTTY -> isatty=false -> CONSOLE_HANDLE_SHELL_NO_WINDOW:
+                // no console, and cmd.exe's std handles map straight to the unix fds -> echo's WriteFile
+                // reaches write(1) -> the box64 result tee. (No fd on Horizon is a real terminal.)
+                unsigned long q = (unsigned long)a2;
+                if (q == 0x5401 /*TCGETS*/  || q == 0x5402 /*TCSETS*/  || q == 0x5403 /*TCSETSW*/ ||
+                    q == 0x5413 /*TIOCGWINSZ*/ || q == 0x5414 /*TIOCSWINSZ*/ ||
+                    q == 0x540F /*TIOCGPGRP*/ || q == 0x5410 /*TIOCSPGRP*/) {
+                    errno = ENOTTY; r = -1; break;
+                }
+                return 0;   // other ioctls on real fds: let box64's default path handle them
+            }
             r = nx_vfd_ioctl((int)a1, (unsigned long)a2, (void*)a3);
             break;
         case 21: r = nx_access_guest((const char*)a1, (int)a2); break;
@@ -856,13 +904,39 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             if (!nx_vfd_is((int)a1)) return 0;
             r = nx_vfd_lseek((int)a1, (off_t)a2, (int)a3);
             break;
-        case 72:  // fcntl (vfd only)
-            if (!nx_vfd_is((int)a1)) return 0;
+        case 72:  // fcntl (vfd; plus the flag ops on real fds — newlib has no fcntl, and glibc
+                  // fdopen() requires a working F_GETFL: the wineserver registry save dies on it)
+            if (!nx_vfd_is((int)a1)) {
+                if ((int)a2 == 1 || (int)a2 == 2 || (int)a2 == 4) { r = 0; break; }  // F_GETFD/F_SETFD/F_SETFL
+                if ((int)a2 == 3) { r = 2 /*O_RDWR*/; break; }                        // F_GETFL
+                return 0;
+            }
             r = nx_vfd_fcntl((int)a1, (int)a2, (long)a3);
             break;
-        case 73:  // flock (vfd LOCK only)
-            if (!nx_vfd_is((int)a1)) return 0;
+        case 73:  // flock: vfd LOCK is the wineserver `lock`; on a REAL fd just accept — the
+                  // wineserver flock()s every file it opens for sharing checks, and newlib has no
+                  // flock (ENOSYS there failed every server-side open -> c0000001 image loads).
+            if (!nx_vfd_is((int)a1)) { r = 0; break; }
             r = nx_vfd_flock((int)a1, (int)a2);
+            break;
+        case 32:  // dup — the wineserver dups the stored unix fd into every get_handle_fd reply.
+            if (nx_vfd_is((int)a1)) {
+                pthread_mutex_lock(&g_mx);
+                V((int)a1)->refs++;          // no alias slots: same number, one more owner. POSIX
+                pthread_mutex_unlock(&g_mx); // wants a fresh number, but wine only stores/closes it.
+                r = (long)a1;
+            } else {
+                r = dup((int)a1);
+                if (r >= 0) tee_mark((int)r, (int)a1);
+            }
+            break;
+        case 33:  // dup2 (real fds only; a vfd can't be pinned to an arbitrary number)
+            if (nx_vfd_is((int)a1) || nx_vfd_is((int)a2)) {
+                vlog("nx_vfd: dup2(%d,%d) with vfd UNSUPPORTED\n", (int)a1, (int)a2);
+                errno = EBADF; r = -1; break;
+            }
+            r = dup2((int)a1, (int)a2);
+            if (r >= 0) tee_mark((int)r, (int)a1);
             break;
         case 77:  // ftruncate (vfd SHMEM only)
             if (!nx_vfd_is((int)a1)) return 0;
@@ -873,6 +947,13 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             else r = 0;                              // real fd: accept (nx_cwd is the only cwd we track)
             break;
         case 82: r = nx_rename_guest((const char*)a1, (const char*)a2); break;
+        // Modern glibc rename() emits renameat2(AT_FDCWD, old, AT_FDCWD, new, 0), NOT legacy rename(82);
+        // the wineserver's registry save renames its reg*.tmp over system.reg this way. Unhandled it
+        // fell through to the host-syscall passthrough -> ENOSYS -> the save FAILED, the registry stayed
+        // dirty, and the flush timer re-saved forever (the "file_set_error: Function not implemented"
+        // loop that starved the wine client). renameat=264(old,new @ a2,a4); renameat2=316(same+flags).
+        case 264: r = nx_rename_guest((const char*)a2, (const char*)a4); break;   // renameat
+        case 316: r = nx_rename_guest((const char*)a2, (const char*)a4); break;   // renameat2 (flags ignored)
         case 83: r = nx_mkdir_guest((const char*)a1, (unsigned)a2); break;
         case 84: r = nx_rmdir_guest((const char*)a1); break;
         case 87: r = nx_unlink_guest((const char*)a1); break;
