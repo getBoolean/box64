@@ -166,6 +166,26 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
         memcpy(out + off + 19, e->d_name, nl + 1);
         off += rl;
     }
+    // M2.5: Windows can't create files named "z:"/"c:" (reserved colon) on the SD, so synthesize the
+    // DOS-drive entries when Wine enumerates $WINEPREFIX/dosdevices — it then readlink()s each (see
+    // nx_readlink_common: z:->/, c:->../drive_c) to map the drives. Emit once (v->fpos as a guard).
+    if (!v->fpos) {
+        size_t gl = strlen(v->guest);
+        if (gl >= 11 && !strcmp(v->guest + gl - 11, "/dosdevices")) {
+            static const char* drives[] = { "z:", "c:" };
+            for (int k = 0; k < 2; k++) {
+                size_t nl = 2, rl = (19 + nl + 1 + 7) & ~(size_t)7;
+                if (off + rl > count) break;
+                *(uint64_t*)(out + off)     = v->ino + 1000 + k;
+                *(int64_t*) (out + off + 8) = ord++;
+                *(uint16_t*)(out + off + 16)= (uint16_t)rl;
+                out[off + 18] = 10;              // DT_LNK (a symlink — Wine readlinks it)
+                memcpy(out + off + 19, drives[k], nl + 1);
+                off += rl;
+            }
+        }
+        v->fpos = 1;                             // synthetic entries emitted (only on the first getdents)
+    }
     return (long)off;
 }
 

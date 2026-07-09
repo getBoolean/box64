@@ -456,6 +456,17 @@ static ssize_t nx_readlink_common(const char* path, char* buf, size_t bufsz) {
         memcpy(buf, exe, n);
         return (ssize_t)n;
     }
+    // M2.5: Wine maps DOS drives by readlink()ing $WINEPREFIX/dosdevices/<x>: to a unix path. fsdev has
+    // no symlinks, so synthesize the standard targets — Z: -> / (unix root) and C: -> the prefix drive_c
+    // — so `cmd /c ... > C:\file` / `Z:\file` resolves and Wine's file I/O reaches fsdev (bypassing the
+    // Wine console entirely, which needs a console host we can't spawn).
+    { const char* d = strstr(path, "/dosdevices/");
+      if (d) { d += 12; const char* tgt = NULL;
+        if ((d[0]=='z'||d[0]=='Z') && d[1]==':' && !d[2]) tgt = "/";
+        else if ((d[0]=='c'||d[0]=='C') && d[1]==':' && !d[2]) tgt = "../drive_c";
+        if (tgt) { size_t n = strlen(tgt); if (n > bufsz) n = bufsz; memcpy(buf, tgt, n); return (ssize_t)n; }
+      }
+    }
     errno = EINVAL;                                    // not a symlink -> caller uses the path as-is
     return -1;
 }
