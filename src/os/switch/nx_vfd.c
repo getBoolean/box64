@@ -488,6 +488,11 @@ long nx_vfd_writev(int fd, const void* iov, int iovcnt) {
     for (int i = 0; i < iovcnt; i++) if (v[i].base) want += v[i].len;
     if (!want) return 0;
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    // Trace the request code (first int of the first iov = wine request_header.req) — the loop that
+    // wedges the client uses writev, not write, so the nx_vfd_write REQ log misses it.
+    { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+      if (on && v[0].base && v[0].len >= 4) { int rq = *(const int*)v[0].base;
+        if (rq > 0 && rq < 256) vlog("nx_vfd: REQV pid=%d fd=%d code=%d want=%zu\n", nx_guest_pid(), fd, rq, want); } }
     pthread_mutex_lock(&g_mx);
     vfd_t* s = V(fd);
     if (s->kind != VK_PIPE && s->kind != VK_SOCK) { pthread_mutex_unlock(&g_mx); errno = EINVAL; return -1; }

@@ -529,10 +529,12 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     RESET_FLAGS(emu);
     uint32_t s = R_EAX; // EAX? (syscalls only go up to 547 anyways)
 #ifdef __SWITCH__
-    if (kx_sctrace) { static int cap = 0; if (cap < 3000) { cap++; extern int nx_guest_pid(void); char b[96];
-        int n = snprintf(b, sizeof b, "nx: SC pid=%d nr=%u rdi=0x%lx rsi=0x%lx\n", nx_guest_pid(), s,
-            (unsigned long)R_RDI, (unsigned long)R_RSI);
-        svcOutputDebugString(b, n); } }
+    if (kx_sctrace) { extern int nx_guest_pid(void); int pid = nx_guest_pid();
+        static int cap[256]; int idx = pid & 0xff;              // PER-PID cap: client & server don't share
+        if (cap[idx] < 6000) { cap[idx]++; char b[96];
+            int n = snprintf(b, sizeof b, "nx: SC pid=%d nr=%u rdi=0x%lx rsi=0x%lx\n", pid, s,
+                (unsigned long)R_RDI, (unsigned long)R_RSI);
+            svcOutputDebugString(b, n); } }
 #endif
     int log = 0;
     char t_buff[256] = "\0";
