@@ -45,6 +45,27 @@ static void rlog(const char *s) {
 // svcOutputDebugString capture), so it's how we turn a creport's guest RIP (X[27]) into lib+offset.
 void nx_result_log(const char *s) { rlog(s); }
 
+// Guest stdout/stderr tee (x64syscall.c write + nx_posix.c writev call this): mirror to the debug
+// log (Ryujinx) AND — bounded, so a chatty guest can't flood the SD — to the result file, which is
+// the only channel an installed title has on real HW (e.g. wine --version's one banner line).
+void nx_guest_output(int fd, const void *buf, size_t len) {
+    if (!buf || !len) return;
+    svcOutputDebugString((const char*)buf, len);
+    static size_t teed = 0;
+    if (teed >= 2048) return;
+    if (len > 2048 - teed) len = 2048 - teed;
+    teed += len;
+    char line[256];
+    while (len) {
+        size_t chunk = len < sizeof(line) - 16 ? len : sizeof(line) - 16;
+        int n = snprintf(line, sizeof line, "guest fd%d> %.*s", fd, (int)chunk, (const char*)buf);
+        // strip the guest's own newline; rlog appends one
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+        rlog(line);
+        buf = (const char*)buf + chunk; len -= chunk;
+    }
+}
+
 // Optional runtime tuning WITHOUT a rebuild: read sdmc:/box64/box64.env and setenv each KEY=VALUE line
 // (blank / '#' lines skipped). Horizon has no shell env, so this is how we flip BOX64_DYNAREC / BOX64_LOG
 // etc. over FTP between hardware runs. Overwrites, so the file wins over the compiled-in defaults.

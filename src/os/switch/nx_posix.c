@@ -20,6 +20,7 @@
 // box64-internal (src/libtools/threads.c): drop this thread's emu from the pthread key so the key
 // destructor can't double-free the emu clone_fn_syscall already released (see clone() below).
 extern void thread_forget_emu(void);
+void nx_guest_output(int fd, const void *buf, size_t len);   // nx_main.c — debug log + result-file tee
 
 #define NX_PAGE 0x1000UL
 
@@ -743,7 +744,7 @@ long syscall(long number, ...) {
             long total = 0;
             for (unsigned i = 0; i < (unsigned)a2 && v; ++i) {
                 if (v[i].base && v[i].len) {
-                    svcOutputDebugString(v[i].base, v[i].len);   // capture in the Ryujinx log
+                    nx_guest_output((int)a0, v[i].base, v[i].len);  // Ryujinx log + result-file tee
                     total += (long)v[i].len;
                 }
             }
