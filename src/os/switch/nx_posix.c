@@ -401,6 +401,25 @@ void login(const struct utmp *ut) { (void)ut; }
 int  logout(const char *line) { (void)line; return 0; }
 void logwtmp(const char *line, const char *name, const char *host) { (void)line; (void)name; (void)host; }
 
+// readlink/readlinkat — newlib returns -ENOSYS, which makes glibc realpath() and Wine's path
+// resolution HARD-FAIL ("cannot get path to ntdll.so"). box64's my_readlink handles /proc/self/exe
+// before reaching us; for everything else, a rootfs entry is not a symlink, so report EINVAL — the
+// POSIX "not a symbolic link" errno, which realpath()/Wine treat as "use the path verbatim". Also
+// answer /proc/self/exe with the Wine loader path (in case box64's isProcSelf didn't match the form).
+static ssize_t nx_readlink_common(const char* path, char* buf, size_t bufsz) {
+    if (!path || !buf) { errno = EFAULT; return -1; }
+    if (!strcmp(path, "/proc/self/exe") || !strcmp(path, "/proc/curproc/file")) {
+        const char* exe = "/usr/lib/wine/wine64";     // a plausible loader path for Wine's bindir logic
+        size_t n = strlen(exe); if (n > bufsz) n = bufsz;
+        memcpy(buf, exe, n);
+        return (ssize_t)n;
+    }
+    errno = EINVAL;                                    // not a symlink -> caller uses the path as-is
+    return -1;
+}
+ssize_t readlink(const char* path, char* buf, size_t bufsz) { return nx_readlink_common(path, buf, bufsz); }
+ssize_t readlinkat(int dirfd, const char* path, char* buf, size_t bufsz) { (void)dirfd; return nx_readlink_common(path, buf, bufsz); }
+
 // sysconf/getpagesize — newlib's return -ENOSYS via our stubs, but box64 needs a real page
 // size (box64_pagesize = sysconf(_SC_PAGESIZE); a -1 poisons all its alignment/mmap math).
 #include <unistd.h>

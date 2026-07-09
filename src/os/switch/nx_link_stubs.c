@@ -401,7 +401,7 @@ __asm__(
 "  .global pwrite\n  .type pwrite, %function\n  .set pwrite, nx_enosys_stub\n"
 "  .global pwritev\n  .type pwritev, %function\n  .set pwritev, nx_enosys_stub\n"
 "  .global quotactl\n  .type quotactl, %function\n  .set quotactl, nx_enosys_stub\n"
-"  .global readlinkat\n  .type readlinkat, %function\n  .set readlinkat, nx_enosys_stub\n"
+// readlinkat: real implementation in nx_posix.c (M2.7 Wine path resolution) — stub removed.
 "  .global readv\n  .type readv, %function\n  .set readv, nx_enosys_stub\n"
 "  .global reboot\n  .type reboot, %function\n  .set reboot, nx_enosys_stub\n"
 "  .global regcomp\n  .type regcomp, %function\n  .set regcomp, nx_enosys_stub\n"

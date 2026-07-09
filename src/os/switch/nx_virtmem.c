@@ -314,9 +314,55 @@ static int        hb_n = 0;
 static void  hb_track(uintptr_t b, size_t l) { if (hb_n < HB_MAX) { hb_blocks[hb_n].base = b; hb_blocks[hb_n].len = l; hb_n++; } }
 static int   hb_untrack(uintptr_t b) { for (int i = 0; i < hb_n; i++) if (hb_blocks[i].base == b) { hb_blocks[i] = hb_blocks[--hb_n]; return 1; } return 0; }
 
+extern char* fake_heap_start;
+extern char* fake_heap_end;
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+// M2.7 (Wine): track the low-VA regions we svcMapMemory'd so Wine's reserve-then-commit pattern (map
+// PROT_NONE over a range, then MAP_FIXED_NOREPLACE a sub-range) doesn't re-map (svcMapMemory of an
+// already-mapped VA fails). A hit means the VA is already backed — just return it.
+#define NX_LOWVA_MAX 128
+static struct { uintptr_t base, end; } g_lowva[NX_LOWVA_MAX];
+static int g_lowva_n = 0;
+static int nx_lowva_covered(uintptr_t a, size_t len) {
+    for (int i = 0; i < g_lowva_n; i++)
+        if (a >= g_lowva[i].base && a + len <= g_lowva[i].end) return 1;
+    return 0;
+}
+
+// Back a low VA (outside the heap: Win32 KSHARED_USER_DATA @0x7ffe0000, PE image bases, Wine's low
+// reservations) with svcMapMemory (mirror fresh heap pages to the exact VA). Returns addr or MAP_FAILED
+// (Horizon rejects a non-mappable region). Guest pages are never executed natively, so RW backing +
+// box64's no-op mprotect is enough; a later commit at the same VA is already covered.
+static void* nx_map_lowva_fixed(void* addr, size_t rounded) {
+    if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); return addr; }
+    void* src = memalign(VM_PAGE, rounded);
+    if (!src) { errno = ENOMEM; return MAP_FAILED; }
+    Result rc = svcMapMemory(addr, src, rounded);
+    if (R_FAILED(rc)) {
+        static int warned = 0;
+        if (!warned) { warned = 1; char b[120];
+            int n = snprintf(b, sizeof b, "nx_vm: lowVA svcMapMemory(%p,0x%lx)=0x%x\n",
+                             addr, (unsigned long)rounded, (unsigned)rc);
+            if (n > 0) svcOutputDebugString(b, n); }
+        free(src); errno = ENOMEM; return MAP_FAILED;
+    }
+    if (g_lowva_n < NX_LOWVA_MAX) { g_lowva[g_lowva_n].base = (uintptr_t)addr;
+                                    g_lowva[g_lowva_n].end = (uintptr_t)addr + rounded; g_lowva_n++; }
+    memset(addr, 0, rounded);
+    return addr;
+}
+
 static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {
-    if (flags & MAP_FIXED) {
+    if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         if (!(flags & MAP_ANONYMOUS) || !addr) { errno = ENODEV; return MAP_FAILED; }
+        // A low VA outside the heap must be explicitly backed (Wine's Win32 address space). A high
+        // MAP_FIXED (the guest ELF/arena at 0x2xx… heap addresses) is already heap-backed -> just zero it.
+        if ((uintptr_t)addr < (uintptr_t)fake_heap_start || (uintptr_t)addr >= (uintptr_t)fake_heap_end)
+            return nx_map_lowva_fixed(addr, rounded);
         memset(addr, 0, rounded);
         return addr;
     }

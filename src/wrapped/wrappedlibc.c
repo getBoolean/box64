@@ -2094,6 +2094,14 @@ EXPORT ssize_t my_readlink(x64emu_t* emu, void* path, void* buf, size_t sz)
 {
     if(isProcSelf((const char*)path, "exe")) {
         // special case for self...
+#ifdef __SWITCH__
+        // box64-nx loads the guest from an sdmc:/ path, so context->fullpath is "sdmc:/box64/..." —
+        // Wine derives its data/nls dirs from /proc/self/exe and mangles them from that. Report the
+        // Linux WINELOADER path instead when running Wine (M2.7). (Real /proc doesn't exist on Horizon.)
+        const char* wl = getenv("WINELOADER");
+        if(wl && wl[0]=='/')
+            return strlen(strncpy((char*)buf, wl, sz));
+#endif
         return strlen(strncpy((char*)buf, emu->context->fullpath, sz));
     }
     ssize_t ret = readlink((const char*)path, (char*)buf, sz);
