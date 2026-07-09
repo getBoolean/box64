@@ -295,10 +295,13 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     extern int nx_vfd_stat(int fd, struct stat* st);
     extern const char* nx_vfd_dir_guest(int fd);
     char hp[512]; int have_hp = 0;
-    if ((flags & AT_EMPTY_PATH) || !path || !path[0])
+    if ((flags & AT_EMPTY_PATH) || !path || !path[0]) {
         r = nx_vfd_is(dirfd) ? nx_vfd_stat(dirfd, b)     // M2.5: dir/socket vfds
                              : fstat(dirfd, b);          // fstat via the open fd
-    else {
+        // Report the std fds as pipes so Wine writes cmd.exe's stdout DIRECTLY to fd 1 instead of
+        // wrapping it in a Wine console (whose output would need an unspawnable console host).
+        if (r == 0 && dirfd >= 0 && dirfd <= 2) b->st_mode = (b->st_mode & ~S_IFMT) | S_IFIFO;
+    } else {
         char gp[512];                                    // M2.5: relative to a dir vfd
         if (path[0] != '/' && nx_vfd_is(dirfd) && nx_vfd_dir_guest(dirfd)) {
             snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest(dirfd), path);

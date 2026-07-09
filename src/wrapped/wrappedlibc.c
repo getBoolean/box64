@@ -1775,6 +1775,11 @@ EXPORT int my_fstat(x64emu_t *emu, int fd, void* buf)
     struct stat st;
 #ifdef __SWITCH__
     int r = nx_vfd_is(fd) ? nx_vfd_stat(fd, &st) : fstat(fd, &st);
+    // M2.5/M2.7: report the std fds (0/1/2) as PIPES, not the char-device the libnx console fd looks
+    // like. Wine wraps a char-device std handle in a Wine console (whose output needs a console host
+    // we can't spawn -> lost); a pipe/file std handle is written to DIRECTLY, so `cmd /c echo X`
+    // reaches our fd 1 (the debug-log + result tee).
+    if (r == 0 && fd >= 0 && fd <= 2) { st.st_mode = (st.st_mode & ~S_IFMT) | S_IFIFO; }
 #else
     int r = fstat(fd, &st);
 #endif
