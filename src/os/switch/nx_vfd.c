@@ -492,7 +492,19 @@ long nx_vfd_writev(int fd, const void* iov, int iovcnt) {
     // wedges the client uses writev, not write, so the nx_vfd_write REQ log misses it.
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
       if (on && v[0].base && v[0].len >= 4) { int rq = *(const int*)v[0].base;
-        if (rq > 0 && rq < 256) vlog("nx_vfd: REQV pid=%d fd=%d code=%d want=%zu\n", nx_guest_pid(), fd, rq, want); } }
+        if (rq > 0 && rq < 256) vlog("nx_vfd: REQV pid=%d fd=%d code=%d want=%zu\n", nx_guest_pid(), fd, rq, want);
+        // Decode a `select` (code 28) to identify the awaited object: request_header(12)+flags(4)+
+        // cookie(8)+timeout(8 @+24). iov[1] carries apc_result + select_op (op int + handles). Dump
+        // the timeout (infinite=0x7fffffffffffffff) and the select_op vararg hex.
+        if (rq == 28 && v[0].len >= 32) {
+            long long to = *(const long long*)((const char*)v[0].base + 24);
+            char hx[200]; int hn = 0; hx[0] = 0;
+            if (iovcnt >= 2 && v[1].base) { size_t m = v[1].len < 64 ? v[1].len : 64;
+                for (size_t k = 0; k < m && hn < (int)sizeof hx - 3; k++)
+                    hn += snprintf(hx + hn, sizeof hx - hn, "%02x", ((const unsigned char*)v[1].base)[k]); }
+            vlog("nx_vfd: SELECT pid=%d timeout=0x%llx iov0len=%zu iov1=%s\n",
+                 nx_guest_pid(), to, v[0].len, hx);
+        } } }
     pthread_mutex_lock(&g_mx);
     vfd_t* s = V(fd);
     if (s->kind != VK_PIPE && s->kind != VK_SOCK) { pthread_mutex_unlock(&g_mx); errno = EINVAL; return -1; }
