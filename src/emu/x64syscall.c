@@ -529,6 +529,7 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     RESET_FLAGS(emu);
     uint32_t s = R_EAX; // EAX? (syscalls only go up to 547 anyways)
 #ifdef __SWITCH__
+    { extern void nx_applet_keepalive(void); nx_applet_keepalive(); }   // keep our layer foregrounded (main thread, throttled)
     if (kx_sctrace) { extern int nx_guest_pid(void); int pid = nx_guest_pid();
         static int cap[256]; int idx = pid & 0xff;              // PER-PID cap: client & server don't share
         if (cap[idx] < 6000) { cap[idx]++; char b[96];

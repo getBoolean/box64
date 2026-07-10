@@ -88,12 +88,29 @@ static void rlog(const char *s) {
 // svcOutputDebugString capture), so it's how we turn a creport's guest RIP (X[27]) into lib+offset.
 void nx_result_log(const char *s) { rlog(s); }
 
+// The console's owning thread (the client/main guest). The in-process wineserver runs on a SEPARATE host
+// thread; libnx's console double-buffer is not safe to drive from two threads, so guest output is only
+// rendered to the screen from this thread (the wineserver's diagnostics still tee to the SD file). Set
+// in main() right after consoleInit().
+static Handle g_main_thread = 0;
+static int g_hold_done = 0;   // ensures the on-screen "press + to exit" hold runs exactly once
+
 // Guest stdout/stderr tee (x64syscall.c write + nx_posix.c writev call this): mirror to the debug
 // log (Ryujinx) AND — bounded, so a chatty guest can't flood the SD — to the result file, which is
 // the only channel an installed title has on real HW (e.g. wine --version's one banner line).
 void nx_guest_output(int fd, const void *buf, size_t len) {
     if (!buf || !len) return;
     svcOutputDebugString((const char*)buf, len);
+    // Mirror guest output to the ON-SCREEN console so a hardware run SHOWS the launched program's output
+    // (e.g. cmd.exe's echo — svcOutputDebugString isn't captured on real HW). ONLY from the main/client
+    // thread: the in-process wineserver runs on another host thread and writes its own diagnostics
+    // (sock_init/file_set_error warnings) to fd 2 — driving libnx's console double-buffer from two threads
+    // corrupts/HANGS it (this was showing the wineserver's errors and stalling before the echo). The
+    // wineserver's chatter still reaches the SD tee below, so it's LOGGED, just kept off the screen.
+    if (threadGetCurHandle() == g_main_thread) {
+        fwrite(buf, 1, len, stdout); fflush(stdout);
+        consoleUpdate(NULL);
+    }
     // Bounded so a chatty guest can't flood the SD, but generous enough that a wineserver's startup
     // chatter (registry-save warnings, ~1 KiB) doesn't crowd out the actual command output that
     // follows — this file is the ONLY result channel on real HW.
@@ -111,6 +128,12 @@ void nx_guest_output(int fd, const void *buf, size_t len) {
         rlog(line);
         buf = (const char*)buf + chunk; len -= chunk;
     }
+    // Hold on the guest's FIRST stdout line until + (real HW + KX_WAIT_EXIT). THIS is the only place a hold
+    // works: we're inside the guest's write() syscall, so the guest is still running and box64 is the
+    // foreground app (appletMainLoop() true, input flows). A hold at exit_group instead shows HOME — by then
+    // the OS has already queued box64's Exit. Blocks the write() until +, then the guest resumes and exits.
+    // no-op after the first hold, off real HW, or without KX_WAIT_EXIT. (fd 1 = the program's own output.)
+    if (fd == 1) { extern void nx_wait_for_exit_button(void); nx_wait_for_exit_button(); }
 }
 
 // Optional runtime tuning WITHOUT a rebuild: read sdmc:/box64/box64.env and setenv each KEY=VALUE line
@@ -144,6 +167,10 @@ static void load_env_file(void) {
 // status/result to the PC terminal while it also shows on the Switch console.
 static int g_nxlink_fd = -1;
 
+// Set in main(); read by the hold + cleanup paths. homebrew = plain NRO (heap override + nxlink + romfs).
+static bool g_homebrew = false;
+static bool g_have_romfs = false;
+
 // Print to the on-screen console AND, when launched via nxlink, mirror the same text to the host PC.
 static void kout(const char *fmt, ...) {
     char buf[512];
@@ -157,6 +184,72 @@ static void kout(const char *fmt, ...) {
     if (g_nxlink_fd >= 0) write(g_nxlink_fd, buf, (size_t)n);
 }
 
+// Hold the screen until the user presses +, so a hardware run's output stays readable and the user closes
+// it themselves. Called from the guest's stdout write (nx_guest_output, fd 1) — NOT from any exit path.
+// Why: a hold only works while the guest is still running, because THEN box64 is a normal foreground app
+// (appletMainLoop() true, input flows). Once the guest calls exit_group the OS has already queued box64's
+// Exit (it force-reaps an emulator whose guest finished, ~3 s later), so a hold there just shows HOME.
+// Gated: only on real HW (padConfigureInput crashes Ryujinx's HID, and Ryujinx has no controller anyway),
+// only with KX_WAIT_EXIT set, only from the console-owning thread (the in-process wineserver must never
+// drive HID/console). Runs at most once (g_hold_done). Blocks the write() until +, then the guest resumes.
+void nx_wait_for_exit_button(void) {
+    if (g_hold_done) return;
+    if (!getenv("KX_WAIT_EXIT") || !detectMesosphere()) return;
+    if (threadGetCurHandle() != g_main_thread) return;
+    g_hold_done = 1;
+    rlog("hold: waiting for + button");
+    kout("\n[ press + to exit ]\n");
+    consoleUpdate(NULL);
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad; padInitializeDefault(&pad);
+    // Pump appletMainLoop() so our layer stays composited (an application must service the applet channel
+    // to hold the screen). This is called from the guest's stdout write — i.e. BEFORE the guest exits —
+    // so the OS has not yet queued our Exit and appletMainLoop() returns true; the app stays foreground
+    // and receives +. (At/after exit_group the OS has already queued Exit -> appletMainLoop() goes false
+    // and Horizon force-reaps us, so a hold there just shows HOME. That is why the hook lives in the write.)
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+        consoleUpdate(NULL);
+        svcSleepThread(16000000ULL);
+    }
+    rlog("hold: + pressed, exiting");
+}
+
+// Keep the application in the foreground DURING a long guest run. box64 emulates in a tight loop and
+// never returns to an appletMainLoop()-driven main loop, so on a multi-second run (Wine loading ~10 DLLs)
+// the OS stops compositing our layer and shows HOME — so the guest's output is produced off-screen and
+// the exit hold then can't reclaim focus. Pumping appletMainLoop() + re-presenting the console on a
+// throttle keeps our layer alive. Called from the hot mmap path (nx_virtmem.c). Main thread only (the
+// wineserver thread must never touch applet/console); throttled to ~30 ms so it's cheap on the hot path.
+void nx_applet_keepalive(void) {
+    if (threadGetCurHandle() != g_main_thread) return;
+    static u64 last = 0;
+    u64 now = svcGetSystemTick();
+    if (now - last < 576000ULL) return;   // 19200 ticks/ms * 30 ms
+    last = now;
+    appletMainLoop();
+    consoleUpdate(NULL);
+}
+
+// main()'s tail hold (guests that DO unwind back to main — a simple static guest, unlike Wine cmd.exe).
+// Waits for + when KX_WAIT_EXIT is set; otherwise a fixed on-screen hold so the result is screenshot-
+// readable. Then tears down. Idempotent.
+static void nx_hold_and_exit(void) {
+    static int done = 0; if (done) return; done = 1;
+    nx_wait_for_exit_button();                 // + hold (real HW + KX_WAIT_EXIT); no-op / already-done otherwise
+    if (!g_hold_done) {
+        kout("\n(returning to the menu shortly)\n");
+        consoleUpdate(NULL);
+        if (g_homebrew) for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i) svcSleepThread(16000000ULL);
+        else            for (int i = 0; i < 30 * 60; ++i) svcSleepThread(16000000ULL);
+    }
+    if (g_have_romfs) romfsExit();
+    if (g_nxlink_fd >= 0) close(g_nxlink_fd);
+    if (g_homebrew) socketExit();
+    consoleExit(NULL);
+}
+
 int main(int argc, char **argv) {
     // Drop a COMMITTED marker before anything else. consoleInit()'s first malloc is exactly where a
     // null-heap title used to Data-Abort, so writing this first lets us tell "crashed before main"
@@ -164,12 +257,14 @@ int main(int argc, char **argv) {
     { int fd = open("sdmc:/box64/box64-result.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
       if (fd >= 0) { write(fd, "main:entered\n", 13); close(fd); } fsdevCommitDevice("sdmc"); }
     consoleInit(NULL);
+    g_main_thread = threadGetCurHandle();   // only this thread may drive the console (see nx_guest_output)
     // nxlink is a homebrew-only channel (the netloader host address comes from the hbloader ABI). An
     // installed title (NSP) has no bsd/nifm services in its NPDM, so socketInitializeDefault() would
     // HANG it on a black screen — do socket/nxlink ONLY for a homebrew NRO (which has a heap override).
     // A title just prints to its own console (read via a screenshot). Connect WITHOUT redirecting
     // stdout (kout mirrors manually) so the console keeps the screen; g_nxlink_fd <0 when not netloaded.
     bool homebrew = envHasHeapOverride();
+    g_homebrew = homebrew;
     if (homebrew) {
         socketInitializeDefault();
         g_nxlink_fd = nxlinkConnectToHost(false, false);
@@ -183,6 +278,7 @@ int main(int argc, char **argv) {
     // (NSP) has none and loads its guest from the SD — and calling romfsInit() there CRASHES Ryujinx
     // (GetRomFs KeyNotFoundException) instead of erroring, so gate it on the homebrew case.
     bool have_romfs = homebrew && R_SUCCEEDED(romfsInit());
+    g_have_romfs = have_romfs;
     // Guest path: argv[1] when a launcher provides one (e.g. `nxlink --args romfs:/loop box64.nro`),
     // else the embedded romfs:/hello, else the SD compile default when romfs is unavailable.
     const char *guest = (argc >= 2 && argv[1] && argv[1][0]) ? argv[1]
@@ -312,28 +408,11 @@ int main(int argc, char **argv) {
         { char b[48]; snprintf(b, sizeof b, "nx_main: guest exited %d\n", code); kdbg(b); }
         { char b[64]; snprintf(b, sizeof b, "guest exited=%d", code); rlog(b); }
     }
-    kout("\n(returning to the menu shortly)\n");
-    consoleUpdate(NULL);   // present the final frame ONCE
-
-    // Hold the result on screen. An NRO returns to hbmenu when the OS asks (or after ~8 s), so pump
-    // appletMainLoop() and exit when it goes false. A title (application) can't return to a menu on its
-    // own — a self-exiting application makes am show "The software was closed because an error occurred",
-    // and appletMainLoop() returns false for it right away — so hold ~30 s with a PLAIN fixed sleep so
-    // the result is readable via a screenshot. Do NOT poll appletMainLoop() on the title path: once am
-    // tears down the applet channel, polling it just spins svcWaitSynchronization(handle 0)=InvalidHandle
-    // (~16 ms cadence) — harmless |W| noise, but pure log spam with no benefit. (No HID re-present either;
-    // Ryujinx aborts on those.)
-    if (homebrew) {
-        for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i)
-            svcSleepThread(16000000ULL);
-    } else {
-        for (int i = 0; i < 30 * 60; ++i)
-            svcSleepThread(16000000ULL);
-    }
-    if (have_romfs) romfsExit();
-    if (g_nxlink_fd >= 0) close(g_nxlink_fd);
-    if (homebrew) socketExit();
-    consoleExit(NULL);
+    consoleUpdate(NULL);   // present the final frame
+    // A guest that unwinds back here (a simple static guest) holds + cleans up now. Wine cmd.exe instead
+    // exits from inside emulate() (exit_group) and never reaches this line — it already held during its
+    // stdout write (nx_guest_output -> nx_wait_for_exit_button). g_hold_done keeps it to a single hold.
+    nx_hold_and_exit();
     return (code < 0) ? 0 : code;
 }
 

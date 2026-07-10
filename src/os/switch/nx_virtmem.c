@@ -571,6 +571,7 @@ static void* nx_mmap_heap(void* addr, size_t rounded, int flags, int prot) {
 // ---------------------------------------------------------------------------------------------
 void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
     if (!length) return MAP_FAILED;
+    { extern void nx_applet_keepalive(void); nx_applet_keepalive(); }   // keep our layer on screen during a long run
 
     // M2.5: mmap of a wineserver SHMEM vfd (tmpmap-*) returns the SINGLE in-process shared buffer, so
     // the client and wineserver map the SAME memory (real shared memory in the one address space).
@@ -613,11 +614,13 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
         // the wineserver's per-instance copy (SystemCall=0) over the page, so re-assert SystemCall=1
         // AFTER the read (see nx_kuser_fixup — the client must use the dispatcher, not raw syscalls).
         nx_kuser_fixup(p, VM_ROUND(length));
-        // Marker: the guest ld.so file-backs libc's (and other .so) segments here. On real HW this is
-        // the only way to learn the runtime load base of libc, so a creport's guest RIP (X[27]) can be
-        // resolved to libc+offset. Cheap: only a handful of these per run (one per PT_LOAD of each .so).
-        { char b[128]; snprintf(b, sizeof b, "mmap file fd=%d off=0x%lx len=0x%lx -> 0x%lx",
-                   fd, (unsigned long)offset, (unsigned long)length, (unsigned long)p); nx_result_log(b); }
+        // Marker: the guest ld.so file-backs libc's (and other .so) segments here — the runtime load base
+        // of each .so, so a creport's guest RIP (X[27]) resolves to lib+offset. Useful for a JIT/loader
+        // crash but it's ~hundreds of lines that bury guest (Wine) error output, so gate it: set KX_MMAP_LOG
+        // in box64.env to re-enable when chasing a load-base fault. (Read once; cached.)
+        { static int mlog = -1; if (mlog < 0) mlog = getenv("KX_MMAP_LOG") ? 1 : 0;
+          if (mlog) { char b[128]; snprintf(b, sizeof b, "mmap file fd=%d off=0x%lx len=0x%lx -> 0x%lx",
+                   fd, (unsigned long)offset, (unsigned long)length, (unsigned long)p); nx_result_log(b); } }
         return p;
     }
     (void)offset;
