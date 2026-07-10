@@ -111,8 +111,17 @@ typedef struct blocklist_s {
 #define MMAPSIZE (512*1024)     // allocate 512kb sized blocks
 #define MMAPSIZE64 (64*2048)   // allocate 128kb sized blocks for 64byte map
 #define MMAPSIZE128 (128*1024)  // allocate 128kb sized blocks for 128byte map
+#ifdef __SWITCH__
+// box64-nx: each dynarec chunk is a separate libnx `jit` = one KCodeMemory kernel object, and Horizon's
+// KCodeMemory slab is TINY (~a dozen system-wide, shared with Wine's fixed-VA maps). So use FEW big chunks:
+// one 16 MiB first chunk holds all of a program's translated code (cmd.exe/Wine ~4-8 MiB), leaving slab
+// slots for the low-VA maps. Memory is cheap here (3.2 GiB Application heap); slab objects are not.
+#define DYNMMAPSZ (16*1024*1024)
+#define DYNMMAPSZ0 (16*1024*1024)
+#else
 #define DYNMMAPSZ (2*1024*1024) // allocate 2Mb block for dynarec
 #define DYNMMAPSZ0 (128*1024)   // allocate 128kb block for 1st page, to avoid wasting too much memory on small program / libs
+#endif
 
 static int                 n_blocks = 0;       // number of blocks for custom malloc
 static int                 c_blocks = 0;       // capacity of blocks for custom malloc

@@ -448,8 +448,8 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
 // back a coarse ALIGNED window (clipped to the enclosing reservation) so clustered commits share one large
 // object, and use a LARGE per-object chunk (adaptively halved if MapOwner rejects the size). Guest pages are
 // never executed natively, so RW backing + box64's no-op mprotect suffices.
-#define NX_LOWVA_CHUNK     (16UL*1024*1024)   // largest MapOwner size Horizon reliably accepts (adaptive-halve below)
-#define NX_LOWVA_COALESCE  (16UL*1024*1024)   // round each commit's backing out to this granule (merge clusters)
+#define NX_LOWVA_CHUNK     (32UL*1024*1024)   // MapOwner size (adaptive-halve if Horizon/memalign balk)
+#define NX_LOWVA_COALESCE  (32UL*1024*1024)   // round each commit's backing out to this granule (merge clusters)
 static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
     uintptr_t base = (uintptr_t)addr;
@@ -685,6 +685,16 @@ int nx_vm_protect(void* addr, size_t len, int prot) {
         if ((start < (uintptr_t)fake_heap_start || start >= (uintptr_t)fake_heap_end)
             && !nx_lowva_covered(start, rounded))
             nx_map_lowva_fixed((void*)start, rounded, prot);   // backs + tracks; MAP_FAILED is non-fatal here
+    } else if (!(prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) && addr && len) {
+        // PROT_NONE mprotect on a low VA = Wine DECOMMITTING (VirtualFree MEM_DECOMMIT). Reclaim the backing
+        // CodeMemory NOW — the KCodeMemory slab is the scarce resource, and Wine decommits temp buffers
+        // during startup; a re-commit later re-backs it. Only whole registered chunks fully inside the
+        // range are freed (partial decommits keep their object). Frees a slab slot for the next map.
+        uintptr_t start = (uintptr_t)addr & ~((uintptr_t)VM_PAGE - 1);
+        size_t rounded = VM_ROUND(len + ((uintptr_t)addr - start));
+        extern char *fake_heap_start, *fake_heap_end;
+        if (start < (uintptr_t)fake_heap_start || start >= (uintptr_t)fake_heap_end)
+            nx_lowva_free_range(start, rounded);
     }
     if (prot & PROT_EXEC) {
         static int warned = 0;
