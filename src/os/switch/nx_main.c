@@ -101,16 +101,16 @@ static int g_hold_done = 0;   // ensures the on-screen "press + to exit" hold ru
 void nx_guest_output(int fd, const void *buf, size_t len) {
     if (!buf || !len) return;
     svcOutputDebugString((const char*)buf, len);
-    // Mirror guest output to the ON-SCREEN console so a hardware run SHOWS the launched program's output
-    // (e.g. cmd.exe's echo — svcOutputDebugString isn't captured on real HW). ONLY from the main/client
-    // thread: the in-process wineserver runs on another host thread and writes its own diagnostics
-    // (sock_init/file_set_error warnings) to fd 2 — driving libnx's console double-buffer from two threads
-    // corrupts/HANGS it (this was showing the wineserver's errors and stalling before the echo). The
-    // wineserver's chatter still reaches the SD tee below, so it's LOGGED, just kept off the screen.
-    if (threadGetCurHandle() == g_main_thread) {
-        fwrite(buf, 1, len, stdout); fflush(stdout);
-        consoleUpdate(NULL);
-    }
+    // Mirror ALL guest output to the ON-SCREEN console (svcOutputDebugString isn't captured on real HW) —
+    // both the client's (cmd.exe's echo) and the in-process wineserver's (its sock_init/file_set_error
+    // startup warnings), which the wineserver writes to fd 2 from its own host thread. fwrite() renders
+    // into the console grid from ANY thread — stdio's FILE lock serialises it — but consoleUpdate() (the
+    // gfx present) is done ONLY from the console-owning main thread: presenting from two threads deadlocks
+    // libnx's double-buffer (that was the earlier hang). The wineserver's lines therefore appear on the
+    // next main-thread present — nx_applet_keepalive() pumps one every ~30 ms. All of it tees to the SD
+    // file below too, so it's LOGGED as well as shown.
+    fwrite(buf, 1, len, stdout); fflush(stdout);
+    if (threadGetCurHandle() == g_main_thread) consoleUpdate(NULL);
     // Bounded so a chatty guest can't flood the SD, but generous enough that a wineserver's startup
     // chatter (registry-save warnings, ~1 KiB) doesn't crowd out the actual command output that
     // follows — this file is the ONLY result channel on real HW.

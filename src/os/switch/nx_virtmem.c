@@ -461,7 +461,10 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
 #define NX_LOWVA_RELOC_THRESH 4               // once this many CodeMemory slab objects are live, bounce further
                                               // MAP_FIXED_NOREPLACE image reservations (Wine relocates them to
                                               // the heap — no slab cost). Keeps the slab for early/essential
-                                              // modules (ntdll/kernel32) + the tiny fixed pages (KUSER/TEB).
+                                              // modules (start.exe/ntdll — the main EXE has no .reloc and CANNOT
+                                              // be relocated, so it must stay on the slab at its base) + the
+                                              // tiny fixed pages (KUSER/TEB). Setting this too low bounces the
+                                              // EXE -> Wine can't relocate it -> STATUS_DLL_NOT_FOUND.
 static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot, int flags) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
     uintptr_t base = (uintptr_t)addr;
