@@ -420,13 +420,21 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
         if (R_SUCCEEDED(rc2)) { memset((void*)addr, 0, len); g_lowva_cm_live++;
                                 nx_lowva_cm_reg_add(addr, len, cm, src, 1); return 0; }   // keep cm+src alive (freed on munmap)
         svcCloseHandle(cm);
-        MemoryInfo mi; u32 pi;   // diagnose WHY the dest is InvalidCurrentMemory: what occupies it?
-        Result qr = svcQueryMemory(&mi, &pi, addr);
-        char b[220]; int n = snprintf(b, sizeof b,
-                     "nx_vm: lowVA 0x%lx+0x%lx MapOwner=0x%x live=%d | q=0x%x region[0x%lx+0x%lx] type=0x%x perm=0x%x",
-                     (unsigned long)addr, (unsigned long)len, (unsigned)rc2, g_lowva_cm_live, (unsigned)qr,
-                     (unsigned long)mi.addr, (unsigned long)mi.size, (unsigned)mi.type, (unsigned)mi.perm);
-        if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }   // result-file too: HW's only channel
+        // ONE-SHOT the MapOwner-failure log. MapOwner=0xdc01 InvalidCurrentMemory is a PLACEMENT/boundary
+        // failure (you can't map a CodeMemory page abutting an existing CodeMemory region); it fails at EVERY
+        // size, so the caller's adaptive-halve retries it ~13x, and the guest then re-commits/re-faults in a
+        // loop — logging it each time floods the result file (60k+ lines) and hangs the run. Log once.
+        static int logged_mo = 0;
+        if (!logged_mo) {
+            logged_mo = 1;
+            MemoryInfo mi; u32 pi;
+            Result qr = svcQueryMemory(&mi, &pi, addr);
+            char b[220]; int n = snprintf(b, sizeof b,
+                         "nx_vm: lowVA 0x%lx+0x%lx MapOwner=0x%x live=%d | q=0x%x region[0x%lx+0x%lx] type=0x%x perm=0x%x",
+                         (unsigned long)addr, (unsigned long)len, (unsigned)rc2, g_lowva_cm_live, (unsigned)qr,
+                         (unsigned long)mi.addr, (unsigned long)mi.size, (unsigned)mi.type, (unsigned)mi.perm);
+            if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }
+        }
     } else {
         int oor = (((unsigned)rc >> 9) & 0x1FFF) == 103;    // Kernel desc 103 (0xce01) = OutOfResource
         if (oor) g_lowva_slab_full = 1;                      // KCodeMemory slab exhausted
