@@ -458,9 +458,30 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
 // never executed natively, so RW backing + box64's no-op mprotect suffices.
 #define NX_LOWVA_CHUNK     (32UL*1024*1024)   // MapOwner size (adaptive-halve if Horizon/memalign balk)
 #define NX_LOWVA_COALESCE  (32UL*1024*1024)   // round each commit's backing out to this granule (merge clusters)
-static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot) {
+#define NX_LOWVA_RELOC_THRESH 4               // once this many CodeMemory slab objects are live, bounce further
+                                              // MAP_FIXED_NOREPLACE image reservations (Wine relocates them to
+                                              // the heap — no slab cost). Keeps the slab for early/essential
+                                              // modules (ntdll/kernel32) + the tiny fixed pages (KUSER/TEB).
+static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot, int flags) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
     uintptr_t base = (uintptr_t)addr;
+
+    // KCodeMemory-slab relief — THE cmd.exe-on-real-HW fix. A PE image reservation uses MAP_FIXED_NOREPLACE
+    // ("map here if free, else fail and I'll cope"); Wine's virtual_map_image retries the mapping at NULL
+    // when the preferred ImageBase fails (wine-8.0 dlls/ntdll/unix/virtual.c:2479), and a NULL-hint mmap on
+    // Horizon lands in box64's memalign heap — which costs NO KCodeMemory slab object. The slab is only
+    // ~a dozen objects system-wide and cmd.exe pulls in ~10 modules (both guests share the space), so once
+    // the slab is under pressure we REFUSE new image reservations with EEXIST and let Wine relocate the
+    // module into the heap for free. Guard on size (>=64 KiB) so the tiny must-be-fixed pages (KUSER
+    // @0x7ffe0000, TEB) are never bounced; early/essential modules load below the threshold and keep their
+    // preferred base. Returning EEXIST for MAP_FIXED_NOREPLACE is exactly that flag's contract.
+    if ((flags & MAP_FIXED_NOREPLACE) && rounded >= 0x10000 && g_lowva_cm_live >= NX_LOWVA_RELOC_THRESH) {
+        static int logged_reloc = 0;
+        if (!logged_reloc) { logged_reloc = 1; char b[128];
+            int n = snprintf(b, sizeof b, "nx_vm: bounce img 0x%lx+0x%lx (slab live=%d) -> Wine relocates to heap",
+                     (unsigned long)base, (unsigned long)rounded, g_lowva_cm_live); if (n > 0) nx_result_log(b); }
+        errno = EEXIST; return MAP_FAILED;
+    }
 
     // Cheaply reject fixed low VAs OUTSIDE the process's mappable ASLR region. Wine's ntdll reserves the
     // ENTIRE low Win32 space during virtual_init — thousands of best-effort PROT_NONE ranges from 0x10000
@@ -529,11 +550,16 @@ static void* nx_mmap_heap(void* addr, size_t rounded, int flags, int prot) {
         // A low VA outside the heap must be explicitly backed (Wine's Win32 address space). A high
         // MAP_FIXED (the guest ELF/arena at 0x2xx… heap addresses) is already heap-backed -> just zero it.
         if ((uintptr_t)addr < (uintptr_t)fake_heap_start || (uintptr_t)addr >= (uintptr_t)fake_heap_end)
-            return nx_map_lowva_fixed(addr, rounded, prot);
+            return nx_map_lowva_fixed(addr, rounded, prot, flags);
         memset(addr, 0, rounded);
         return addr;
     }
-    void* p = memalign(VM_PAGE, rounded);   // newlib malloc is itself thread-safe
+    // 64 KiB-align: a NULL-hint mmap is Wine's map_view fallback (incl. a RELOCATED image, our slab fix),
+    // which over-allocates size+granularity then munmap-trims to 64 KiB alignment. If the block is already
+    // 64 KiB-aligned the head-trim is empty and the tail-trim (an interior munmap) is a no-op in nx_munmap
+    // (not the tracked base) — so the whole memalign block stays intact and is freed on the module's final
+    // munmap. A 4 KiB-aligned block would let Wine munmap the block BASE (freeing it out from under itself).
+    void* p = memalign(0x10000, rounded);   // newlib malloc is itself thread-safe
     if (!p) { errno = ENOMEM; return MAP_FAILED; }
     if (flags & MAP_ANONYMOUS) memset(p, 0, rounded);
     mutexLock(&vm_lock); hb_track((uintptr_t)p, rounded); mutexUnlock(&vm_lock);
@@ -692,7 +718,9 @@ int nx_vm_protect(void* addr, size_t len, int prot) {
         extern char *fake_heap_start, *fake_heap_end;
         if ((start < (uintptr_t)fake_heap_start || start >= (uintptr_t)fake_heap_end)
             && !nx_lowva_covered(start, rounded))
-            nx_map_lowva_fixed((void*)start, rounded, prot);   // backs + tracks; MAP_FAILED is non-fatal here
+            nx_map_lowva_fixed((void*)start, rounded, prot, 0);   // flags=0: a commit must succeed (not a
+                                                                  // relocatable image); back it + track
+
     } else if (!(prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) && addr && len) {
         // PROT_NONE mprotect on a low VA = Wine DECOMMITTING (VirtualFree MEM_DECOMMIT). Reclaim the backing
         // CodeMemory NOW — the KCodeMemory slab is the scarce resource, and Wine decommits temp buffers
