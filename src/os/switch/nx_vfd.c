@@ -927,14 +927,21 @@ long nx_vfd_ioctl(int fd, unsigned long req, void* arg) {
     switch (req) {
         case 0x5421: v->nonblock = arg && *(int*)arg ? 1 : 0; return 0;  // FIONBIO
         case 0x541B: if (arg) *(int*)arg = (int)rused(v); return 0;      // FIONREAD
-        // Terminal ioctls on a vfd (a pipe/dir/socket is NOT a tty): report ENOTTY, exactly as the
-        // real-fd path does. Returning 0 (success) told Wine's isatty() the vfd WAS a tty, so Wine
-        // drove it as a console and spun forever (3.26M ioctls on the drive_c/windows dir vfd -> the
-        // "console-stage hang"). ENOTTY -> isatty=false -> Wine uses the non-console path.
-        case 0x5401: case 0x5402: case 0x5403: case 0x5404: case 0x5413: case 0x5414:
-        case 0x540F: case 0x5410: case 0x5411: case 0x5412:
+        // EVERYTHING else -> ENOTTY ("inappropriate ioctl for device"), exactly like a real Linux fd.
+        // Returning 0 (success) is a LIVELOCK LANDMINE: Wine PROBES fds with ioctls and, on success,
+        // drives that path forever. Confirmed hits, all via this default:
+        //  - terminal ioctls (TCGETS/TIOCGWINSZ 0x54xx): isatty()->true -> console spin (3.26M ioctls
+        //    on the drive_c/windows dir vfd -- the old "console-stage hang").
+        //  - VFAT_IOCTL_READDIR_BOTH (0x82307201 = _IOR('r',1,KERNEL_DIRENT[2])): Wine's
+        //    find_file_in_dir/NtQueryDirectoryFile probe. On success it reads the dir VIA the ioctl,
+        //    but we never fill KERNEL_DIRENT, so kde[0].d_reclen stays garbage-nonzero and the inner
+        //    ioctl keeps "succeeding" -> Wine loops `while(kde[0].d_reclen)` forever (file.c:2748-2778).
+        //  - EXT2_IOC_GETFLAGS (0x80086601): case-fold probe -> garbage flags misclassify the FS.
+        // ENOTTY makes every probe FAIL, so Wine uses the normal getdents64 path (nx_vfd_getdents64)
+        // and its own case-insensitive matching. Any vfd ioctl that legitimately needs success must be
+        // added as an explicit case above (like FIONBIO/FIONREAD), never left to a fake 0.
+        default:
             errno = ENOTTY; return -1;
-        default: return 0;                                               // accept quietly
     }
 }
 

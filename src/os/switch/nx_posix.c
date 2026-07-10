@@ -289,6 +289,30 @@ int lstat64(const char *p, struct stat64 *b)  { return lstat(p, (struct stat *)b
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
 #endif
+// M2.7: should this fd's stat report a REGULAR FILE (S_IFREG)? True for std out/err (0/1/2) AND their
+// SCM_RIGHTS-passed dups — the in-process wineserver fstat's the dup of client fd 1 to classify the fd
+// type (server/file.c file_get_fd_type). A regular file -> Wine picks FD_TYPE_FILE -> NtWriteFile does
+// a SYNCHRONOUS in-process write() (no server round-trip, no async, no APC). A char/fifo -> FD_TYPE_CHAR
+// -> async write -> an alertable SELECT_NONE APC wait that never completes on fork/exec-less Horizon
+// (no conhost, no async-I/O loop) — THE `cmd /c echo` hang. Key on the tee origin, not the fd number:
+// the wineserver's copy of fd 1 is a high-numbered dup with nx_tee_origin()==1 (shared g_tee[]).
+int nx_stdfd_regularize(int fd, unsigned mode) {
+    extern int nx_tee_origin(int fd);
+    extern int nx_guest_pid(void);
+    if (fd < 0) return 0;
+    int tee = nx_tee_origin(fd);
+    int is = (fd <= 2 || tee);
+    // DIAG (KX_STATLOG): log std/tee fds AND any raw char-device/fifo fstat (the libnx console + the
+    // dups the wineserver fstat's for the passed std handle) so we can see how fd 1 gets classified.
+    // Skip the S_IFREG library flood. `mode` is the RAW st_mode BEFORE this override.
+    static int on = -1; if (on < 0) on = getenv("KX_STATLOG") ? 1 : 0;
+    if (on && (is || (mode & S_IFMT) == S_IFCHR || (mode & S_IFMT) == S_IFIFO)) {
+        char b[128]; int n = snprintf(b, sizeof b, "nx_stat: pid=%d fd=%d tee=%d rawmode=0%o is=%d\n",
+                                      nx_guest_pid(), fd, tee, (unsigned)(mode & S_IFMT), is);
+        svcOutputDebugString(b, (size_t)n);
+    }
+    return is;
+}
 int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     int r;
     extern int nx_vfd_is(int fd);
@@ -298,9 +322,16 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     if ((flags & AT_EMPTY_PATH) || !path || !path[0]) {
         r = nx_vfd_is(dirfd) ? nx_vfd_stat(dirfd, b)     // M2.5: dir/socket vfds
                              : fstat(dirfd, b);          // fstat via the open fd
-        // Report the std fds as pipes so Wine writes cmd.exe's stdout DIRECTLY to fd 1 instead of
-        // wrapping it in a Wine console (whose output would need an unspawnable console host).
-        if (r == 0 && dirfd >= 0 && dirfd <= 2) b->st_mode = (b->st_mode & ~S_IFMT) | S_IFIFO;
+        // std out/err (+ their SCM_RIGHTS-passed dups, which the in-process wineserver fstat's for the
+        // passed std handle) -> a valid REGULAR-FILE stat. TWO reasons: (1) the libnx console fd's fstat
+        // FAILS with ENOSYS, which fails Wine's create_file_for_fd() (server/file.c) -> NULL hStdOutput
+        // -> cmd.exe's `echo` is written to a dead handle and LOST; synthesizing success makes the std
+        // handle exist so WCMD's WriteFile fallback reaches fd 1 (the tee). (2) FD_TYPE_FILE makes
+        // NtWriteFile a synchronous in-process write() (no async/APC). ino is set nonzero below.
+        if (nx_stdfd_regularize(dirfd, r == 0 ? b->st_mode : 0)) {
+            if (r != 0) { memset(b, 0, sizeof *b); b->st_nlink = 1; r = 0; }
+            b->st_mode = (b->st_mode & ~S_IFMT) | S_IFREG | 0600;
+        }
     } else {
         char gp[512];                                    // M2.5: relative to a dir vfd
         if (path[0] != '/' && nx_vfd_is(dirfd) && nx_vfd_dir_guest(dirfd)) {
@@ -1005,11 +1036,20 @@ long syscall(long number, ...) {
             lseek((int)a0, cur, SEEK_SET);                       // restore
             return (long)r;
         }
-        case 68: {  // pwrite64(fd, buf, count, offset) — wineserver sizes/inits its shared-mem file
-            off_t cur = lseek((int)a0, 0, SEEK_CUR);
-            if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) return -1;
-            ssize_t r = write((int)a0, (const void*)a1, (size_t)a2);
-            lseek((int)a0, cur, SEEK_SET);
+        case 68: {  // pwrite64(fd, buf, count, offset)
+            int wfd = (int)a0;
+            extern int nx_tee_origin(int fd);
+            int to = nx_tee_origin(wfd);
+            if (to) {  // std out/err (now a "regular file" to Wine): the tee IS the console channel.
+                // NEVER seek the libnx console fd (lseek would fail -> lost write). Capture + succeed.
+                if (a2) nx_guest_output(to, (const void*)a1, (size_t)a2);
+                return (long)a2;
+            }
+            // wineserver sizes/inits its shared-mem file via positioned writes
+            off_t cur = lseek(wfd, 0, SEEK_CUR);
+            if (lseek(wfd, (off_t)a3, SEEK_SET) < 0) return -1;
+            ssize_t r = write(wfd, (const void*)a1, (size_t)a2);
+            lseek(wfd, cur, SEEK_SET);
             return (long)r;
         }
         case 66: {  // writev(fd, iov, iovcnt) — REAL scatter write. fds 1/2 tee to the debug log +
