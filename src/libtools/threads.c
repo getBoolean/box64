@@ -349,6 +349,13 @@ static void* pthread_routine(void* p)
 		return atomic_load_explicit(&g_active_emu_workers, memory_order_relaxed);
 }
 
+// For emu threads NOT started via pthread_routine (e.g. the Horizon in-process wineserver, which nx_spawn
+// runs on a raw detached pthread calling DynaRun directly). Without this the worker count stays 0, so
+// endBox64() frees my_context out from under the still-running wineserver -> it then dereferences a NULL
+// my_context (mutex_lock(&my_context->mutex_dyndump) == lock(0x190)) and crashes on real HW.
+void inc_active_emu_workers(void) { atomic_fetch_add_explicit(&g_active_emu_workers, 1, memory_order_relaxed); }
+void dec_active_emu_workers(void) { atomic_fetch_sub_explicit(&g_active_emu_workers, 1, memory_order_relaxed); }
+
 #ifdef NOALIGN
 #define PTHREAD_ATTR_ALIGN(A)
 #define PTHREAD_ATTR_UNALIGN(A)

@@ -76,10 +76,42 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
         if (n > 0) nx_result_log(b);
     }
 
-    // Recover the faulting thread's emu. thread_get_emu() reads the per-thread key (we run on the faulting
-    // thread); prefer the live xEmu register (cpu_gprs[0]) when it looks like a valid pointer, as box64
-    // keeps emu in x0 throughout dynarec execution (mirrors signals.c:1107).
-    x64emu_t* emu = thread_get_emu();
+    // KX_DIAG-A (temporary, DEREF-FREE): box64 .text anchor (symbolize the host fault PC of a nested crash)
+    // + the live xEmu register (cpu_gprs[0]). Emitted BEFORE any structure walk (thread_get_emu / dynablock
+    // lookup) so it survives even if THOSE nest-crash. Only channel that survives a 2nd fault.
+    {
+        char b[192];
+        int n = snprintf(b, sizeof b,
+            "nx_exc2a: anchor=%p rx=0x%llx far=0x%llx x0=0x%llx lr(x30)=0x%llx sp=0x%llx fp(x29)=0x%llx",
+            (void*)&__libnx_exception_handler, (unsigned long long)ctx->pc.x,
+            (unsigned long long)ctx->far.x, (unsigned long long)ctx->cpu_gprs[0].x,
+            (unsigned long long)ctx->lr.x, (unsigned long long)ctx->sp.x, (unsigned long long)ctx->fp.x);
+        if (n > 0) nx_result_log(b);
+        n = snprintf(b, sizeof b, "nx_exc2a: x1..x9=%llx %llx %llx %llx %llx %llx %llx %llx %llx",
+            (unsigned long long)ctx->cpu_gprs[1].x, (unsigned long long)ctx->cpu_gprs[2].x,
+            (unsigned long long)ctx->cpu_gprs[3].x, (unsigned long long)ctx->cpu_gprs[4].x,
+            (unsigned long long)ctx->cpu_gprs[5].x, (unsigned long long)ctx->cpu_gprs[6].x,
+            (unsigned long long)ctx->cpu_gprs[7].x, (unsigned long long)ctx->cpu_gprs[8].x,
+            (unsigned long long)ctx->cpu_gprs[9].x);
+        if (n > 0) nx_result_log(b);
+        // x10..x25 = guest RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,R8..R15 (box64 arm64 map). x28 scratch.
+        n = snprintf(b, sizeof b, "nx_exc2a: gRAX=%llx gRSP(x14)=%llx gRBP(x15)=%llx gRDI(x17)=%llx x28=%llx",
+            (unsigned long long)ctx->cpu_gprs[10].x, (unsigned long long)ctx->cpu_gprs[14].x,
+            (unsigned long long)ctx->cpu_gprs[15].x, (unsigned long long)ctx->cpu_gprs[17].x,
+            (unsigned long long)ctx->cpu_gprs[28].x);
+        if (n > 0) nx_result_log(b);
+    }
+
+    // Recover the faulting thread's emu. In the Horizon exception context pthread TLS is NOT valid
+    // (pthread_getspecific -> NULL), so plain thread_get_emu()'s "this should not happen" CREATE path runs
+    // and NEST-CRASHES (NewX64Emu/setProtection_stack -> rb_set_64 on a NULL tree, far=0x0). NEVER create
+    // here: prefer the live xEmu register (x0 == cpu_gprs[0]), which box64 keeps as emu throughout dynarec,
+    // and fall back to the per-thread key WITHOUT creating. If neither yields a valid emu (e.g. x0 was
+    // clobbered — a corrupt xEmu is itself the bug we're diagnosing) emu stays NULL: we then still compute
+    // the precise faulting RIP and log a clean UNHANDLED diagnostic instead of a second fault.
+    x64emu_t* emu = (x64emu_t*)ctx->cpu_gprs[0].x;
+    if ((uintptr_t)emu < 0x10000 || ((uintptr_t)emu & 7))   // 0x190 etc. are not valid emu pointers
+        emu = thread_get_emu_no_create();
 
     // 1) Synthesize a Linux-aarch64 ucontext (shim layout) from the dump. Thread-local so concurrent
     //    guest-thread faults don't clobber each other (the libnx exception STACK is still shared — a known
@@ -112,13 +144,28 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     uintptr_t x64pc = ctx->cpu_gprs[27].x;       // fallback: block-start guest RIP (x27)
     void* cur_db = NULL;
 #ifdef DYNAREC
-    dynablock_t* db = FindDynablockFromNativeAddress(rw);
-    if (db) {
-        cur_db = db;
-        uintptr_t gx = getX64Address(db, (uintptr_t)rw);
-        if (gx) x64pc = gx;                      // precise faulting-instruction RIP
+    // Only walk box64's (GLOBAL, unlocked) dynablock rbtree when we actually have an emu to deliver to.
+    // With no emu (corrupt xEmu / TLS-less exc ctx) the walk is both pointless AND race-prone: the OTHER
+    // guest thread may be mutating the tree concurrently -> rb_get_64 reads a NULL node (far=0x20) and the
+    // handler LOOPS re-faulting. Skip it; x64pc falls back to the block-start RIP (x27) for the diagnostic.
+    if (emu) {
+        dynablock_t* db = FindDynablockFromNativeAddress(rw);
+        if (db) {
+            cur_db = db;
+            uintptr_t gx = getX64Address(db, (uintptr_t)rw);
+            if (gx) x64pc = gx;                  // precise faulting-instruction RIP
+        }
     }
 #endif
+
+    // KX_DIAG-B (temporary): the PRECISE guest RIP (getX64Address) + rw + db. If DIAG-A logged but DIAG-B
+    // does not, the nest-crash is in the FindDynablock/getX64Address lookup (lines above).
+    {
+        char b[160];
+        int n = snprintf(b, sizeof b, "nx_exc2b: x64pc=0x%llx rw=%p db=%p",
+            (unsigned long long)x64pc, rw, cur_db);
+        if (n > 0) nx_result_log(b);
+    }
 
     // 3) Classify the ARM64 exception into an x86 signal + siginfo.
     //    ESR: EC = esr>>26, DFSC = esr&0x3f, WnR = (esr>>6)&1.
@@ -156,6 +203,19 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     info.si_signo = sig;
     info.si_code  = si_code;
     info.si_addr  = (void*)ctx->far.x;
+
+    // KX_DIAG (temporary): log the PRECISE guest RIP (getX64Address) + a box64 .text anchor (to symbolize
+    // the nested-handler fault PC) + emu/db + the (process-GLOBAL) guest handler for this signal, BEFORE
+    // the delivery path (which nest-crashes on real HW). This is the only channel that survives a 2nd fault.
+    {
+        char b[192];
+        uintptr_t hh = my_context ? (uintptr_t)my_context->signals[sig] : 0;
+        int n = snprintf(b, sizeof b,
+            "nx_exc2: anchor=%p x64pc=0x%llx emu=%p db=%p sig=%d h=0x%llx rw=%p",
+            (void*)&__libnx_exception_handler, (unsigned long long)x64pc,
+            (void*)emu, cur_db, sig, (unsigned long long)hh, rw);
+        if (n > 0) nx_result_log(b);
+    }
 
     // Defensive same-address loop guard: if the EXACT same fault (fault address + guest RIP) recurs many
     // times in a row, delivery isn't making progress (a delivery/resume bug) — bail to a crash report

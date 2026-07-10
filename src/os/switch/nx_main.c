@@ -205,6 +205,10 @@ int main(int argc, char **argv) {
     extern u64 nx_mem_total_size, nx_mem_used_at_init;
     unsigned long long memtot = (unsigned long long)nx_mem_total_size, memuse = (unsigned long long)nx_mem_used_at_init;
     unsigned long long heap_sz = (unsigned long long)(fake_heap_end - fake_heap_start);
+    // Load box64.env BEFORE the backend probe: nx_vm_status() -> vm_ensure_init() picks the mmap backend on
+    // its FIRST call and must already see env overrides like KX_FORCE_HEAP (else it commits to PHYS before
+    // the env is read). Idempotent setenv, so it's safe that we don't call load_env_file again later.
+    load_env_file();
     { uintptr_t vb = 0; size_t vs = 0; unsigned long long sr = 0;
       int st = nx_vm_status(&vb, &vs, &sr);
       const char *name = (st == 2) ? "UNSAFE" : (st == 1) ? "PHYS" : "heap-fallback";
@@ -280,7 +284,7 @@ int main(int argc, char **argv) {
     // Compute box64's contiguous module span at runtime (ASLR-safe for real HW) and publish the low-VA
     // reserve set MINUS that hole as KX_WINE_LOWVA; the PIE Wine shim parses it into preload_info.
     nx_publish_wine_lowva();
-    load_env_file();   // FTP-flippable overrides (e.g. BOX64_DYNAREC=0 to force the interpreter on HW)
+    // (box64.env already loaded above, before the backend probe, so KX_FORCE_HEAP applies to vm_init.)
     if (initialize(ac, (const char **)b_argv, environ, &emu, &elf, 1)) {
         kdbg("nx_main: initialize failed\n");
         kout("box64: initialize failed (guest missing or not a valid x86-64 ELF?)\n");

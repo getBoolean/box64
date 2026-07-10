@@ -232,6 +232,14 @@ static void vm_reset_state(void) {
 }
 
 static void vm_init(void) {
+    // KX_FORCE_HEAP: stay on the HEAP backend even when a PHYS/UNSAFE arena is available. Wine's Win32
+    // low-VA FIXED maps (0x10000.., KUSER @0x7ffe0000, PE reserves) need box64's nx_map_lowva_fixed
+    // (svcControlCodeMemory) path, which ONLY runs on VM_HEAP; the arena backends (svcMapPhysicalMemory)
+    // map the guest's HIGH VAs but can't place those low fixed maps (-> wild-pointer crash). We still want
+    // system_resource_size>0 for the bigger memory-block budget those CodeMemory maps consume — that's an
+    // NPDM property, independent of which mmap backend box64 picks — so force HEAP but keep sysres>0.
+    if (getenv("KX_FORCE_HEAP")) { vm_backend = VM_HEAP; svcOutputDebugString("nx_vm: heap-forced (KX_FORCE_HEAP)\n", 34); return; }
+
     // --- 1) UNSAFE (real-HW non-Application-pool path) ------------------------------------------
     // Gate on detectMesosphere(): only real hardware (Atmosphère) implements the unsafe SVCs — Ryujinx
     // THROWS NotImplementedException on svcSetUnsafeLimit/svcMapPhysicalMemoryUnsafe (a crash, not an
@@ -324,12 +332,30 @@ extern char* fake_heap_end;
 // M2.7 (Wine): track the low-VA regions we svcMapMemory'd so Wine's reserve-then-commit pattern (map
 // PROT_NONE over a range, then MAP_FIXED_NOREPLACE a sub-range) doesn't re-map (svcMapMemory of an
 // already-mapped VA fails). A hit means the VA is already backed — just return it.
-#define NX_LOWVA_MAX 128
+#define NX_LOWVA_MAX 2048
 static struct { uintptr_t base, end; } g_lowva[NX_LOWVA_MAX];
 static int g_lowva_n = 0;
 static int nx_lowva_covered(uintptr_t a, size_t len) {
     for (int i = 0; i < g_lowva_n; i++)
         if (a >= g_lowva[i].base && a + len <= g_lowva[i].end) return 1;
+    return 0;
+}
+
+// PROT_NONE reservations: Wine reserves the WHOLE low Win32 window up-front (the preload areas box64 hands
+// it, plus its own low reserves). We must NOT back these with CodeMemory — one svcCreateCodeMemory per
+// chunk over ~1.5 GiB of reservation exhausts Horizon's memory-block resource (svcCreateCodeMemory ->
+// 0xce01 OutOfResource), which then fails the CRITICAL *committed* maps (KUSER @0x7ffe0000 -> fatal).
+// Track reservations instead and back only the sub-ranges Wine actually COMMITS (mmap PROT_RW reaches
+// nx_map_lowva_fixed; mprotect PROT_RW reaches nx_vm_protect).
+#define NX_LOWVA_RESV_MAX 256
+static struct { uintptr_t base, end; } g_lowva_resv[NX_LOWVA_RESV_MAX];
+static int g_lowva_resv_n = 0;
+static void nx_lowva_resv_track(uintptr_t a, size_t len) {
+    if (g_lowva_resv_n < NX_LOWVA_RESV_MAX) { g_lowva_resv[g_lowva_resv_n].base = a; g_lowva_resv[g_lowva_resv_n].end = a + len; g_lowva_resv_n++; }
+}
+static int nx_lowva_reserved(uintptr_t a, size_t len) {   // does [a,a+len) overlap a deferred reservation?
+    for (int i = 0; i < g_lowva_resv_n; i++)
+        if (a < g_lowva_resv[i].end && a + len > g_lowva_resv[i].base) return 1;
     return 0;
 }
 
@@ -361,6 +387,7 @@ static void nx_kuser_fixup(void* addr, size_t rounded) {
 }
 // Back ONE chunk [addr, addr+len) with a CodeMemory MapOwner mapping (Perm_Rw). len must be page-
 // rounded. Returns 0 on success (keeps cm+src alive for the run), -1 on failure.
+static int g_lowva_cm_live = 0;   // # of live low-VA CodeMemory maps (diagnostic: leak vs hard slab limit)
 static int nx_lowva_map_one(uintptr_t addr, size_t len) {
     void* src = memalign(VM_PAGE, len);
     if (!src) return -1;
@@ -371,56 +398,105 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
     Result rc = svcCreateCodeMemory(&cm, src, len);
     if (R_SUCCEEDED(rc)) {
         Result rc2 = svcControlCodeMemory(cm, CodeMapOperation_MapOwner, (void*)addr, len, Perm_Rw);
-        if (R_SUCCEEDED(rc2)) { memset((void*)addr, 0, len); return 0; }   // keep cm+src alive
+        if (R_SUCCEEDED(rc2)) { memset((void*)addr, 0, len); g_lowva_cm_live++; return 0; }   // keep cm+src alive
         svcCloseHandle(cm);
         MemoryInfo mi; u32 pi;   // diagnose WHY the dest is InvalidCurrentMemory: what occupies it?
         Result qr = svcQueryMemory(&mi, &pi, addr);
-        char b[200]; int n = snprintf(b, sizeof b,
-                     "nx_vm: lowVA 0x%lx+0x%lx MapOwner=0x%x | q=0x%x region[0x%lx+0x%lx] type=0x%x perm=0x%x attr=0x%x\n",
-                     (unsigned long)addr, (unsigned long)len, (unsigned)rc2, (unsigned)qr,
-                     (unsigned long)mi.addr, (unsigned long)mi.size, (unsigned)mi.type, (unsigned)mi.perm, (unsigned)mi.attr);
-        if (n>0) svcOutputDebugString(b,n);
+        char b[220]; int n = snprintf(b, sizeof b,
+                     "nx_vm: lowVA 0x%lx+0x%lx MapOwner=0x%x live=%d | q=0x%x region[0x%lx+0x%lx] type=0x%x perm=0x%x",
+                     (unsigned long)addr, (unsigned long)len, (unsigned)rc2, g_lowva_cm_live, (unsigned)qr,
+                     (unsigned long)mi.addr, (unsigned long)mi.size, (unsigned)mi.type, (unsigned)mi.perm);
+        if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }   // result-file too: HW's only channel
     } else {
-        char b[140]; int n = snprintf(b, sizeof b, "nx_vm: lowVA 0x%lx+0x%lx CreateCodeMemory=0x%x\n",
-                     (unsigned long)addr, (unsigned long)len, (unsigned)rc); if (n>0) svcOutputDebugString(b,n);
+        char b[140]; int n = snprintf(b, sizeof b, "nx_vm: lowVA 0x%lx+0x%lx CreateCodeMemory=0x%x live=%d",
+                     (unsigned long)addr, (unsigned long)len, (unsigned)rc, g_lowva_cm_live);
+        if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }
     }
     free(src); return -1;
 }
 
 // Back a low VA (outside the heap: Win32 KUSER_SHARED_DATA @0x7ffe0000, PE image bases, Wine's low
-// reservations) with CodeMemory MapOwner. svcControlCodeMemory MapOwner refuses a single map at/above
-// ~0x400000 bytes (InvalidCurrentMemory), and Wine reserves multi-MB PROT_NONE ranges (e.g. a 4 MiB
-// process-heap reserve at 0x8330000), so map in <=2 MiB chunks — each chunk is its own CodeMemory
-// object. (Guest pages are never executed natively, so RW backing + box64's no-op mprotect suffices;
-// a later commit at the same VA is already covered via g_lowva.)
-#define NX_LOWVA_CHUNK  (2UL*1024*1024)
-static void* nx_map_lowva_fixed(void* addr, size_t rounded) {
+// reservations) with CodeMemory MapOwner. The KCodeMemory slab is TINY and system-wide (~a dozen objects;
+// svcCreateCodeMemory returns 0xce01 OutOfResource once exhausted — NOT governed by system_resource_size),
+// so ONE object per Wine commit exhausts it (cmd.exe needs ~9 distinct low-VA regions). To fit, COALESCE:
+// back a coarse ALIGNED window (clipped to the enclosing reservation) so clustered commits share one large
+// object, and use a LARGE per-object chunk (adaptively halved if MapOwner rejects the size). Guest pages are
+// never executed natively, so RW backing + box64's no-op mprotect suffices.
+#define NX_LOWVA_CHUNK     (16UL*1024*1024)   // try large single MapOwner maps (adaptive-halve on refusal)
+#define NX_LOWVA_COALESCE  (16UL*1024*1024)   // round each commit's backing out to this granule
+static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
     uintptr_t base = (uintptr_t)addr;
-    size_t done = 0;
-    while (done < rounded) {
-        size_t len = rounded - done;
-        if (len > NX_LOWVA_CHUNK) len = NX_LOWVA_CHUNK;
-        if (nx_lowva_map_one(base + done, len) != 0) {
-            // roll back nothing (chunks persist harmlessly); report failure
-            errno = ENOMEM; return MAP_FAILED;
+
+    // Cheaply reject fixed low VAs OUTSIDE the process's mappable ASLR region. Wine's ntdll reserves the
+    // ENTIRE low Win32 space during virtual_init — thousands of best-effort PROT_NONE ranges from 0x10000
+    // up (esp. the whole 0x10000..aslr_base window BELOW where anything can be mapped). svcControlCodeMemory
+    // MapOwner can only map INSIDE the ASLR region, so every out-of-region address fails anyway (0xdc01) —
+    // but running the svcCreateCodeMemory+MapOwner+close dance ~2000x churns the CodeMemory resource to
+    // EXHAUSTION (svcCreateCodeMemory then returns 0xce01 OutOfResource), which breaks the CRITICAL
+    // in-region maps that follow — notably KUSER_SHARED_DATA @0x7ffe0000, whose failure is FATAL
+    // (virtual_alloc_first_teb -> "failed to map the shared user data: c000000d" -> exit(1)). Wine tolerates
+    // a failed reservation, so reject out-of-region low VAs immediately and keep the budget for real maps.
+    {
+        static uintptr_t asb = 0, ase = 0;
+        if (!ase) {
+            u64 a = 0, s = 0;
+            svcGetInfo(&a, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
+            svcGetInfo(&s, InfoType_AslrRegionSize,    CUR_PROCESS_HANDLE, 0);
+            asb = (uintptr_t)a; ase = (uintptr_t)(a + s);
         }
-        done += len;
+        if (ase && (base < asb || base + rounded > ase)) { errno = ENOMEM; return MAP_FAILED; }
     }
-    { char b[120]; int n = snprintf(b, sizeof b, "nx_vm: lowVA MapOwner %p+0x%lx OK (chunked)\n",
-                   addr, (unsigned long)rounded); if (n > 0) svcOutputDebugString(b, n); }
-    nx_lowva_track(base, rounded);
+
+    // PROT_NONE reservation: record it but DEFER real backing until Wine commits a sub-range (mmap PROT_RW
+    // here, or mprotect PROT_RW -> nx_vm_protect). Backing the whole reservation now would exhaust the
+    // CodeMemory resource (see g_lowva_resv note). Return the VA unmapped (Wine never touches a reservation).
+    if (!(prot & (PROT_READ | PROT_WRITE))) { nx_lowva_resv_track(base, rounded); return addr; }
+
+    // Coalesce the backing to a COARSE-aligned window, clipped to the enclosing reservation (never back
+    // beyond it into box64's own regions) and to the ASLR region. Clustered commits then share one window.
+    uintptr_t wbeg = base, wend = base + rounded;
+    for (int i = 0; i < g_lowva_resv_n; i++)
+        if (base >= g_lowva_resv[i].base && base < g_lowva_resv[i].end) {
+            uintptr_t rb = g_lowva_resv[i].base, re = g_lowva_resv[i].end;
+            uintptr_t nb = base & ~(NX_LOWVA_COALESCE - 1);
+            uintptr_t ne = (base + rounded + NX_LOWVA_COALESCE - 1) & ~(NX_LOWVA_COALESCE - 1);
+            wbeg = nb < rb ? rb : nb;
+            wend = ne > re ? re : ne;
+            break;
+        }
+    // The window MUST cover the whole request: a commit can span BEYOND the reservation that contains its
+    // base (Wine reserves the low space in many adjacent chunks, then commits a range crossing several).
+    // Clipping to base's reservation alone would drop the tail of the commit -> that VA stays unbacked and
+    // the guest faults reading it (e.g. 0x830fcb0 in a [0x8010000,0x8310000) commit). Never clip inside it.
+    if (wbeg > base) wbeg = base;
+    if (wend < base + rounded) wend = base + rounded;
+    { static uintptr_t asb = 0, ase = 0;
+      if (!ase) { u64 a=0,s=0; svcGetInfo(&a,InfoType_AslrRegionAddress,CUR_PROCESS_HANDLE,0);
+                  svcGetInfo(&s,InfoType_AslrRegionSize,CUR_PROCESS_HANDLE,0); asb=(uintptr_t)a; ase=(uintptr_t)(a+s); }
+      if (ase) { if (wbeg < asb) wbeg = asb; if (wend > ase) wend = ase; } }
+
+    int orig_ok = 1;
+    for (uintptr_t p = wbeg; p < wend; ) {
+        size_t want = wend - p; if (want > NX_LOWVA_CHUNK) want = NX_LOWVA_CHUNK;
+        if (nx_lowva_covered(p, want)) { p += want; continue; }   // window slot already backed
+        size_t len = want;                                        // adaptive: halve until MapOwner accepts
+        while (len >= 0x10000 && nx_lowva_map_one(p, len) != 0) len >>= 1;
+        if (len >= 0x10000) { nx_lowva_track(p, len); p += len; }
+        else { if (p < base + rounded && p + want > base) orig_ok = 0; p += want; }  // request slot unmappable
+    }
+    if (!orig_ok) { errno = ENOMEM; return MAP_FAILED; }
     nx_kuser_fixup(addr, rounded);
     return addr;
 }
 
-static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {
+static void* nx_mmap_heap(void* addr, size_t rounded, int flags, int prot) {
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         if (!(flags & MAP_ANONYMOUS) || !addr) { errno = ENODEV; return MAP_FAILED; }
         // A low VA outside the heap must be explicitly backed (Wine's Win32 address space). A high
         // MAP_FIXED (the guest ELF/arena at 0x2xx… heap addresses) is already heap-backed -> just zero it.
         if ((uintptr_t)addr < (uintptr_t)fake_heap_start || (uintptr_t)addr >= (uintptr_t)fake_heap_end)
-            return nx_map_lowva_fixed(addr, rounded);
+            return nx_map_lowva_fixed(addr, rounded, prot);
         memset(addr, 0, rounded);
         return addr;
     }
@@ -435,7 +511,6 @@ static void* nx_mmap_heap(void* addr, size_t rounded, int flags) {
 // Public mmap / munmap / mprotect
 // ---------------------------------------------------------------------------------------------
 void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssize_t offset) {
-    (void)prot;
     if (!length) return MAP_FAILED;
 
     // M2.5: mmap of a wineserver SHMEM vfd (tmpmap-*) returns the SINGLE in-process shared buffer, so
@@ -491,7 +566,7 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
 
     vm_ensure_init();
     if (vm_backend == VM_HEAP)
-        return nx_mmap_heap(addr, rounded, flags);
+        return nx_mmap_heap(addr, rounded, flags, prot);
 
     // PHYS or UNSAFE arena
     if (flags & MAP_FIXED) {
@@ -540,7 +615,23 @@ int nx_munmap(void* addr, unsigned long length) {
 // custommem.c's protectDB/unprotectDB), NOT the guest's own mappings. [full-c2 Stage 3 — focused follow-up;
 // see tests/m2/smc.c + docs/porting-log.md]. box64 never executes guest pages (exec is the jit path).
 int nx_vm_protect(void* addr, size_t len, int prot) {
-    (void)addr; (void)len;
+    // Commit within a deferred PROT_NONE reservation: Wine reserves a big low-VA range (PROT_NONE, which we
+    // did NOT back — see nx_lowva_resv), then commits sub-ranges by mprotect'ing them PROT_RW. Back the
+    // sub-range NOW (once). This is the ONLY place nx_vm_protect actually maps memory; it does NOT enforce
+    // permissions on already-backed pages (making that real destabilizes box64 — see note below), so it
+    // can't fault box64's own writes into guest RO/RELRO pages.
+    if ((prot & (PROT_READ | PROT_WRITE)) && addr && len) {
+        uintptr_t start = (uintptr_t)addr & ~((uintptr_t)VM_PAGE - 1);
+        size_t rounded = VM_ROUND(len + ((uintptr_t)addr - start));
+        // Any RW/R mprotect on a low VA OUTSIDE box64's heap that isn't backed yet = Wine committing into
+        // its Win32 space (reserve PROT_NONE -> commit by mprotect). Back it (nx_map_lowva_fixed re-checks
+        // covered + the ASLR-region gate + coalesces). Gate on outside-heap so the guest's own high-VA
+        // heap/arena mprotects (already heap-backed) stay no-ops.
+        extern char *fake_heap_start, *fake_heap_end;
+        if ((start < (uintptr_t)fake_heap_start || start >= (uintptr_t)fake_heap_end)
+            && !nx_lowva_covered(start, rounded))
+            nx_map_lowva_fixed((void*)start, rounded, prot);   // backs + tracks; MAP_FAILED is non-fatal here
+    }
     if (prot & PROT_EXEC) {
         static int warned = 0;
         if (!warned) { warned = 1; svcOutputDebugString("nx_vm: mprotect(PROT_EXEC) no-op\n", 32); }

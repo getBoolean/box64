@@ -32,6 +32,7 @@
 #include "box64cpu.h"
 #include "box64cpu_util.h"   // Push64, PushString, SetRIP
 #include "custommem.h"
+#include "threads.h"        // inc/dec_active_emu_workers — keep endBox64 from freeing my_context under us
 #include "librarian.h"
 #include "debug.h"           // box64_pagesize (uintptr_t)
 
@@ -165,7 +166,12 @@ static void* spawn_thread(void* arg) {
 
     slog("nx_spawn: wineserver thread starting, ld.so=0x%lx prog_ep=0x%lx pid=%d\n",
          (unsigned long)interp_ep, (unsigned long)(s->prog->entrypoint + s->prog->delta), s->pid);
+    // Count this thread as an active emu worker so endBox64() (fired when the PRIMARY guest exits) waits
+    // for / skips freeing my_context while the wineserver is still executing dynarec. Otherwise it frees
+    // my_context under us and the next internalDBGetBlock -> mutex_lock(&my_context->mutex_dyndump) faults.
+    inc_active_emu_workers();
     DynaRun(emu);
+    dec_active_emu_workers();
     slog("nx_spawn: wineserver exited eax=%d\n", GetEAX(emu));
     return NULL;
 }

@@ -16,6 +16,8 @@ typedef struct emuthread_s {
 	void**		cancels;
 } emuthread_t;
 int get_active_emu_workers(void);
+void inc_active_emu_workers(void);   // for emu threads not started via pthread_routine (nx_spawn wineserver)
+void dec_active_emu_workers(void);
 void CleanStackSize(box64context_t* context);
 
 void init_pthread_helper(void);
