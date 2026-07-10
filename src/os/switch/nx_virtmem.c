@@ -388,17 +388,37 @@ static void nx_kuser_fixup(void* addr, size_t rounded) {
 // Back ONE chunk [addr, addr+len) with a CodeMemory MapOwner mapping (Perm_Rw). len must be page-
 // rounded. Returns 0 on success (keeps cm+src alive for the run), -1 on failure.
 static int g_lowva_cm_live = 0;   // # of live low-VA CodeMemory maps (diagnostic: leak vs hard slab limit)
+static int g_lowva_slab_full = 0; // set once svcCreateCodeMemory hits 0xce01 OutOfResource (system KCodeMemory
+                                  // slab exhausted) — stop pointless shrink-retries (shrinking can't help a
+                                  // resource shortage) that otherwise flood the result file / livelock.
+
+// Registry of live low-VA backings so nx_munmap can RECLAIM the (system-wide, ~a dozen) KCodeMemory objects
+// on VirtualFree(MEM_RELEASE). Without this every Wine free LEAKS its object and the slab exhausts as the
+// process runs. code=1 => svcControlCodeMemory owner map (free via UnmapOwner + close(cm)); code=0 =>
+// svcMapMemory mirror (free via svcUnmapMemory). Also drops the matching g_lowva coverage entry.
+#define NX_LOWVA_CM_REG_MAX 512
+static struct { uintptr_t addr; size_t len; Handle cm; void* src; int code; } g_lowva_cm_reg[NX_LOWVA_CM_REG_MAX];
+static int g_lowva_cm_reg_n = 0;
+static void nx_lowva_cm_reg_add(uintptr_t a, size_t l, Handle cm, void* src, int code) {
+    if (g_lowva_cm_reg_n < NX_LOWVA_CM_REG_MAX) {
+        g_lowva_cm_reg[g_lowva_cm_reg_n].addr=a; g_lowva_cm_reg[g_lowva_cm_reg_n].len=l;
+        g_lowva_cm_reg[g_lowva_cm_reg_n].cm=cm; g_lowva_cm_reg[g_lowva_cm_reg_n].src=src;
+        g_lowva_cm_reg[g_lowva_cm_reg_n].code=code; g_lowva_cm_reg_n++;
+    }
+}
+
 static int nx_lowva_map_one(uintptr_t addr, size_t len) {
     void* src = memalign(VM_PAGE, len);
     if (!src) return -1;
     if (R_SUCCEEDED(svcMapMemory((void*)addr, src, len))) {   // Stack-region VAs: fast path
-        memset((void*)addr, 0, len); return 0;
+        memset((void*)addr, 0, len); nx_lowva_cm_reg_add(addr, len, INVALID_HANDLE, src, 0); return 0;
     }
     Handle cm = INVALID_HANDLE;
     Result rc = svcCreateCodeMemory(&cm, src, len);
     if (R_SUCCEEDED(rc)) {
         Result rc2 = svcControlCodeMemory(cm, CodeMapOperation_MapOwner, (void*)addr, len, Perm_Rw);
-        if (R_SUCCEEDED(rc2)) { memset((void*)addr, 0, len); g_lowva_cm_live++; return 0; }   // keep cm+src alive
+        if (R_SUCCEEDED(rc2)) { memset((void*)addr, 0, len); g_lowva_cm_live++;
+                                nx_lowva_cm_reg_add(addr, len, cm, src, 1); return 0; }   // keep cm+src alive (freed on munmap)
         svcCloseHandle(cm);
         MemoryInfo mi; u32 pi;   // diagnose WHY the dest is InvalidCurrentMemory: what occupies it?
         Result qr = svcQueryMemory(&mi, &pi, addr);
@@ -408,9 +428,15 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
                      (unsigned long)mi.addr, (unsigned long)mi.size, (unsigned)mi.type, (unsigned)mi.perm);
         if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }   // result-file too: HW's only channel
     } else {
-        char b[140]; int n = snprintf(b, sizeof b, "nx_vm: lowVA 0x%lx+0x%lx CreateCodeMemory=0x%x live=%d",
-                     (unsigned long)addr, (unsigned long)len, (unsigned)rc, g_lowva_cm_live);
-        if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }
+        int oor = (((unsigned)rc >> 9) & 0x1FFF) == 103;    // Kernel desc 103 (0xce01) = OutOfResource
+        if (oor) g_lowva_slab_full = 1;                      // KCodeMemory slab exhausted
+        static int logged_cc = 0;
+        if (!logged_cc || !oor) {
+            logged_cc = 1;
+            char b[140]; int n = snprintf(b, sizeof b, "nx_vm: lowVA 0x%lx+0x%lx CreateCodeMemory=0x%x live=%d",
+                         (unsigned long)addr, (unsigned long)len, (unsigned)rc, g_lowva_cm_live);
+            if (n>0) { svcOutputDebugString(b,n); nx_result_log(b); }
+        }
     }
     free(src); return -1;
 }
@@ -422,8 +448,8 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
 // back a coarse ALIGNED window (clipped to the enclosing reservation) so clustered commits share one large
 // object, and use a LARGE per-object chunk (adaptively halved if MapOwner rejects the size). Guest pages are
 // never executed natively, so RW backing + box64's no-op mprotect suffices.
-#define NX_LOWVA_CHUNK     (16UL*1024*1024)   // try large single MapOwner maps (adaptive-halve on refusal)
-#define NX_LOWVA_COALESCE  (16UL*1024*1024)   // round each commit's backing out to this granule
+#define NX_LOWVA_CHUNK     (16UL*1024*1024)   // largest MapOwner size Horizon reliably accepts (adaptive-halve below)
+#define NX_LOWVA_COALESCE  (16UL*1024*1024)   // round each commit's backing out to this granule (merge clusters)
 static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot) {
     if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
     uintptr_t base = (uintptr_t)addr;
@@ -453,22 +479,15 @@ static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot) {
     // CodeMemory resource (see g_lowva_resv note). Return the VA unmapped (Wine never touches a reservation).
     if (!(prot & (PROT_READ | PROT_WRITE))) { nx_lowva_resv_track(base, rounded); return addr; }
 
-    // Coalesce the backing to a COARSE-aligned window, clipped to the enclosing reservation (never back
-    // beyond it into box64's own regions) and to the ASLR region. Clustered commits then share one window.
-    uintptr_t wbeg = base, wend = base + rounded;
-    for (int i = 0; i < g_lowva_resv_n; i++)
-        if (base >= g_lowva_resv[i].base && base < g_lowva_resv[i].end) {
-            uintptr_t rb = g_lowva_resv[i].base, re = g_lowva_resv[i].end;
-            uintptr_t nb = base & ~(NX_LOWVA_COALESCE - 1);
-            uintptr_t ne = (base + rounded + NX_LOWVA_COALESCE - 1) & ~(NX_LOWVA_COALESCE - 1);
-            wbeg = nb < rb ? rb : nb;
-            wend = ne > re ? re : ne;
-            break;
-        }
-    // The window MUST cover the whole request: a commit can span BEYOND the reservation that contains its
-    // base (Wine reserves the low space in many adjacent chunks, then commits a range crossing several).
-    // Clipping to base's reservation alone would drop the tail of the commit -> that VA stays unbacked and
-    // the guest faults reading it (e.g. 0x830fcb0 in a [0x8010000,0x8310000) commit). Never clip inside it.
+    // Coalesce the backing to a COARSE-aligned window so ADJACENT commits (esp. separate Wine DLL images,
+    // each its own reservation) share ONE large CodeMemory object — critical because the KCodeMemory slab
+    // is ~a dozen system-wide and cmd.exe pulls in ~8 DLLs. We do NOT clip to base's reservation (that
+    // stops adjacent reservations from merging); box64's own regions live in the HIGH ASLR area, never in
+    // this low Win32 window, so a low-VA window can't collide with them. The per-page backing loop below
+    // skips any already-mapped page, so overlapping an earlier window is harmless. Clip only to the ASLR
+    // region, and always cover the whole request.
+    uintptr_t wbeg = base & ~(NX_LOWVA_COALESCE - 1);
+    uintptr_t wend = (base + rounded + NX_LOWVA_COALESCE - 1) & ~(NX_LOWVA_COALESCE - 1);
     if (wbeg > base) wbeg = base;
     if (wend < base + rounded) wend = base + rounded;
     { static uintptr_t asb = 0, ase = 0;
@@ -476,16 +495,22 @@ static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot) {
                   svcGetInfo(&s,InfoType_AslrRegionSize,CUR_PROCESS_HANDLE,0); asb=(uintptr_t)a; ase=(uintptr_t)(a+s); }
       if (ase) { if (wbeg < asb) wbeg = asb; if (wend > ase) wend = ase; } }
 
+    // Back the window, skipping already-mapped PAGES (a commit's window routinely OVERLAPS an earlier
+    // window — Wine commits ranges that straddle regions we already backed; mapping over an occupied page
+    // fails MapOwner). Map each contiguous UNCOVERED run as one object (adaptive-shrink if MapOwner balks).
     int orig_ok = 1;
-    for (uintptr_t p = wbeg; p < wend; ) {
-        size_t want = wend - p; if (want > NX_LOWVA_CHUNK) want = NX_LOWVA_CHUNK;
-        if (nx_lowva_covered(p, want)) { p += want; continue; }   // window slot already backed
-        size_t len = want;                                        // adaptive: halve until MapOwner accepts
-        while (len >= 0x10000 && nx_lowva_map_one(p, len) != 0) len >>= 1;
-        if (len >= 0x10000) { nx_lowva_track(p, len); p += len; }
-        else { if (p < base + rounded && p + want > base) orig_ok = 0; p += want; }  // request slot unmappable
+    uintptr_t p = wbeg;
+    while (p < wend && !g_lowva_slab_full) {
+        if (nx_lowva_covered(p, VM_PAGE)) { p += VM_PAGE; continue; }   // already backed
+        uintptr_t q = p + VM_PAGE;                                      // extent of the uncovered run
+        while (q < wend && (q - p) < NX_LOWVA_CHUNK && !nx_lowva_covered(q, VM_PAGE)) q += VM_PAGE;
+        size_t m = q - p;
+        while (m >= VM_PAGE && !g_lowva_slab_full && nx_lowva_map_one(p, m) != 0)
+            m = (m > VM_PAGE) ? ((m >> 1) & ~VM_PAGEMASK) : 0;
+        if (m >= VM_PAGE && !g_lowva_slab_full) { nx_lowva_track(p, m); p += m; }
+        else { if (p < base + rounded && p + VM_PAGE > base) orig_ok = 0; p += VM_PAGE; }  // request page unmappable
     }
-    if (!orig_ok) { errno = ENOMEM; return MAP_FAILED; }
+    if (!orig_ok || g_lowva_slab_full) { errno = ENOMEM; return MAP_FAILED; }
     nx_kuser_fixup(addr, rounded);
     return addr;
 }
@@ -591,6 +616,32 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
     return (void*)a;
 }
 
+// Reclaim registered low-VA CodeMemory chunks fully inside [a, a+len) — a Wine VirtualFree/MEM_RELEASE.
+// Returns the count freed. Frees the kernel object + src heap and drops the g_lowva coverage entry, and
+// clears g_lowva_slab_full so the freed slot can be reused (the KCodeMemory slab is the scarce resource).
+static int nx_lowva_free_range(uintptr_t a, size_t len) {
+    int freed = 0;
+    for (int i = 0; i < g_lowva_cm_reg_n; ) {
+        uintptr_t ca = g_lowva_cm_reg[i].addr; size_t cl = g_lowva_cm_reg[i].len;
+        if (ca >= a && ca + cl <= a + len) {
+            if (g_lowva_cm_reg[i].code) {
+                svcControlCodeMemory(g_lowva_cm_reg[i].cm, CodeMapOperation_UnmapOwner, (void*)ca, cl, 0);
+                svcCloseHandle(g_lowva_cm_reg[i].cm);
+                if (g_lowva_cm_live > 0) g_lowva_cm_live--;
+                g_lowva_slab_full = 0;
+            } else {
+                svcUnmapMemory((void*)ca, g_lowva_cm_reg[i].src, cl);
+            }
+            free(g_lowva_cm_reg[i].src);
+            for (int j = 0; j < g_lowva_n; j++)
+                if (g_lowva[j].base == ca) { g_lowva[j] = g_lowva[--g_lowva_n]; break; }
+            g_lowva_cm_reg[i] = g_lowva_cm_reg[--g_lowva_cm_reg_n];   // swap-remove
+            freed++;
+        } else i++;
+    }
+    return freed;
+}
+
 int nx_munmap(void* addr, unsigned long length) {
     if (!addr || !length) return 0;
     size_t rounded = VM_ROUND(length);
@@ -601,7 +652,10 @@ int nx_munmap(void* addr, unsigned long length) {
         mutexLock(&vm_lock); vm_release(a, rounded); mutexUnlock(&vm_lock);   // ...and the address range
         return 0;
     }
-    mutexLock(&vm_lock); int found = hb_untrack(a); mutexUnlock(&vm_lock);
+    mutexLock(&vm_lock);
+    int freed = nx_lowva_free_range(a, rounded);   // reclaim low-VA CodeMemory (Wine VirtualFree)
+    int found = freed ? 0 : hb_untrack(a);
+    mutexUnlock(&vm_lock);
     if (found) free(addr);         // heap-fallback whole-block reclaim
     return 0;
 }
