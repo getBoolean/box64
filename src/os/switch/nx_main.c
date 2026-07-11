@@ -380,6 +380,10 @@ int main(int argc, char **argv) {
     // Compute box64's contiguous module span at runtime (ASLR-safe for real HW) and publish the low-VA
     // reserve set MINUS that hole as KX_WINE_LOWVA; the PIE Wine shim parses it into preload_info.
     nx_publish_wine_lowva();
+    // Fix 1: place the un-relocatable EXE base (start.exe @0x140000000) + KUSER on the CodeMemory slab
+    // FIRST — before initialize()/the wineserver spawn/any Wine module — so their MapOwner is deterministic
+    // (nothing adjacent to trigger 0xdc01). This is the residual ASLR-flakiness fix (see nx_virtmem.c).
+    { extern void nx_prereserve_fixed(void); nx_prereserve_fixed(); }
     // (box64.env already loaded above, before the backend probe, so KX_FORCE_HEAP applies to vm_init.)
     if (initialize(ac, (const char **)b_argv, environ, &emu, &elf, 1)) {
         kdbg("nx_main: initialize failed\n");

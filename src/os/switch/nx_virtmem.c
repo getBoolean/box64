@@ -547,6 +547,25 @@ static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot, int flags)
     return addr;
 }
 
+// Fix 1 for the cmd.exe ASLR-flakiness: place the genuinely-fixed, un-relocatable low VAs on the
+// CodeMemory slab FIRST — before any other low-VA object exists — so their MapOwner can't fail 0xdc01 by
+// abutting a prior CodeMemory region (0xdc01 = the map range crossing a memory-region edge). The main EXE
+// (Wine's start.exe @0x140000000) has no .reloc and MUST load at its base; when its base MapOwner hits
+// 0xdc01 mid-run (abutting an already-placed module), the run dies STATUS_DLL_NOT_FOUND (~1/3 of launches).
+// Reserving it at live=0, with nothing adjacent, makes the placement deterministic. Because these calls run
+// nx_lowva_track, a later Wine mmap of the same VA hits the nx_lowva_covered short-circuit (no 2nd MapOwner,
+// no conflict). Only meaningful on the HEAP backend (the low-VA MapOwner path); gated on the Wine run.
+void nx_prereserve_fixed(void) {
+    if (!getenv("KX_WINESERVER")) return;   // Wine-specific fixed VAs; skip for a plain guest
+    // Main EXE image window: start.exe is ~1.6 MiB; reserve a 32 MiB coalesce window (one MapOwner object)
+    // for headroom so a slightly-larger image map still lands fully inside (covered -> no 2nd MapOwner).
+    nx_map_lowva_fixed((void*)0x140000000UL, 0x2000000UL, PROT_READ | PROT_WRITE, 0);
+    // KUSER_SHARED_DATA (single fixed page).
+    nx_map_lowva_fixed((void*)0x7ffe0000UL, 0x1000UL, PROT_READ | PROT_WRITE, 0);
+    { char b[96]; int n = snprintf(b, sizeof b, "nx_vm: prereserved EXE@0x140000000 + KUSER (live=%d)",
+             g_lowva_cm_live); if (n > 0) nx_result_log(b); }
+}
+
 static void* nx_mmap_heap(void* addr, size_t rounded, int flags, int prot) {
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         if (!(flags & MAP_ANONYMOUS) || !addr) { errno = ENODEV; return MAP_FAILED; }
