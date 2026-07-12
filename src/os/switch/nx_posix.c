@@ -55,6 +55,7 @@ typedef struct nx_clone_s {
     int*   ctid;         // CLONE_CHILD_CLEARTID target, or NULL
     int    tid;          // our positive, unique tid (== the value written to *ptid)
     int    gpid;         // creator's guest-instance pid (M2.5) — the child inherits it
+    void*  stack;        // box64-owned pool stack (reaper path); reclaimed after pthread_join. NULL when detached
 } nx_clone_t;
 
 static _Atomic int          g_nx_next_tid = 2;     // 1 is the main thread
@@ -933,8 +934,9 @@ long syscall(long number, ...) {
         }
         case 96:  return nx_gettid();                // set_tid_address -> this thread's tid
         case 99:  return 0;                          // set_robust_list -> accept
-        case 293: errno = ENOSYS; return -1;         // rseq -> glibc tolerates ENOSYS
-        case 261: errno = ENOSYS; return -1;         // prlimit64 -> glibc falls back to getrlimit/defaults
+        case 293: errno = ENOSYS; return -1;         // rseq -> glibc tolerates ENOSYS (benign probe)
+        case 233: return 0;                          // madvise -> advisory; no-op success (glibc malloc + thread-stack mgmt spam it per thread)
+        case 261: errno = ENOSYS; return -1;         // prlimit64 -> glibc falls back to getrlimit/defaults (sane-limits TODO after arena root-cause)
         case 278:                                    // getrandom(buf, len, flags)
             if (a0 && a1) { randomGet((void*)a0, a1); return (long)a1; }
             return 0;
@@ -1209,8 +1211,66 @@ long syscall(long number, ...) {
 #define CLONE_CHILD_CLEARTID 0x00200000
 #endif
 
+// ---- host-thread reaper with box64-owned stacks (M2.6) --------------------------------------
+// A DETACHED host thread leaks its Horizon thread-ResourceLimit slot (only threadClose, reached via
+// pthread_join, frees it) -> svcCreateThread LimitReached after ~600 lifecycles -> pthread_create
+// EPERM. We reap JOINABLE threads with pthread_join, BUT give each a box64-owned stack via
+// pthread_attr_setstack so pthread never allocates/frees the 1MB stack: it's taken from a REUSE pool
+// and returned after join, so join frees only the small pthread descriptor + closes the Horizon
+// handle. (A naive reaper that let pthread own the stack CORRUPTED the guest heap on real HW — the
+// join's newlib 1MB stack-free raced the guest's malloc churn -> _int_malloc NULL deref.) KX_NO_REAP
+// restores the old detached behavior (leak, no reaper) for A/B on real HW.
+#define NX_TSTACK_SIZE  (1u << 20)   // 1 MiB host/JIT stack per guest thread
+#define NX_TPOOL_MAX    640          // > the ~600 thread ceiling -> the free-list/reap queue never overflow
+static void* g_tstack_free[NX_TPOOL_MAX];
+static int   g_tstack_free_n = 0;
+typedef struct { pthread_t th; void* stack; } nx_reap_t;
+static nx_reap_t g_reap[NX_TPOOL_MAX];
+static int   g_reap_n = 0;
+static pthread_mutex_t g_tpool_mx = PTHREAD_MUTEX_INITIALIZER;
+
+// OFF by default (opt-in KX_REAP=1). BOTH reaper variants tried — pthread-allocated stack AND this
+// box64-owned pooled stack (pthread_attr_setstack) — CORRUPT the guest glibc heap on real HW (identical
+// _int_malloc NULL-chunk deref, far=0x8). So the corruptor is pthread_join itself (the libnx join path),
+// not the 1MB stack-free. Freeing the Horizon thread slot without pthread_join needs the raw libnx Thread
+// API (threadCreate/threadClose) — but that loses pthread TLS (thread_key/emu), a large redesign. Until
+// then, DETACHED (leak, ~600-lifecycle ceiling) is strictly safer than a heap-corrupting reaper.
+static int reap_enabled(void) {
+    static int e = -1;
+    if (e < 0) e = getenv("KX_REAP") ? 1 : 0;
+    return e;
+}
+static void* tstack_get(void) {   // a reusable page-aligned stack from the pool, or a fresh one (grows to peak-concurrent)
+    void* s = NULL;
+    pthread_mutex_lock(&g_tpool_mx);
+    if (g_tstack_free_n > 0) s = g_tstack_free[--g_tstack_free_n];
+    pthread_mutex_unlock(&g_tpool_mx);
+    if (!s) s = memalign(0x1000, NX_TSTACK_SIZE);   // one-time growth; the stack is NOT freed during churn
+    return s;
+}
+static void tstack_put(void* s) {   // return an exited thread's stack for reuse (avoid free() during churn)
+    if (!s) return;
+    pthread_mutex_lock(&g_tpool_mx);
+    if (g_tstack_free_n < NX_TPOOL_MAX) g_tstack_free[g_tstack_free_n++] = s; else free(s);
+    pthread_mutex_unlock(&g_tpool_mx);
+}
+static void nx_reap_enqueue(pthread_t th, void* stack) {
+    pthread_mutex_lock(&g_tpool_mx);
+    if (g_reap_n < NX_TPOOL_MAX) { g_reap[g_reap_n].th = th; g_reap[g_reap_n].stack = stack; g_reap_n++; }
+    pthread_mutex_unlock(&g_tpool_mx);
+}
+static void nx_reap_drain(void) {
+    nx_reap_t batch[NX_TPOOL_MAX]; int n;
+    pthread_mutex_lock(&g_tpool_mx);
+    n = g_reap_n; g_reap_n = 0;                              // take the pending batch under lock,
+    for (int i = 0; i < n; i++) batch[i] = g_reap[i];
+    pthread_mutex_unlock(&g_tpool_mx);
+    for (int i = 0; i < n; i++) { pthread_join(batch[i].th, NULL); tstack_put(batch[i].stack); }  // join OUTSIDE the lock
+}
+
 static void* nx_clone_trampoline(void* p) {
     nx_clone_t* c = (nx_clone_t*)p;
+    void* mystack = c->stack;               // box64-owned pool stack (NULL if detached) — reclaimed after our join
     g_nx_self = c;                          // publish tid/ctid before running the guest
     { extern void nx_set_guest_pid(int); nx_set_guest_pid(c->gpid); }   // same guest "process"
     c->fn(c->arg);                          // clone_fn_syscall: DynaRun the guest, FreeX64Emu, then return
@@ -1224,12 +1284,17 @@ static void* nx_clone_trampoline(void* p) {
                                             // orphaned emuthread_t here instead of leaking it every thread (M2.6).
     free(c);
     g_nx_self = NULL;
-    return NULL;                            // detached: pthread/libnx reclaim the host stack
+    if (reap_enabled()) nx_reap_enqueue(pthread_self(), mystack);   // JOINABLE: a later clone() joins us -> frees the thread slot + reclaims the stack
+    return NULL;
 }
 
 // Host clone() — the seam box64's raw-clone THREAD branch (x64syscall.c case 56) calls. box64's `stack`
 // is a 1MB host scratch stack we ignore (we only receive its top); pthread allocates the host/JIT stack.
-// The guest owns join via the CLONE_CHILD_CLEARTID futex, so the pthread is detached (never host-joined).
+// The guest owns join via the CLONE_CHILD_CLEARTID futex, so box64 never host-joins for synchronization.
+// But a DETACHED host thread leaks its Horizon thread-ResourceLimit slot (only threadClose, reached via
+// pthread_join, frees it) -> svcCreateThread LimitReached after ~600 lifecycles. So (reaper on) we run
+// JOINABLE on a box64-owned POOLED stack and reap with pthread_join: join frees the slot without freeing
+// the 1MB stack (box64 owns it), avoiding the guest-heap corruption a pthread-stack join-free caused.
 int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
     (void)stack;
     va_list ap; va_start(ap, arg);
@@ -1237,6 +1302,9 @@ int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
     void* newtls = va_arg(ap, void*); (void)newtls;   // R_R8 — CLONE_SETTLS already stripped by box64
     int*  ctid   = va_arg(ap, int*);          // R_R10 (child_tid)
     va_end(ap);
+
+    int reap = reap_enabled();
+    if (reap) nx_reap_drain();   // reclaim thread slots + stacks from host threads that exited since last clone() (M2.6)
 
     nx_clone_t* c = (nx_clone_t*)malloc(sizeof(*c));
     if (!c) { errno = ENOMEM; return -1; }
@@ -1250,12 +1318,21 @@ int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 1u << 20);                  // >=1MB host/JIT stack
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    c->stack = NULL;
+    if (reap) {
+        void* st = tstack_get();                                 // box64-owned, page-aligned, POOLED stack
+        if (!st) { free(c); errno = ENOMEM; return -1; }
+        c->stack = st;
+        pthread_attr_setstack(&attr, st, NX_TSTACK_SIZE);        // pthread never alloc/frees it -> no join-time newlib free
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    } else {
+        pthread_attr_setstacksize(&attr, 1u << 20);              // >=1MB host/JIT stack (detached path)
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    }
     pthread_t th;
     int rc = pthread_create(&th, &attr, nx_clone_trampoline, c);
     pthread_attr_destroy(&attr);
-    if (rc) { free(c); errno = rc; return -1; }
+    if (rc) { if (c->stack) tstack_put(c->stack); free(c); errno = rc; return -1; }
     return c->tid;                                                // child tid to the guest parent
 }
 
