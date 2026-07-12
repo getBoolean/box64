@@ -287,6 +287,9 @@ int AddTLSPartition(box64context_t* context, int tlssize);
 // defined in fact in threads.c
 void thread_set_emu(x64emu_t* emu);
 void thread_forget_emu();
+#ifdef __SWITCH__
+void thread_free_forgotten_emu(void);   // M2.6: forget + free the orphaned wrapper (fixes per-thread leak)
+#endif
 x64emu_t* thread_get_emu_no_create(void);
 x64emu_t* thread_get_emu(void);
 

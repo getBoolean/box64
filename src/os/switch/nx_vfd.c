@@ -84,6 +84,7 @@ typedef struct {
     int      fdq_n;
     int      peer;                // slot idx, -1 = closed/never
     int      pid;                 // creator's guest pid (SO_PEERCRED)
+    int      rd_shut;             // peer did shutdown(SHUT_WR): reads here see EOF once the ring drains
     // VK_SOCK bound / VK_LISTEN
     char     bpath[256];
     int      backlog[8];
@@ -432,7 +433,7 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
             pthread_mutex_unlock(&g_mx);
             return (long)take;
         }
-        if (v->peer < 0) { pthread_mutex_unlock(&g_mx); return 0; }      // EOF
+        if (v->peer < 0 || v->rd_shut) { pthread_mutex_unlock(&g_mx); return 0; }  // EOF (peer closed or shutdown(SHUT_WR))
         if (v->nonblock) { pthread_mutex_unlock(&g_mx); errno = EAGAIN; return -1; }
         { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
           if (on) vlog("nx_vfd: RDBLK pid=%d fd=%d kind=%d peer=%d n=%zu\n",
@@ -567,6 +568,23 @@ int nx_socketpair(int domain, int type, int protocol, int sv[2]) {
     if (domain != 1) { errno = EAFNOSUPPORT; return -1; }
     (void)protocol;
     return make_pair(VK_SOCK, sv, (type & 0x800) ? 1 : 0);
+}
+
+// shutdown(SHUT_WR/SHUT_RDWR) half-closes our write side: the PEER's reads see EOF once its ring
+// drains. Wine's wineserver sock_check_pollhup probe relies on this (socketpair + SHUT_WR on one
+// end, then poll the other for POLLIN/read()==0). A no-op here left the peer's poll timing out ->
+// the "sock_init: ERROR in sock_check_pollhup()" message. Real (non-vfd) fds: accept as a no-op.
+int nx_shutdown(int fd, int how) {
+    if (!nx_vfd_is(fd)) return 0;                     // real fd: nothing to do on Horizon
+    pthread_mutex_lock(&g_mx);
+    vfd_t* v = V(fd);
+    int peer = v->peer;
+    if ((v->kind == VK_SOCK || v->kind == VK_PIPE) && peer >= 0 && (how == 1 || how == 2))
+        g_v[peer].rd_shut = 1;                        // SHUT_WR/RDWR: peer reads hit EOF when drained
+    pthread_cond_broadcast(&g_cv);                    // wake a poll()/read() blocked on the peer
+    pthread_mutex_unlock(&g_mx);
+    vlog("nx_vfd: shutdown fd=%d how=%d peer=%d pid=%d\n", fd, how, peer, nx_guest_pid());
+    return 0;
 }
 
 // normalize a guest sun_path against the guest cwd so bind("socket") and a later absolute
@@ -823,7 +841,7 @@ static short vfd_ready(vfd_t* v, short events) {
     if (v->kind == VK_LISTEN) {
         if (v->backlog_n) re |= 0x001;                                   // POLLIN
     } else if (v->kind == VK_SOCK || v->kind == VK_PIPE) {
-        if (rused(v)) re |= 0x001;                                       // POLLIN: buffered data
+        if (rused(v) || v->rd_shut) re |= 0x001;                         // POLLIN: buffered data, or drained after peer shutdown(SHUT_WR) -> read()==0 EOF
         if (v->peer < 0) re |= 0x010;                                    // POLLHUP: peer closed
         else if (RING_CAP - rused(&g_v[v->peer]) > 0) re |= 0x004;       // POLLOUT
         // wineserver's sock_check_pollhup expects EXACTLY POLLHUP on a drained hung-up socket, so
@@ -1019,6 +1037,11 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             break;
         case 7:   // poll
             r = nx_poll((l_pollfd*)a1, (unsigned long)a2, (int)a3);
+            break;
+        case 48:  // shutdown — half-close a vfd socketpair so the PEER sees EOF. box64's scwrap has no
+                  // entry for shutdown, so without this it hit the big-switch default -> ENOSYS, which
+                  // failed the wineserver's sock_check_pollhup probe ("ERROR in sock_check_pollhup()").
+            r = nx_shutdown((int)a1, (int)a2);
             break;
         case 16:  // ioctl
             if (!nx_vfd_is((int)a1)) {

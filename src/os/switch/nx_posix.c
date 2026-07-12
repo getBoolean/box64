@@ -20,6 +20,7 @@
 // box64-internal (src/libtools/threads.c): drop this thread's emu from the pthread key so the key
 // destructor can't double-free the emu clone_fn_syscall already released (see clone() below).
 extern void thread_forget_emu(void);
+extern void thread_free_forgotten_emu(void);   // M2.6: same, plus free the ~64B wrapper (fixes the leak)
 void nx_guest_output(int fd, const void *buf, size_t len);   // nx_main.c — debug log + result-file tee
 
 #define NX_PAGE 0x1000UL
@@ -331,6 +332,17 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
         if (nx_stdfd_regularize(dirfd, r == 0 ? b->st_mode : 0)) {
             if (r != 0) { memset(b, 0, sizeof *b); b->st_nlink = 1; r = 0; }
             b->st_mode = (b->st_mode & ~S_IFMT) | S_IFREG | 0600;
+        }
+        if (r != 0 && !nx_vfd_is(dirfd)) {
+            // A real fd newlib can't fstat (a special/char/pipe fd the in-process wineserver passes to
+            // create_file_for_fd -> fstat -> file_set_error, which can't map ENOSYS -> STATUS_UNSUCCESSFUL
+            // aborts the mapping op: the "file_set_error() can't map error" message). Synthesize a valid
+            // regular-file stat so the op proceeds (a non-zero ino is stamped below).
+            int se = errno;
+            static int on = -1; if (on < 0) on = getenv("KX_STATLOG") ? 1 : 0;
+            if (on) { char bb[96]; int nn = snprintf(bb, sizeof bb, "nx_stat: SYNTH fd=%d fstat_errno=%d\n", dirfd, se);
+                      svcOutputDebugString(bb, (size_t)nn); }
+            memset(b, 0, sizeof *b); b->st_mode = S_IFREG | 0600; b->st_nlink = 1; r = 0;
         }
     } else {
         char gp[512];                                    // M2.5: relative to a dir vfd
@@ -868,6 +880,7 @@ int  nx_vfd_fchdir(int fd);
 int  nx_pipe2(int fds[2], int linux_flags);
 int  nx_socket(int domain, int type, int protocol);
 int  nx_socketpair(int domain, int type, int protocol, int sv[2]);
+int  nx_shutdown(int fd, int how);
 int  nx_bind(int fd, const void* addr, unsigned alen);
 int  nx_listen(int fd, int backlog);
 int  nx_connect(int fd, const void* addr, unsigned alen);
@@ -1023,7 +1036,7 @@ long syscall(long number, ...) {
             errno = EBADF; return -1;
         case 208: return nx_setsockopt((int)a0, (int)a1, (int)a2, (const void*)a3, (unsigned)a4);
         case 209: return nx_getsockopt((int)a0, (int)a1, (int)a2, (void*)a3, (unsigned*)a4);
-        case 210: return 0;                                      // shutdown -> accept
+        case 210: return nx_shutdown((int)a0, (int)a1);          // shutdown (SHUT_WR -> peer EOF)
         case 211: return nx_sendmsg((int)a0, (const void*)a1, (int)a2);
         case 212: return nx_recvmsg((int)a0, (void*)a1, (int)a2);
         case 62:                                                 // lseek
@@ -1158,6 +1171,32 @@ long syscall(long number, ...) {
             }
             return nx_access_guest(p, (int)a2);
         }
+        // Non-file syscalls glibc/Wine touch during cmd.exe startup. As ENOSYS they spammed nx_stub
+        // and left a sticky guest errno; give each a benign, plausible result instead.
+        case 114: {  // clock_getres(clockid, timespec*) — report 1ns resolution
+            struct kx_ts { long tv_sec, tv_nsec; } *ts = (struct kx_ts*)a1;
+            if (ts) { ts->tv_sec = 0; ts->tv_nsec = 1; }
+            return 0;
+        }
+        case 123: {  // sched_getaffinity(pid, cpusetsize, mask) — report online CPUs so glibc's
+                     // nproc/arena sizing is sane. Return the bytes filled (glibc zeroes the rest).
+            unsigned long sz = (unsigned long)a1; unsigned char* mask = (unsigned char*)a2;
+            if (!mask || sz < 8) { errno = EINVAL; return -1; }
+            memset(mask, 0, sz);
+            mask[0] = 0x0f;                          // 4 CPUs online (Horizon exposes cores 0-3)
+            return 8;                                // bytes of cpumask copied
+        }
+        case 167: return 0;                          // prctl(option, ...) -> accept (PR_SET_NAME etc.)
+        case 179: {  // sysinfo(struct sysinfo*) — zero-fill + a plausible RAM figure (mem_unit=1)
+            struct kx_sysinfo { long uptime; unsigned long loads[3];
+                unsigned long totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+                unsigned short procs, pad; unsigned long totalhigh, freehigh;
+                unsigned int mem_unit; char _f[20]; } *si = (struct kx_sysinfo*)a0;
+            if (si) { memset(si, 0, sizeof *si);
+                      si->mem_unit = 1; si->totalram = 0x40000000UL; si->freeram = 0x20000000UL;
+                      si->procs = 1; }
+            return 0;
+        }
         default:
             nx_warnf("nx_stub: syscall(%ld) unimplemented -> -ENOSYS\n", number);
             errno = ENOSYS; return -1;
@@ -1180,8 +1219,9 @@ static void* nx_clone_trampoline(void* p) {
         __atomic_store_n(c->ctid, 0, __ATOMIC_SEQ_CST);
         svcSignalToAddress(c->ctid, SignalType_Signal, 0, 1);
     }
-    thread_forget_emu();                    // NULL the pthread key: the emu was already freed, so its
-                                            // destructor must not run (would double-free). The ~64B et leaks.
+    thread_free_forgotten_emu();            // NULL the pthread key + FREE the ~64B wrapper. The emu was
+                                            // already freed (destructor would double-free it), so we free the
+                                            // orphaned emuthread_t here instead of leaking it every thread (M2.6).
     free(c);
     g_nx_self = NULL;
     return NULL;                            // detached: pthread/libnx reclaim the host stack

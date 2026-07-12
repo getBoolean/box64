@@ -509,6 +509,24 @@ static int clone_fn_syscall(void* arg)
 #endif
 }
 
+#ifdef __SWITCH__
+extern int nx_guest_pid(void);
+// M2 diagnostic (gated on KX_ENOSYS_LOG): name the exact syscall that returns -ENOSYS to the guest,
+// INCLUDING the box64-internal ENOSYS the nx_stub log misses. Used to pin the syscall behind the
+// wineserver's "file_set_error() can't map error" choke. Total-capped so a livelock can't flood;
+// attribute by guest pid (in-process wineserver=2, client=100).
+static void nx_diag_enosys(long s) {
+    static int on = -1;
+    if (on < 0) on = getenv("KX_ENOSYS_LOG") ? 1 : 0;
+    if (!on) return;
+    static int cnt = 0;
+    if (cnt >= 64) return;
+    cnt++;
+    char b[96]; int n = snprintf(b, sizeof b, "nx: ENOSYS syscall=%ld pid=%d\n", s, nx_guest_pid());
+    if (n > 0) svcOutputDebugString(b, n);
+}
+#endif
+
 void EXPORT x64Syscall(x64emu_t *emu)
 {
     // check if it's a wine process, then filter the syscall (simulate SECCMP)
@@ -603,7 +621,8 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     {
         long pr;
         if (nx_x64_precase(s, R_RDI, R_RSI, R_RDX, R_R10, R_R8, R_R9, &pr)) {
-            if (pr < 0 && pr > -4096) pr = -(long)nx_errno_h2l((int)-pr);   // host->Linux errno (M2.3)
+            if (pr < 0 && pr > -4096) { pr = -(long)nx_errno_h2l((int)-pr);   // host->Linux errno (M2.3)
+                                        if (pr == -38) nx_diag_enosys(s); }
             S_RAX = (uint64_t)pr;
             return;
         }
@@ -644,6 +663,9 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             S_RAX = -nx_errno_h2l(errno);   // M2.3: newlib host errno -> the Linux errno the guest expects
 #else
             S_RAX = -errno;
+#endif
+#ifdef __SWITCH__
+        if((int64_t)S_RAX == -38) nx_diag_enosys(s);   // KX_ENOSYS_LOG: pin the file_set_error choke
 #endif
         if(log) snprintf(buffret, 127, "0x%x%s", R_EAX, buff2);
         if(log && !BOX64ENV(rolling_log)) printf_log_prefix(0, LOG_NONE, "=> %s\n", buffret);
@@ -1133,8 +1155,10 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     // range to the Linux errno the guest glibc expects. Success returns (>=0, or a pointer < -4095 such
     // as MAP_FAILED's identity-mapped -1) are untouched; the wrapper path (above) already translated and
     // returned before reaching here, as does clone3's early -38. (No-op on non-newlib hosts.)
-    if ((int64_t)R_RAX <= -1 && (int64_t)R_RAX >= -4095)
+    if ((int64_t)R_RAX <= -1 && (int64_t)R_RAX >= -4095) {
         R_RAX = (uint64_t)(int64_t)(-nx_errno_h2l((int)(-(int64_t)R_RAX)));
+        if ((int64_t)R_RAX == -38) nx_diag_enosys(s);   // KX_ENOSYS_LOG: pin the file_set_error choke
+    }
 #endif
     if(log) {
         if(BOX64ENV(rolling_log))

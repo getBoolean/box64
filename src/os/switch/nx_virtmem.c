@@ -581,10 +581,19 @@ static void* nx_mmap_heap(void* addr, size_t rounded, int flags, int prot) {
     // 64 KiB-aligned the head-trim is empty and the tail-trim (an interior munmap) is a no-op in nx_munmap
     // (not the tracked base) — so the whole memalign block stays intact and is freed on the module's final
     // munmap. A 4 KiB-aligned block would let Wine munmap the block BASE (freeing it out from under itself).
-    void* p = memalign(0x10000, rounded);   // newlib malloc is itself thread-safe
-    if (!p) { errno = ENOMEM; return MAP_FAILED; }
+    // M2.6: serialize the WHOLE heap-mmap op (memalign + memset + track) under vm_lock, paired with
+    // nx_munmap's free-under-lock. Real-HW crash (tests/m2/stress.c phase 3): 32 threads churning
+    // 1 MiB mmap/munmap corrupted the guest glibc heap ("malloc(): unaligned fastbin chunk detected" ->
+    // SIGSEGV). A guest-side mutex around mmap/munmap fixed it, proving the race is in this box64 path
+    // (the raw newlib memalign/free are thread-safe on their own, but the alloc/free must be paired so a
+    // munmap's free() can't race a concurrent mmap's memalign at high volume). Correctness-first; the
+    // 1 MiB memset inside the lock is a perf cost to revisit in the M2.6 tuning pass.
+    mutexLock(&vm_lock);
+    void* p = memalign(0x10000, rounded);
+    if (!p) { mutexUnlock(&vm_lock); errno = ENOMEM; return MAP_FAILED; }
     if (flags & MAP_ANONYMOUS) memset(p, 0, rounded);
-    mutexLock(&vm_lock); hb_track((uintptr_t)p, rounded); mutexUnlock(&vm_lock);
+    hb_track((uintptr_t)p, rounded);
+    mutexUnlock(&vm_lock);
     return p;
 }
 
@@ -714,8 +723,8 @@ int nx_munmap(void* addr, unsigned long length) {
     mutexLock(&vm_lock);
     int freed = nx_lowva_free_range(a, rounded);   // reclaim low-VA CodeMemory (Wine VirtualFree)
     int found = freed ? 0 : hb_untrack(a);
-    mutexUnlock(&vm_lock);
-    if (found) free(addr);         // heap-fallback whole-block reclaim
+    if (found) free(addr);         // free UNDER vm_lock (M2.6): pair with nx_mmap_heap's memalign so a
+    mutexUnlock(&vm_lock);         // munmap's free() can't race a concurrent mmap's memalign (see stress.c p3)
     return 0;
 }
 

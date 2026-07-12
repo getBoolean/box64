@@ -228,6 +228,20 @@ void thread_forget_emu()
 {
 	pthread_setspecific(thread_key, NULL);
 }
+#ifdef __SWITCH__
+// box64-nx (M2.6): free the orphaned emuthread_t wrapper on guest-thread exit. clone_fn_syscall already
+// FreeX64Emu'd et->emu (leaving it dangling), so the normal emuthread_destroy would double-free it — the
+// Switch trampoline therefore called thread_forget_emu() (drop the key, skip the destructor), which LEAKED
+// the ~64B wrapper every thread. Over a long Wine session churning thousands of short-lived threads that
+// grows the box_malloc heap unbounded. Here we drop the key AND free the wrapper (never et->emu, already
+// gone; box_free(NULL)-safe cancels array too).
+void thread_free_forgotten_emu(void)
+{
+	emuthread_t* et = (emuthread_t*)pthread_getspecific(thread_key);
+	pthread_setspecific(thread_key, NULL);
+	if(et) { box_free(et->cancels); box_free(et); }
+}
+#endif
 void thread_set_emu(x64emu_t* emu)
 {
 	emuthread_t *et = (emuthread_t*)pthread_getspecific(thread_key);
