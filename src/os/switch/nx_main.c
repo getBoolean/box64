@@ -146,7 +146,7 @@ static void kout(const char *fmt, ...) {
 // Why: a hold only works while the guest is still running, because THEN box64 is a normal foreground app
 // (appletMainLoop() true, input flows). Once the guest calls exit_group the OS has already queued box64's
 // Exit (it force-reaps an emulator whose guest finished, ~3 s later), so a hold there just shows HOME.
-// Gated: only on real HW (padConfigureInput crashes Ryujinx's HID, and Ryujinx has no controller anyway),
+// Gated: only on real HW (Ryujinx has no controller anyway; pad support is declared once in main()),
 // only with KX_WAIT_EXIT set, only from the console-owning thread (the in-process wineserver must never
 // drive HID/console). Runs at most once (g_hold_done). Blocks the write() until +, then the guest resumes.
 void nx_wait_for_exit_button(void) {
@@ -157,8 +157,10 @@ void nx_wait_for_exit_button(void) {
     rlog("hold: waiting for + button");
     kout("\n[ press + to exit ]\n");
     consoleUpdate(NULL);
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-    PadState pad; padInitializeDefault(&pad);
+    // No padConfigureInput here: main() already declared 8 players (re-declaring 1 here would SHRINK
+    // the supported set mid-run and disconnect a pad sitting on No2+ at the exact moment of the hold).
+    // padInitializeAny: sample + from whichever slot the physical or switch-mcp virtual pad landed in.
+    PadState pad; padInitializeAny(&pad);
     // Pump appletMainLoop() so our layer stays composited (an application must service the applet channel
     // to hold the screen). This is called from the guest's stdout write — i.e. BEFORE the guest exits —
     // so the OS has not yet queued our Exit and appletMainLoop() returns true; the app stays foreground
@@ -226,9 +228,12 @@ int main(int argc, char **argv) {
         socketInitializeDefault();
         g_nxlink_fd = nxlinkConnectToHost(false, false);
     }
-    // NB: no HID init — box64 doesn't poll a pad (the hold loop below is appletMainLoop-only), and
-    // padConfigureInput crashes Ryujinx 1.2.72's HID service (KeyNotFoundException) before we ever
-    // reach the guest. Real HW doesn't need it either.
+    // Pad/HID setup happens after load_env_file() below (padConfigureInput(8, ...)): an application
+    // that never declares supported npad styles/IDs gets its Bluetooth controllers POWERED OFF by the
+    // npad arbiter on real HW (no assignable slot — the retail "extra controller in a 1-player game"
+    // behavior; a paired Pro-Controller-alike drops into a wake/re-pair/drop loop the moment box64
+    // takes foreground). Gated off Ryujinx: padConfigureInput crashes Ryujinx 1.2.72's HID service
+    // (KeyNotFoundException) before we ever reach the guest; KX_PAD_CONFIG=1 forces it there.
 
     // Mount the romfs embedded in the NRO (holds the x86-64 guests: romfs:/hello, /loop, /churn), so a
     // single nxlink push carries box64 + its guest. Only the homebrew NRO has embedded romfs; a title
@@ -262,6 +267,13 @@ int main(int argc, char **argv) {
     // its FIRST call and must already see env overrides like KX_FORCE_HEAP (else it commits to PHYS before
     // the env is read). Idempotent setenv, so it's safe that we don't call load_env_file again later.
     load_env_file();
+    // Declare supported pads to Horizon ASAP (after load_env_file so KX_PAD_CONFIG can force it on):
+    // without a hidSetSupportedNpadStyleSet/IdType call the npad arbiter cannot bind a Bluetooth
+    // controller to any slot and powers it off (see the comment above). 8 players so a switch-mcp
+    // HDLS virtual pad sitting on No1 can't bump the physical pad out of the supported range.
+    // hidInitialize() itself already ran in libnx's default __appInit ("hid" is in the NPDM).
+    if (detectMesosphere() || getenv("KX_PAD_CONFIG"))
+        padConfigureInput(8, HidNpadStyleSet_NpadStandard);
     { uintptr_t vb = 0; size_t vs = 0; unsigned long long sr = 0;
       int st = nx_vm_status(&vb, &vs, &sr);
       const char *name = (st == 2) ? "UNSAFE" : (st == 1) ? "PHYS" : "heap-fallback";
