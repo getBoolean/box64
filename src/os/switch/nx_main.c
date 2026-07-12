@@ -25,49 +25,6 @@
 #endif
 
 static void kdbg(const char *s) { svcOutputDebugString(s, strlen(s)); }
-static void rlog(const char *s);   // defined below; used by nx_publish_wine_lowva
-
-// Compute box64's own contiguous loaded-image span [start,end) and publish, as KX_WINE_LOWVA, the
-// Win32 low-VA reserve set with that span carved out. box64's NSO/NRO (code + rodata + data + bss) is
-// a run of CodeStatic/CodeMutable regions; walk svcQueryMemory out from a box64 code address in both
-// directions across those types to bound it exactly (works under ASLR — no hardcoded base). The Wine
-// PIE shim (tests/m2/wineshim.c) parses KX_WINE_LOWVA "s-e,s-e,..." into wine_main_preload_info so
-// Wine reserves those ranges and never allocates on top of box64's own image.
-static void nx_publish_wine_lowva(void) {
-    // box64's own image + its runtime data are FRAGMENTED across the low ASLR region (image, a guard
-    // gap, then more box64 regions), so a single contiguous "box64 span" can't be carved out reliably.
-    // Instead ENUMERATE the genuinely-free (Unmapped, type 0) holes in Wine's low Win32 window and hand
-    // Wine exactly those as reserved areas — Wine then only ever allocates where box64 has nothing, so
-    // svcControlCodeMemory MapOwner never hits a non-Free destination. Runs pre-initialize; the guest
-    // arena regions are up at 0x100000000+ and out of this window, and the KUSER zone is appended.
-    const uintptr_t LO = 0x8000000UL, HI = 0x68000000UL;
-    const size_t MIN_HOLE = 0x400000UL;   // ignore holes < 4 MiB (too small for a heap/reserve)
-    char env[256]; int o = 0; int nranges = 0;
-    uintptr_t a = LO;
-    MemoryInfo mi; u32 pi;
-    while (a < HI && nranges < 6) {
-        if (R_FAILED(svcQueryMemory(&mi, &pi, a))) break;
-        uintptr_t rstart = mi.addr, rend = mi.addr + mi.size;
-        if (rend <= a) break;                          // no progress -> stop
-        if ((mi.type & 0xff) == 0) {                   // Unmapped = free
-            uintptr_t hs = rstart < LO ? LO : rstart;
-            uintptr_t he = rend > HI ? HI : rend;
-            hs = (hs + 0xFFFFFUL) & ~0xFFFFFUL;         // 1 MiB-align inward (avoid box64 edge pages)
-            he &= ~0xFFFFFUL;
-            if (he > hs && (he - hs) >= MIN_HOLE) {
-                o += snprintf(env + o, sizeof env - o, "%s0x%lx-0x%lx",
-                              nranges ? "," : "", (unsigned long)hs, (unsigned long)he);
-                nranges++;
-            }
-        }
-        a = rend;
-    }
-    o += snprintf(env + o, sizeof env - o, "%s0x7ff00000-0x7fff0000", nranges ? "," : "");
-    setenv("KX_WINE_LOWVA", env, 1);
-    char b[300]; int n = snprintf(b, sizeof b, "nx_main: %d free low hole(s) KX_WINE_LOWVA=%s\n",
-                 nranges, env);
-    if (n > 0) { svcOutputDebugString(b, n); rlog(b); }
-}
 
 // Append a line to a result file on the SD. A title (NSP) has no nxlink and its console is replaced by
 // am's "software closed" dialog when it self-exits, so this is the only reliable way to read a title's
@@ -373,13 +330,6 @@ int main(int argc, char **argv) {
     // Ryujinx to a crawl for a big guest like Wine+cmd.exe. Override with BOX64_LOG in box64.env when
     // debugging a specific load/reloc issue.
     setenv("BOX64_LOG", "0", 1);
-    // M2.5 Wine: box64's OWN NSO/NRO is loaded low in the guest's Win32 address space (Ryujinx: ~0x8.5M),
-    // right where Wine's process heap grows. Wine trusts the ranges in wine_main_preload_info as free, so
-    // it must be told to AVOID box64's image (else NtAllocateVirtualMemory MAP_FIXED there collides with
-    // box64's own code -> svcControlCodeMemory InvalidCurrentMemory -> heap create fails -> NO_MEMORY).
-    // Compute box64's contiguous module span at runtime (ASLR-safe for real HW) and publish the low-VA
-    // reserve set MINUS that hole as KX_WINE_LOWVA; the PIE Wine shim parses it into preload_info.
-    nx_publish_wine_lowva();
     // Fix 1: place the un-relocatable EXE base (start.exe @0x140000000) + KUSER on the CodeMemory slab
     // FIRST — before initialize()/the wineserver spawn/any Wine module — so their MapOwner is deterministic
     // (nothing adjacent to trigger 0xdc01). This is the residual ASLR-flakiness fix (see nx_virtmem.c).
