@@ -1,0 +1,12 @@
+# Source is LF everywhere: index normalized to LF and checked out as LF (box64 is a Linux-oriented
+# codebase; the MSYS2/devkitPro toolchain is LF-native). This also fixes the phantom whole-tree-
+# modified status on Windows (~2500 files were smudged to CRLF in the worktree by an earlier
+# core.autocrlf setting while the index is LF). Files genuinely committed with CRLF upstream are
+# left untouched — git skips conversion when the index blob already contains CRLF — so they don't
+# become phantoms either. Real binaries (.exe/.dll/.nso/images) are auto-detected and never touched.
+* text=auto eol=lf
+
+# Windows script/text formats keep CRLF (none in-tree today; pinned for future-proofing).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
