@@ -282,6 +282,76 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     }
 #endif
 
+#ifdef DYNAREC
+    // 3c) CALLRET (BOX64_DYNAREC_CALLRET>=2): each call-return / self-loop site carries a shadow slot that is
+    //     a NOP while its block is clean and a UDF(#0xcafe) once the block is marked dirty. Hitting the UDF
+    //     (undefined instruction -> ec==0 -> SIGILL) means box64 must re-validate the block. CLEAN: reset the
+    //     callret slots to NOP + re-arm the jump table, then resume at the NEXT native instruction (rx+4) via
+    //     the trampoline (Horizon has no kernel sigreturn, and siglongjmp can't land mid-block). DIRTY: lift
+    //     guest state + siglongjmp(3) to leave the stale block (regen at the current RIP). Mirrors
+    //     signals.c:859-929 (#ifdef ARCH_NOP SIGILL branch); the native fault addr is `rw` (compare to
+    //     db->block, the rw alias), the resume PC is ctx->pc.x (rx) + 4. Runs before generic SIGILL delivery;
+    //     a genuine guest ud2 won't match a callret slot and falls through.
+    if (sig == X64_SIGILL && cur_db && emu) {
+        dynablock_t* db = (dynablock_t*)cur_db;
+        if (db->callret_size) {
+            int is_callret = 0, type_callret = 0;
+            for (int i = 0; i < db->callret_size && !is_callret; ++i)
+                if ((uintptr_t)rw == (uintptr_t)db->block + db->callrets[i].offs) {
+                    is_callret = 1; type_callret = db->callrets[i].type;
+                }
+            if (is_callret) {
+                // "ret" type (0): the relevant x64 addr is the return target held in xRIP (X[27]); "loop"
+                // type (1) keeps getX64Address's x64pc. Used for the hotpage/hash validity check + state lift.
+                uintptr_t cr_x64pc = type_callret ? x64pc : (uintptr_t)ctx->cpu_gprs[27].x;
+                int is_hotpage = checkInHotPage(cr_x64pc);
+                uint32_t hash = (db->gone || is_hotpage) ? 0 : X31_hash_code(db->x64_addr, db->x64_size);
+                if (!db->gone && (!is_hotpage || db->autocrc) && hash == db->hash) {
+                    // CLEAN: block still valid -> reset callret slots to NOP + re-arm the jump table, resume rx+4.
+                    if (db->always_test) {
+                        protectDB((uintptr_t)db->x64_addr, 1);
+                    } else {
+                        for (int i = 0; i < db->callret_size; ++i)
+                            *(uint32_t*)(db->block + db->callrets[i].offs) = ARCH_NOP;   // db->block is the writable rw alias
+                        ClearCache(db->block, db->size);
+                        protectDBJumpTable((uintptr_t)db->x64_addr, db->x64_size, db->block, db->jmpnext);
+                        for (int i = 0; i < db->sep_size; ++i) {
+                            uint32_t x64_offs = db->sep[i].x64_offs;
+                            uint32_t nat_offs = db->sep[i].nat_offs;
+                            if (addJumpTableIfDefault64(db->x64_addr + x64_offs, db->always_test ? db->jmpnext : (db->block + nat_offs)))
+                                db->sep[i].active = 1;
+                            else
+                                db->sep[i].active = 0;
+                        }
+                    }
+                    { static int logged = 0; if (!logged) { logged = 1; nx_result_log("nx_exc: CALLRET clean -> reset + resume rx+4 (Stage D)"); } }
+                    struct fpsimd_context* fpsimd = (struct fpsimd_context*)uctx.uc_mcontext.__reserved;
+                    nx_resume_ctx_t rc;
+                    for (int i = 0; i < 31; ++i) rc.x[i] = uctx.uc_mcontext.regs[i];
+                    rc.sp   = uctx.uc_mcontext.sp;
+                    rc.pc   = ctx->pc.x + 4;                     // rx + 4 (skip the UDF/NOP shadow slot)
+                    rc.nzcv = uctx.uc_mcontext.pstate;
+                    for (int i = 0; i < 32; ++i) rc.v[i] = fpsimd->vregs[i];
+                    nx_resume_native(&rc);                       // reloads full state, branches to rx+4; NEVER returns
+                } else if (emu->jmpbuf) {
+                    // DIRTY (or in a HotPage): leave the stale block. Lift guest regs; a "loop" type also needs
+                    // the partial-instruction rewind + flags/x87/SSE reconstruction ("ret" is just the epilog).
+                    { static int logged = 0; if (!logged) { logged = 1; nx_result_log("nx_exc: CALLRET dirty -> siglongjmp(3) regen (Stage D)"); } }
+                    copyUCTXreg2Emu(emu, &uctx, cr_x64pc);
+                    if (type_callret) {
+                        adjustregs(emu, rw);
+                        if (db->arch_size) ARCH_ADJUST(db, emu, &uctx, cr_x64pc);
+                    }
+                    emu->test.clean = 0;
+                    dynablock_leave_runtime(db);
+                    cancel_deferred_signal_processing(emu);
+                    siglongjmp(emu->jmpbuf, 3);                  // regen a dynablock at current RIP; NEVER returns
+                }
+            }
+        }
+    }
+#endif
+
     // 4) Deliver to the guest handler if one is installed. The core runs the guest handler and then either
     //    exit()s (the handler siglongjmp'd out and the program ran to exit_group) or siglongjmp()s back
     //    into EmuRun to resume the guest — it NEVER returns here on success. SIG_DFL(0)/SIG_IGN(1) or no
