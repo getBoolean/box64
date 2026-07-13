@@ -847,7 +847,25 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                     clone_t* args = box_calloc(1, sizeof(clone_t));
                     newemu->regs[_SP].q[0] = sp;  // setup new stack pointer
                     args->emu = newemu;
-                    if(flags&CLONE_SETTLS) args->tls = (void*)R_R9;
+                    if(flags&CLONE_SETTLS) args->tls = (void*)R_R8;  // raw-clone ABI: tls is r8 (r9 is junk here)
+#ifdef __SWITCH__
+                    // M2.6: honor CLONE_SETTLS. glibc expects the KERNEL to install the child's TCB as its
+                    // FS base; box64 strips the flag and CloneEmu copies the PARENT's segs_offs, so without
+                    // this the child runs on the parent's TCB and every fs-relative guest TLS (errno, malloc
+                    // tcache, thread_arena) is SHARED across guest threads — the M2.6 "reaper" guest-arena
+                    // corruption (real-HW-only: the lockless shared-tcache race needs weak-ordered multicore
+                    // timing; the join-reaper only correlated by letting arena.c live past the ~600-lifecycle
+                    // slot-leak cap). tests/m2/tlsprobe.c exits 50 without this, 42 with it.
+                    // A/B opt-out (box64.env): KX_NO_CLONE_SETTLS=1 restores the old shared-FS behavior.
+                    {
+                        static int no_settls = -1;
+                        if (no_settls < 0) no_settls = getenv("KX_NO_CLONE_SETTLS") ? 1 : 0;
+                        if (!no_settls && args->tls) {
+                            newemu->segs[_FS] = 0;
+                            newemu->segs_offs[_FS] = (uintptr_t)args->tls;
+                        }
+                    }
+#endif
                     void* mystack = NULL;
                     if(my_context->stack_clone_used) {
                         args->stack2free = mystack = box_malloc(1024*1024);  // stack for own process...

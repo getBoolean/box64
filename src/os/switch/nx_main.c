@@ -267,6 +267,14 @@ int main(int argc, char **argv) {
     // its FIRST call and must already see env overrides like KX_FORCE_HEAP (else it commits to PHYS before
     // the env is read). Idempotent setenv, so it's safe that we don't call load_env_file again later.
     load_env_file();
+    // M2.6: bound guest glibc's malloc-arena count (reachable since the CLONE_SETTLS fix gave guest
+    // threads their own TLS). Each new arena reserves 2*HEAP_MAX_SIZE = 128 MiB with mmap(PROT_NONE),
+    // and Horizon's heap backend has NO overcommit — a reservation is committed RAM, and the unaligned
+    // head/tail trims can't be returned to the newlib heap (nx_virtmem hb_untrack keeps partially-
+    // unmapped blocks). Unbounded (glibc default 8*ncpu) the real-HW 3-core arena ramp transiently
+    // demands multiple GiB and ordinary mallocs ENOMEM (stress.c p3 exit 4). 4 arenas ~= one per core
+    // + main; box64.env can override (overwrite=0 -> the env file wins).
+    setenv("MALLOC_ARENA_MAX", "4", 0);
     // Declare supported pads to Horizon ASAP (after load_env_file so KX_PAD_CONFIG can force it on):
     // without a hidSetSupportedNpadStyleSet/IdType call the npad arbiter cannot bind a Bluetooth
     // controller to any slot and powers it off (see the comment above). 8 players so a switch-mcp
@@ -341,7 +349,7 @@ int main(int argc, char **argv) {
     // Default 0 (quiet) — verbose per-instruction/reloc logging via svcOutputDebugString throttles
     // Ryujinx to a crawl for a big guest like Wine+cmd.exe. Override with BOX64_LOG in box64.env when
     // debugging a specific load/reloc issue.
-    setenv("BOX64_LOG", "0", 1);
+    setenv("BOX64_LOG", "0", 0);   // default only — box64.env's BOX64_LOG (already loaded) wins
     // Fix 1: place the un-relocatable EXE base (start.exe @0x140000000) + KUSER on the CodeMemory slab
     // FIRST — before initialize()/the wineserver spawn/any Wine module — so their MapOwner is deterministic
     // (nothing adjacent to trigger 0xdc01). This is the residual ASLR-flakiness fix (see nx_virtmem.c).
