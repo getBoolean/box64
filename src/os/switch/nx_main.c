@@ -267,6 +267,10 @@ int main(int argc, char **argv) {
     // its FIRST call and must already see env overrides like KX_FORCE_HEAP (else it commits to PHYS before
     // the env is read). Idempotent setenv, so it's safe that we don't call load_env_file again later.
     load_env_file();
+    // M2.6 A/B gate: KX_EXC_SINGLE=1 forces the legacy single-exception-slot behavior (the entry asm
+    // uses slot 0 with no atomic claim; the C handler skips the chain bookkeeping). FTP-flippable
+    // bisect between old/new exception plumbing on the same binary.
+    { extern uint32_t kx_exc_single; if (getenv("KX_EXC_SINGLE")) kx_exc_single = 1; }
     // M2.6: bound guest glibc's malloc-arena count (reachable since the CLONE_SETTLS fix gave guest
     // threads their own TLS). Each new arena reserves 2*HEAP_MAX_SIZE = 128 MiB with mmap(PROT_NONE),
     // and Horizon's heap backend has NO overcommit — a reservation is committed RAM, and the unaligned

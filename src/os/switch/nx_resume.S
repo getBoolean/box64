@@ -61,9 +61,15 @@ nx_resume_native:
 	ldp	x28, x29, [x16, #(NX_RC_X + 0xE0)]
 	ldr	x30,      [x16, #(NX_RC_X + 0xF0)]
 
-	// --- branch to the (executable, rx) resume PC via x17 ---
+	// --- release the M2.6 exception slot (if any), then branch to the (executable, rx) resume PC.
+	// Order matters: BOTH ctx reads complete before the stlr frees the slot (the ctx lives on the
+	// dying slot stack), and SP was already restored off that stack above — after the stlr a
+	// concurrent claimant may immediately reuse the stack, but only registers are used from here.
 	ldr	x17, [x16, #NX_RC_PC]
-	br	x17
+	ldr	x16, [x16, #NX_RC_RELEASE]
+	cbz	x16, 1f
+	stlr	wzr, [x16]
+1:	br	x17
 
 	.size nx_resume_native, .-nx_resume_native
 

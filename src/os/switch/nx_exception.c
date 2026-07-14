@@ -1,9 +1,10 @@
 // box64-nx — Horizon userspace CPU-exception handler (M2.2c2): async guest-signal delivery.
 //
 // A real bad guest dereference / bad jump / self-modifying-code write faults as an ARM64 CPU exception
-// INSIDE dynarec-generated code. Horizon delivers such exceptions to a per-process userspace entry that
-// libnx's crt0 dispatches to the weak __libnx_exception_handler. By DEFINING it (non-weak) + enlarging
-// the exception stack + setting ignoredebug, we take over that path (instead of the kernel crash-report).
+// INSIDE dynarec-generated code. Horizon delivers such exceptions to a per-process userspace entry;
+// our STRONG __libnx_exception_entry (nx_exception_entry.S) replaces libnx's single-global-dump/-stack
+// entry with a per-fault {dump, stack} slot pool (M2.6 — concurrent faults from 32 guest threads no
+// longer corrupt each other), then hands the slot's dump to this C handler on the slot's stack.
 // NOTE: only real hardware delivers here — Ryujinx uses its own InvalidAccessHandler and never calls us.
 //
 // We reconstruct a Linux-aarch64 ucontext from the ThreadExceptionDump, classify the fault into an x86
@@ -23,6 +24,7 @@
 #include <switch.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ucontext.h>   // shim: Linux-aarch64 sigcontext/ucontext_t + fpsimd_context / FPSIMD_MAGIC
 
@@ -55,31 +57,149 @@ void my_sigactionhandler_oldcode(x64emu_t* emu, int32_t sig, int simple, x64_sig
 #define X64_BUS_ADRALN   1
 #define X64_ILL_ILLOPC   1
 
-// Override libnx's weak exception scaffolding. Bigger stack than the 0x400 default: our fault path
-// re-enters the dynarec to run the guest handler. ignoredebug=1 so the handler still runs when a
-// debugger/gdbstub is attached (Ryujinx attaches one — though it never delivers user faults here anyway).
-__attribute__((aligned(16))) u8 __nx_exception_stack[0x10000];
-u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
-u32 __nx_exception_ignoredebug = 1;
+// ---- M2.6 per-fault {dump, stack} slot pool -----------------------------------------------------
+// nx_exception_entry.S (our STRONG __libnx_exception_entry — with it linked, libnx exception.o and
+// its single global __nx_exceptiondump/__nx_exception_stack drop out of the link entirely) claims one
+// slot per in-flight fault, so 32 threads can take SMC faults simultaneously (stress -DSTRESS_SMC).
+// Storage is non-static so the .S reaches it PC-relative. kx_exc_single = the KX_EXC_SINGLE legacy
+// A/B gate (nx_main.c sets it from box64.env): slot 0 unconditionally, no claim/release bookkeeping.
+#include "nx_exc_pool.h"
+uint32_t kx_exc_single = 0;
+uint32_t kx_exc_owner[KX_EXC_NSLOTS];                 // 0=free, 1=claimed (entry asm ldaxr/stlxr)
+typedef struct { ThreadExceptionDump d; } __attribute__((aligned(16))) kx_exc_dump_t;
+_Static_assert(sizeof(kx_exc_dump_t) == KX_EXC_DUMPSZ, "KX_EXC_DUMPSZ != sizeof(ThreadExceptionDump) rounded to 16");
+kx_exc_dump_t kx_exc_dumps[KX_EXC_NSLOTS];
+__attribute__((aligned(16))) uint8_t kx_exc_stacks[KX_EXC_NSLOTS][KX_EXC_STKSZ];
+
+// Slot-release invariant (NEVER add a release before a siglongjmp: the longjmp tail still executes on
+// the slot's stack, and a concurrent claimant would write handler frames over the live frames). A
+// thread's claimed slots form a per-thread chain (nesting: a guest signal handler run by DynaCall ON
+// a slot stack can itself fault). Releases happen ONLY at three sites:
+//   1. handler entry (the SP-chain prune below): slots ABOVE the deepest chain stack the interrupted
+//      SP still lives on are provably abandoned (the only exits from a slot stack are siglongjmp —
+//      which abandons everything above the jmpbuf's frame — or nx_resume_native, which pops itself).
+//      NB a nested fault's siglongjmp can land in a DynaCall setjmp frame on a PARENT slot stack, so
+//      the prune must scan the whole chain for the SP, not just the top.
+//   2. the nx_resume.S tail (rc.release): a single stlr AFTER the last ctx read, right before `br`.
+//   3. nx_exc_thread_exit() (nx_posix.c clone trampoline): the exiting thread is off every slot stack.
+// A missed release only leaks a slot -> worst case pool exhaustion -> 0xf801 -> creport, never a hang.
+static __thread uint8_t exc_chain[KX_EXC_MAXDEPTH];
+static __thread int     exc_depth = 0;
+
+static int nx_exc_slot_of(ThreadExceptionDump* ctx) {
+    uintptr_t off = (uintptr_t)ctx - (uintptr_t)&kx_exc_dumps[0].d;
+    if (off % KX_EXC_DUMPSZ) return -1;
+    uintptr_t idx = off / KX_EXC_DUMPSZ;
+    return (idx < KX_EXC_NSLOTS) ? (int)idx : -1;
+}
+static int nx_exc_sp_in_slot(uintptr_t sp, int idx) {
+    uintptr_t base = (uintptr_t)kx_exc_stacks[idx];
+    return sp > base && sp <= base + KX_EXC_STKSZ;    // top==base+STKSZ is this slot's empty stack
+}
+static void nx_exc_release(int idx) {
+    __atomic_store_n(&kx_exc_owner[idx], 0, __ATOMIC_RELEASE);
+}
+// Called from nx_clone_trampoline after the guest thread's fn returns: off every slot stack by then.
+void nx_exc_thread_exit(void) {
+    if (kx_exc_single) return;
+    for (int i = 0; i < exc_depth; ++i) nx_exc_release(exc_chain[i]);
+    exc_depth = 0;
+}
+// Release site 2 setup: pop this fault's slot (the chain top — the entry prune pushed it) and hand
+// its owner-word address to the nx_resume.S tail, which stlr's it AFTER its last ctx read. 0 = none.
+static uint64_t nx_exc_pop_release(void) {
+    if (kx_exc_single || exc_depth <= 0) return 0;
+    int idx = exc_chain[--exc_depth];
+    return (uint64_t)(uintptr_t)&kx_exc_owner[idx];
+}
+
+// Per-fault SD-log throttle: every rlog line commits the SD filesystem — 6400 concurrent stress
+// faults would grind through fsdev and serialize the run. Full detail for the first 8 faults and
+// every 1024th after; KX_EXC_LOG=1 restores full logging. The UNHANDLED tail always logs.
+static uint32_t g_exc_total = 0;   // __atomic_fetch_add'd at handler entry
+static int nx_exc_log_all(void) {
+    static int e = -1;
+    if (e < 0) e = getenv("KX_EXC_LOG") ? 1 : 0;
+    return e;
+}
+
+// Unhandled-fault tail (+-exit guarantee): both give-up paths route here before returning to the
+// trampoline (-> svcBreak -> creport -> the am error dialog, A drops to HOME). When the fault PC is
+// in guest/JIT code (rw!=rx or a dynablock matched) the faulting thread cannot hold box64's console/
+// stdio locks, so on the MAIN thread it's safe to run the + hold first — the on-screen state stays
+// readable before the creport wipes it. nx_wait_for_exit_button self-gates (KX_WAIT_EXIT +
+// detectMesosphere + main thread only + once), so on a secondary thread / without the env it's a
+// no-op and we go straight to the crash report. A main-thread fault inside box64 C code skips the
+// hold (it may hold the very locks consoleUpdate needs — the dialog is still a user-driven exit).
+static void nx_exc_unhandled_tail(ThreadExceptionDump* ctx, void* cur_db, void* rx, void* rw,
+                                  int sig, int si_code, uintptr_t x64pc) {
+    {
+        char b[160];
+        int n = snprintf(b, sizeof b,
+            "nx_exc: UNHANDLED sig=%d code=%d addr=0x%llx db=%p x64pc=0x%llx -> crash report",
+            sig, si_code, (unsigned long long)ctx->far.x, cur_db, (unsigned long long)x64pc);
+        if (n > 0) nx_result_log(b);
+    }
+    if (rw != rx || cur_db) {
+        extern void nx_wait_for_exit_button(void);
+        nx_wait_for_exit_button();
+    }
+}
 
 // box64 arm64 register map (see CLAUDE.md crash-triage): cpu_gprs[0]=xEmu (emu ptr), [10..25]=RAX..R15,
 // [26]=xFlags, [27]=guest RIP (block-start). cpu_gprs[0..28] map 1:1 onto the Linux sigcontext regs[0..28].
 void __libnx_exception_handler(ThreadExceptionDump* ctx)
 {
+    // Log throttle (see nx_exc_log_all above): verbose for the first 8 faults + every 1024th after.
+    uint32_t nfault = __atomic_fetch_add(&g_exc_total, 1, __ATOMIC_RELAXED);
+    int verbose = nx_exc_log_all() || nfault < 8 || (nfault & 1023) == 0;
+
     // Result-file breadcrumb FIRST (the only HW-visible channel) so even a crash mid-handler leaves a trace.
-    {
+    if (verbose) {
         char b[192];
         int n = snprintf(b, sizeof b,
-            "nx_exc: desc=0x%x esr=0x%x far=0x%llx pc=0x%llx pstate=0x%x gRIP(x27)=0x%llx xFlags(x26)=0x%llx",
-            ctx->error_desc, ctx->esr, (unsigned long long)ctx->far.x, (unsigned long long)ctx->pc.x,
+            "nx_exc: #%u desc=0x%x esr=0x%x far=0x%llx pc=0x%llx pstate=0x%x gRIP(x27)=0x%llx xFlags(x26)=0x%llx",
+            nfault, ctx->error_desc, ctx->esr, (unsigned long long)ctx->far.x, (unsigned long long)ctx->pc.x,
             ctx->pstate, (unsigned long long)ctx->cpu_gprs[27].x, (unsigned long long)ctx->cpu_gprs[26].x);
         if (n > 0) nx_result_log(b);
+    }
+
+    // SP-chain prune (release site 1 — see the invariant at the pool definition): every chain slot
+    // ABOVE the deepest slot stack the interrupted SP still lives on is provably abandoned. SP on the
+    // guest/host stack (the common, non-nested case) -> the whole chain is abandoned. Then push this
+    // fault's slot. Depth overflow (8 nested faults = pathological) -> give up to the crash report;
+    // the current slot stays claimed, which is fine — we're dying.
+    if (!kx_exc_single) {
+        int slot = nx_exc_slot_of(ctx);
+        if (slot >= 0) {
+            int keep = 0;
+            for (int i = exc_depth - 1; i >= 0; --i)
+                if (nx_exc_sp_in_slot(ctx->sp.x, exc_chain[i])) { keep = i + 1; break; }
+            for (int i = keep; i < exc_depth; ++i) nx_exc_release(exc_chain[i]);
+            exc_depth = keep;
+            if (exc_depth >= KX_EXC_MAXDEPTH) {
+                nx_result_log("nx_exc: nested-fault depth cap hit — giving up to crash report");
+                return;
+            }
+            exc_chain[exc_depth++] = (uint8_t)slot;
+        }
+    }
+
+    // KX_EXC_MAX storm guard (default OFF — stress legitimately takes 6400 faults, Wine SMC loads
+    // millions; this is a soak/debug knob, not a limiter): total faults past the cap -> crash report.
+    {
+        static int cap = -1;
+        if (cap < 0) { const char* s = getenv("KX_EXC_MAX"); cap = s ? atoi(s) : 0; }
+        if (cap > 0 && nfault >= (uint32_t)cap) {
+            nx_result_log("nx_exc: KX_EXC_MAX fault cap exceeded — giving up to crash report");
+            return;
+        }
     }
 
     // KX_DIAG-A (temporary, DEREF-FREE): box64 .text anchor (symbolize the host fault PC of a nested crash)
     // + the live xEmu register (cpu_gprs[0]). Emitted BEFORE any structure walk (thread_get_emu / dynablock
     // lookup) so it survives even if THOSE nest-crash. Only channel that survives a 2nd fault.
-    {
+    if (verbose) {
         char b[192];
         int n = snprintf(b, sizeof b,
             "nx_exc2a: anchor=%p rx=0x%llx far=0x%llx x0=0x%llx lr(x30)=0x%llx sp=0x%llx fp(x29)=0x%llx",
@@ -113,9 +233,9 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     if ((uintptr_t)emu < 0x10000 || ((uintptr_t)emu & 7))   // 0x190 etc. are not valid emu pointers
         emu = thread_get_emu_no_create();
 
-    // 1) Synthesize a Linux-aarch64 ucontext (shim layout) from the dump. Thread-local so concurrent
-    //    guest-thread faults don't clobber each other (the libnx exception STACK is still shared — a known
-    //    limitation for now; the gate is single-fault).
+    // 1) Synthesize a Linux-aarch64 ucontext (shim layout) from the dump. Thread-local, and since M2.6
+    //    each concurrent fault also runs on its OWN pool slot's dump+stack (nx_exception_entry.S), so
+    //    32-way concurrent faults no longer clobber each other.
     static __thread ucontext_t uctx;
     memset(&uctx, 0, sizeof(uctx));
     for (int i = 0; i < 29; ++i) uctx.uc_mcontext.regs[i] = ctx->cpu_gprs[i].x;  // x0..x28
@@ -144,23 +264,31 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     uintptr_t x64pc = ctx->cpu_gprs[27].x;       // fallback: block-start guest RIP (x27)
     void* cur_db = NULL;
 #ifdef DYNAREC
-    // Only walk box64's (GLOBAL, unlocked) dynablock rbtree when we actually have an emu to deliver to.
-    // With no emu (corrupt xEmu / TLS-less exc ctx) the walk is both pointless AND race-prone: the OTHER
-    // guest thread may be mutating the tree concurrently -> rb_get_64 reads a NULL node (far=0x20) and the
-    // handler LOOPS re-faulting. Skip it; x64pc falls back to the block-start RIP (x27) for the diagnostic.
-    if (emu) {
+    // Walk box64's GLOBAL dynablock rbtree when we have an emu to deliver to. Prefer to hold
+    // mutex_dyndump (the lock every rbt_dynmem mutation — AllocDynarecMap/FreeDynarecMap via
+    // FillBlock/CancelBlock64 — takes): a locked walk can't race a concurrent rebalance into a NULL
+    // node (the far=0x20 nest-crash class). But a SINGLE non-blocking trylock only: a blocking lock
+    // risks self-deadlock+wedge (a box64 bug faulting inside a mutex_dyndump section would never
+    // release it), which would break the +-exit guarantee, and a long retry loop starves the SMC
+    // path under 32-way churn. On trylock failure we MUST still populate cur_db — an SMC write fault
+    // whose block we can't find becomes a fatal unhandled SIGSEGV — so degrade to the UNLOCKED walk
+    // (box64's long-standing behavior for emu!=NULL; the executing block is pinned by its in_used
+    // refcount and invalidation frees are zombie-deferred, so the race is narrow and non-fatal).
+    if (emu && my_context) {
+        int locked = (mutex_trylock(&my_context->mutex_dyndump) == 0);
         dynablock_t* db = FindDynablockFromNativeAddress(rw);
         if (db) {
             cur_db = db;
             uintptr_t gx = getX64Address(db, (uintptr_t)rw);
             if (gx) x64pc = gx;                  // precise faulting-instruction RIP
         }
+        if (locked) mutex_unlock(&my_context->mutex_dyndump);
     }
 #endif
 
     // KX_DIAG-B (temporary): the PRECISE guest RIP (getX64Address) + rw + db. If DIAG-A logged but DIAG-B
     // does not, the nest-crash is in the FindDynablock/getX64Address lookup (lines above).
-    {
+    if (verbose) {
         char b[160];
         int n = snprintf(b, sizeof b, "nx_exc2b: x64pc=0x%llx rw=%p db=%p",
             (unsigned long long)x64pc, rw, cur_db);
@@ -207,7 +335,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     // KX_DIAG (temporary): log the PRECISE guest RIP (getX64Address) + a box64 .text anchor (to symbolize
     // the nested-handler fault PC) + emu/db + the (process-GLOBAL) guest handler for this signal, BEFORE
     // the delivery path (which nest-crashes on real HW). This is the only channel that survives a 2nd fault.
-    {
+    if (verbose) {
         char b[192];
         uintptr_t hh = my_context ? (uintptr_t)my_context->signals[sig] : 0;
         int n = snprintf(b, sizeof b,
@@ -217,19 +345,30 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
         if (n > 0) nx_result_log(b);
     }
 
-    // Defensive same-address loop guard: if the EXACT same fault (fault address + guest RIP) recurs many
-    // times in a row, delivery isn't making progress (a delivery/resume bug) — bail to a crash report
-    // instead of hanging forever. Hanging a HOME-launched title can only be recovered by a reboot, so this
-    // safety net is worth keeping. A program that catches many DIFFERENT faults resets the counter.
+    // Defensive loop guard: if a fault recurs with NO forward progress, delivery/resume is broken —
+    // bail to a crash report instead of hanging forever (a hung HOME-launched title needs a reboot).
+    // (far, guest RIP) ALONE is not enough: a tight self-modifying-code loop (stress -DSTRESS_SMC:
+    // one page rewritten at one store site 200x) legitimately re-faults at an IDENTICAL (far, rip)
+    // every iteration — that is progress, not a stuck loop. The discriminator is whether the guest's
+    // store LANDS: read the word at the fault address (a WnR data-abort target is a mapped, at-least-R
+    // page, so this can't nest-fault) — a legit SMC loop advances that value each iteration, a truly
+    // stuck loop (store never lands / resume re-enters the same state) leaves it frozen. Only count a
+    // repeat when (far, rip, value) are ALL unchanged; any change resets. A program catching many
+    // DIFFERENT faults also resets.
     {
         static __thread uintptr_t last_far = ~0ULL, last_rip = ~0ULL;
+        static __thread uint32_t  last_val = 0;
         static __thread int repeat = 0;
-        if (ctx->far.x == last_far && x64pc == last_rip) {
+        uint32_t cur_val = 0;
+        if (((esr >> 6) & 1) /*WnR*/ && getProtection(ctx->far.x))
+            cur_val = *(volatile uint32_t*)ctx->far.x;   // store target — mapped, safe to read
+        if (ctx->far.x == last_far && x64pc == last_rip && cur_val == last_val) {
             if (++repeat >= 16) {
-                nx_result_log("nx_exc: same fault repeated 16x — delivery not progressing, giving up");
+                nx_result_log("nx_exc: same fault repeated 16x with no progress — giving up");
+                nx_exc_unhandled_tail(ctx, cur_db, rx, rw, sig, si_code, x64pc);
                 return;
             }
-        } else { last_far = ctx->far.x; last_rip = x64pc; repeat = 0; }
+        } else { last_far = ctx->far.x; last_rip = x64pc; last_val = cur_val; repeat = 0; }
     }
 
 #ifdef DYNAREC
@@ -277,6 +416,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             rc.pc   = uctx.uc_mcontext.pc;              // rx + 4 (executable resume target)
             rc.nzcv = uctx.uc_mcontext.pstate;
             for (int i = 0; i < 32; ++i) rc.v[i] = fpsimd->vregs[i];
+            rc.release = nx_exc_pop_release();          // slot freed by the .S tail after its last ctx read
             nx_resume_native(&rc);                      // reloads full state, branches to rx+4; NEVER returns
         }
     }
@@ -332,6 +472,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
                     rc.pc   = ctx->pc.x + 4;                     // rx + 4 (skip the UDF/NOP shadow slot)
                     rc.nzcv = uctx.uc_mcontext.pstate;
                     for (int i = 0; i < 32; ++i) rc.v[i] = fpsimd->vregs[i];
+                    rc.release = nx_exc_pop_release();           // slot freed by the .S tail after its last ctx read
                     nx_resume_native(&rc);                       // reloads full state, branches to rx+4; NEVER returns
                 } else if (emu->jmpbuf) {
                     // DIRTY (or in a HotPage): leave the stale block. Lift guest regs; a "loop" type also needs
@@ -367,14 +508,9 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             siglongjmp(emu->jmpbuf, 3);
     }
 
-    // Unhandled / default action: final breadcrumb, then return -> libnx -> svcBreak -> Horizon crash report.
-    {
-        char b[160];
-        int n = snprintf(b, sizeof b,
-            "nx_exc: UNHANDLED sig=%d code=%d addr=0x%llx db=%p x64pc=0x%llx -> crash report",
-            sig, si_code, (unsigned long long)ctx->far.x, cur_db, (unsigned long long)x64pc);
-        if (n > 0) nx_result_log(b);
-    }
+    // Unhandled / default action: breadcrumb (+ the main-thread + hold when safe), then return ->
+    // __kx_exception_returnentry -> svcBreak -> Horizon crash report.
+    nx_exc_unhandled_tail(ctx, cur_db, rx, rw, sig, si_code, x64pc);
 }
 
 #endif // __SWITCH__

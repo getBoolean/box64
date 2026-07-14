@@ -1256,6 +1256,9 @@ static void* nx_clone_trampoline(void* p) {
     thread_free_forgotten_emu();            // NULL the pthread key + FREE the ~64B wrapper. The emu was
                                             // already freed (destructor would double-free it), so we free the
                                             // orphaned emuthread_t here instead of leaking it every thread (M2.6).
+    { extern void nx_exc_thread_exit(void); nx_exc_thread_exit(); }   // release any exception slots this
+                                            // thread still holds (M2.6 pool, release site 3 — safe here: the
+                                            // exiting thread is off every slot stack once c->fn returned)
     free(c);
     g_nx_self = NULL;
     if (reap_enabled()) nx_reap_enqueue(pthread_self());   // JOINABLE: a later clone() joins us -> frees the slot

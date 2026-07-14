@@ -20,11 +20,12 @@
 #define __NX_RESUME_H__
 
 // Byte offsets into nx_resume_ctx_t, shared with nx_resume.S (which #includes this through cpp).
-#define NX_RC_X     0x000   // x[0]..x[30]  (31 * 8 = 0xF8 bytes)
-#define NX_RC_SP    0x0F8   // uint64_t sp
-#define NX_RC_PC    0x100   // uint64_t pc   (rx alias + delta — the executable resume target)
-#define NX_RC_NZCV  0x108   // uint64_t nzcv (pstate; only bits [31:28] applied via msr nzcv)
-#define NX_RC_V     0x110   // __uint128_t v[32]  (16-byte aligned)
+#define NX_RC_X       0x000   // x[0]..x[30]  (31 * 8 = 0xF8 bytes)
+#define NX_RC_SP      0x0F8   // uint64_t sp
+#define NX_RC_PC      0x100   // uint64_t pc   (rx alias + delta — the executable resume target)
+#define NX_RC_NZCV    0x108   // uint64_t nzcv (pstate; only bits [31:28] applied via msr nzcv)
+#define NX_RC_V       0x110   // __uint128_t v[32]  (16-byte aligned)
+#define NX_RC_RELEASE 0x310   // uint64_t release (0, or &kx_exc_owner[slot] — M2.6 exception-slot free)
 
 #ifndef __ASSEMBLER__
 
@@ -37,13 +38,16 @@ typedef struct nx_resume_ctx_s {
     uint64_t    pc;         // executable (rx) resume address
     uint64_t    nzcv;       // pstate; msr nzcv applies bits [31:28]
     __uint128_t v[32];      // v0..v31
+    uint64_t    release;    // M2.6: 0, or the exception slot's owner word — the .S stlr's it to 0
+                            // AFTER its last read of *c (the ctx lives on the dying slot stack)
 } nx_resume_ctx_t;
 
-_Static_assert(offsetof(nx_resume_ctx_t, x)    == NX_RC_X,    "nx_resume_ctx_t.x offset");
-_Static_assert(offsetof(nx_resume_ctx_t, sp)   == NX_RC_SP,   "nx_resume_ctx_t.sp offset");
-_Static_assert(offsetof(nx_resume_ctx_t, pc)   == NX_RC_PC,   "nx_resume_ctx_t.pc offset");
-_Static_assert(offsetof(nx_resume_ctx_t, nzcv) == NX_RC_NZCV, "nx_resume_ctx_t.nzcv offset");
-_Static_assert(offsetof(nx_resume_ctx_t, v)    == NX_RC_V,    "nx_resume_ctx_t.v offset");
+_Static_assert(offsetof(nx_resume_ctx_t, x)       == NX_RC_X,       "nx_resume_ctx_t.x offset");
+_Static_assert(offsetof(nx_resume_ctx_t, sp)      == NX_RC_SP,      "nx_resume_ctx_t.sp offset");
+_Static_assert(offsetof(nx_resume_ctx_t, pc)      == NX_RC_PC,      "nx_resume_ctx_t.pc offset");
+_Static_assert(offsetof(nx_resume_ctx_t, nzcv)    == NX_RC_NZCV,    "nx_resume_ctx_t.nzcv offset");
+_Static_assert(offsetof(nx_resume_ctx_t, v)       == NX_RC_V,       "nx_resume_ctx_t.v offset");
+_Static_assert(offsetof(nx_resume_ctx_t, release) == NX_RC_RELEASE, "nx_resume_ctx_t.release offset");
 
 // Restore the full guest machine state from *c and branch to c->pc. Never returns.
 void nx_resume_native(const nx_resume_ctx_t* c) __attribute__((noreturn));

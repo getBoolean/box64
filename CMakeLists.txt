@@ -500,6 +500,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch/nx_virtmem.c"
         "${BOX64_ROOT}/src/os/switch/emit_signal_switch.c"
         "${BOX64_ROOT}/src/os/switch/nx_exception.c"
+        "${BOX64_ROOT}/src/os/switch/nx_exception_entry.S"
         "${BOX64_ROOT}/src/os/switch/nx_resume.S"
         "${BOX64_ROOT}/src/os/switch/hostext_switch.c"
         "${BOX64_ROOT}/src/os/switch/random_switch.c"
