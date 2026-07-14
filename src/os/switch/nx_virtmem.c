@@ -482,9 +482,82 @@ static int nx_lowva_map_one(uintptr_t addr, size_t len) {
                                               // be relocated, so it must stay on the slab at its base) + the
                                               // tiny fixed pages (KUSER/TEB). Setting this too low bounces the
                                               // EXE -> Wine can't relocate it -> STATUS_DLL_NOT_FOUND.
+
+// The process ASLR region [asb, ase) — the only VA range svcControlCodeMemory MapOwner can target.
+static void nx_aslr_region(uintptr_t* pasb, uintptr_t* pase) {
+    static uintptr_t asb = 0, ase = 0;
+    if (!ase) {
+        u64 a = 0, s = 0;
+        svcGetInfo(&a, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&s, InfoType_AslrRegionSize,    CUR_PROCESS_HANDLE, 0);
+        asb = (uintptr_t)a; ase = (uintptr_t)(a + s);
+    }
+    *pasb = asb; *pase = ase;
+}
+
+// Honest low-VA reservation probing (M2.5, replaces the retired KX_WINE_LOWVA/preload_info handshake).
+// With wine_main_preload_info == NULL, wine-8.0 ntdll self-reserves the low Win32 window in virtual_init:
+// reserve_area() probes [0x10000,0x68000000) etc. with PROT_NONE MAP_FIXED_NOREPLACE|MAP_NORESERVE mmaps
+// and BINARY-SPLITS on failure (dlls/ntdll/unix/virtual.c:431-503,553-557), registering every success as
+// a reserved area. So the guest discovers the free holes ITSELF — provided each probe is answered from
+// the LIVE kernel map (box64's own NSO image + runtime allocations sit inside the low window at
+// ASLR-dependent spots; blindly accepting a probe over them makes Wine place views on top of box64).
+// Occupied or policy-refused -> EEXIST (MAP_FIXED_NOREPLACE's contract; Wine splits and retries smaller);
+// genuinely free -> the usual deferred-reservation success (no KCodeMemory cost).
+// Policy mirrors what the old hole list encoded: a margin off occupied regions (MapOwner 0xdc01 rejects a
+// range abutting an existing region) and a minimum hole size (tiny scattered reservations would scatter
+// Wine's views across many CodeMemory objects — the slab only has ~a dozen). The KUSER zone
+// [0x7ff00000,0x7fff0000) is exempt from both (it is <1 MiB total and Wine needs it for KUSER/TEB/PEB).
+#define NX_LOWVA_PROBE_MARGIN (1UL*1024*1024)
+#define NX_LOWVA_MIN_HOLE     (4UL*1024*1024)
+static int nx_no_lowva_probe(void) {   // KX_NO_LOWVA_PROBE=1: restore the old blind-accept (A/B escape hatch)
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("KX_NO_LOWVA_PROBE"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+static int nx_lowva_range_free(uintptr_t base, size_t len) {
+    uintptr_t a = base;
+    while (a < base + len) {
+        MemoryInfo mi; u32 pi;
+        if (R_FAILED(svcQueryMemory(&mi, &pi, a))) return 0;
+        if ((mi.type & 0xff) != 0) return 0;               // MemType 0 = Unmapped = free
+        uintptr_t rend = mi.addr + mi.size;
+        if (rend <= a) return 0;                           // no progress -> treat as occupied
+        a = rend;
+    }
+    return 1;
+}
+
 static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot, int flags) {
-    if (nx_lowva_covered((uintptr_t)addr, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
     uintptr_t base = (uintptr_t)addr;
+
+    // ntdll reservation PROBE (PROT_NONE + MAP_FIXED_NOREPLACE): answer honestly from the kernel map.
+    // Runs BEFORE the slab-pressure bounce below — a probe must never be bounced (by the time the cmd.exe
+    // client's virtual_init runs, live >= NX_LOWVA_RELOC_THRESH, and bouncing every probe at every split
+    // size leaves ntdll with NO reserved areas -> scattered ad-hoc commits -> slab exhaustion -> c000000d,
+    // the 2026-07-13 regression). Forced PROT_NONE maps (MAP_FIXED without NOREPLACE — Wine re-reserving
+    // inside an area it already owns, e.g. decommit-to-reserved) keep the legacy accept path below.
+    if (!(prot & (PROT_READ | PROT_WRITE)) && (flags & MAP_FIXED_NOREPLACE) && !nx_no_lowva_probe()) {
+        uintptr_t asb, ase;
+        nx_aslr_region(&asb, &ase);
+        if (ase && (base < asb || base + rounded > ase)) { errno = ENOMEM; return MAP_FAILED; }
+        int kuser = (base >= 0x7ff00000UL && base + rounded <= 0x7fff0000UL);
+        if (!kuser && rounded < NX_LOWVA_MIN_HOLE) { errno = EEXIST; return MAP_FAILED; }
+        size_t margin = kuser ? 0 : NX_LOWVA_PROBE_MARGIN;
+        uintptr_t pb = (base > margin) ? base - margin : 0;
+        if (nx_lowva_covered(base, rounded) || !nx_lowva_range_free(pb, (base + rounded + margin) - pb)) {
+            errno = EEXIST; return MAP_FAILED;
+        }
+        nx_lowva_resv_track(base, rounded);
+        static int resv_logged = 0;
+        if (resv_logged < 8) { resv_logged++; char b[96];
+            int n = snprintf(b, sizeof b, "nx_vm: resv probe ok 0x%lx+0x%lx",
+                             (unsigned long)base, (unsigned long)rounded);
+            if (n > 0) nx_result_log(b); }
+        return addr;
+    }
+
+    if (nx_lowva_covered(base, rounded)) { memset(addr, 0, rounded); nx_kuser_fixup(addr, rounded); return addr; }
 
     // KCodeMemory-slab relief — THE cmd.exe-on-real-HW fix. A PE image reservation uses MAP_FIXED_NOREPLACE
     // ("map here if free, else fail and I'll cope"); Wine's virtual_map_image retries the mapping at NULL
@@ -513,13 +586,8 @@ static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot, int flags)
     // (virtual_alloc_first_teb -> "failed to map the shared user data: c000000d" -> exit(1)). Wine tolerates
     // a failed reservation, so reject out-of-region low VAs immediately and keep the budget for real maps.
     {
-        static uintptr_t asb = 0, ase = 0;
-        if (!ase) {
-            u64 a = 0, s = 0;
-            svcGetInfo(&a, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
-            svcGetInfo(&s, InfoType_AslrRegionSize,    CUR_PROCESS_HANDLE, 0);
-            asb = (uintptr_t)a; ase = (uintptr_t)(a + s);
-        }
+        uintptr_t asb, ase;
+        nx_aslr_region(&asb, &ase);
         if (ase && (base < asb || base + rounded > ase)) { errno = ENOMEM; return MAP_FAILED; }
     }
 
@@ -531,28 +599,39 @@ static void* nx_map_lowva_fixed(void* addr, size_t rounded, int prot, int flags)
     // Coalesce the backing to a COARSE-aligned window so ADJACENT commits (esp. separate Wine DLL images,
     // each its own reservation) share ONE large CodeMemory object — critical because the KCodeMemory slab
     // is ~a dozen system-wide and cmd.exe pulls in ~8 DLLs. We do NOT clip to base's reservation (that
-    // stops adjacent reservations from merging); box64's own regions live in the HIGH ASLR area, never in
-    // this low Win32 window, so a low-VA window can't collide with them. The per-page backing loop below
-    // skips any already-mapped page, so overlapping an earlier window is harmless. Clip only to the ASLR
-    // region, and always cover the whole request.
+    // stops adjacent reservations from merging). box64's own NSO image + runtime allocations CAN sit in
+    // this low Win32 window (ASLR-dependent — ~0x8.5M on Ryujinx), so the backing loop below consults the
+    // kernel map and skips occupied pages (a window overlapping box64's image must not churn MapOwner
+    // failures against it). The loop also skips already-backed pages (a commit's window routinely OVERLAPS
+    // an earlier window). Clip only to the ASLR region, and always cover the whole request.
     uintptr_t wbeg = base & ~(NX_LOWVA_COALESCE - 1);
     uintptr_t wend = (base + rounded + NX_LOWVA_COALESCE - 1) & ~(NX_LOWVA_COALESCE - 1);
     if (wbeg > base) wbeg = base;
     if (wend < base + rounded) wend = base + rounded;
-    { static uintptr_t asb = 0, ase = 0;
-      if (!ase) { u64 a=0,s=0; svcGetInfo(&a,InfoType_AslrRegionAddress,CUR_PROCESS_HANDLE,0);
-                  svcGetInfo(&s,InfoType_AslrRegionSize,CUR_PROCESS_HANDLE,0); asb=(uintptr_t)a; ase=(uintptr_t)(a+s); }
+    { uintptr_t asb, ase;
+      nx_aslr_region(&asb, &ase);
       if (ase) { if (wbeg < asb) wbeg = asb; if (wend > ase) wend = ase; } }
 
-    // Back the window, skipping already-mapped PAGES (a commit's window routinely OVERLAPS an earlier
-    // window — Wine commits ranges that straddle regions we already backed; mapping over an occupied page
-    // fails MapOwner). Map each contiguous UNCOVERED run as one object (adaptive-shrink if MapOwner balks).
+    // Back the window, skipping already-backed pages and kernel-occupied regions. Map each contiguous
+    // FREE run as one object (adaptive-shrink if MapOwner balks).
     int orig_ok = 1;
     uintptr_t p = wbeg;
     while (p < wend && !g_lowva_slab_full) {
-        if (nx_lowva_covered(p, VM_PAGE)) { p += VM_PAGE; continue; }   // already backed
-        uintptr_t q = p + VM_PAGE;                                      // extent of the uncovered run
-        while (q < wend && (q - p) < NX_LOWVA_CHUNK && !nx_lowva_covered(q, VM_PAGE)) q += VM_PAGE;
+        if (nx_lowva_covered(p, VM_PAGE)) { p += VM_PAGE; continue; }   // already backed by us
+        uintptr_t free_end = wend;                                      // kernel-map check: skip occupied
+        { MemoryInfo mi; u32 pi;                                        // regions (box64's image etc.)
+          if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, p))) {
+              uintptr_t rend = mi.addr + mi.size;
+              if ((mi.type & 0xff) != 0) {                              // occupied, not ours
+                  if (rend > wend) rend = wend;
+                  if (p < base + rounded && rend > base) orig_ok = 0;   // overlaps the REQUEST -> honest fail
+                  p = (rend > p) ? rend : p + VM_PAGE;
+                  continue;
+              }
+              if (rend < free_end) free_end = rend;                     // bound the run to the free region
+          } }
+        uintptr_t q = p + VM_PAGE;                                      // extent of the mappable run
+        while (q < free_end && (q - p) < NX_LOWVA_CHUNK && !nx_lowva_covered(q, VM_PAGE)) q += VM_PAGE;
         size_t m = q - p;
         while (m >= VM_PAGE && !g_lowva_slab_full && nx_lowva_map_one(p, m) != 0)
             m = (m > VM_PAGE) ? ((m >> 1) & ~VM_PAGEMASK) : 0;
