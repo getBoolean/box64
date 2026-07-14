@@ -1214,15 +1214,11 @@ long syscall(long number, ...) {
 // A DETACHED host thread leaks its Horizon thread-ResourceLimit slot (only threadClose, reached via
 // pthread_join, frees it) -> svcCreateThread LimitReached after ~600 lifecycles -> pthread_create
 // EPERM. So we run guest threads JOINABLE and reap them with a plain pthread_join at the next clone().
-// The "reaper corrupts the guest heap" episode had TWO real causes, neither of them pthread_join:
-//   (1) guest threads ran on the PARENT's guest TLS (CLONE_SETTLS never applied -> shared glibc
-//       tcache/thread_arena; fixed in x64syscall.c case 56) — the reaper only correlated because
-//       joining let arena.c live past the ~600-lifecycle slot cap into 4800 lifecycles of exposure;
-//   (2) libnx threadCreate allocated stack_sz+tls_sz+reent_sz but mapped/unmapped the page-ROUNDED
-//       size, so teardown reprotected up to ~0xFFF bytes of the ADJACENT newlib chunk (fixed in the
-//       libnx fork, nx/source/kernel/thread.c — allocation now covers the mapped range).
-// With both fixed, join-reaping is clean on real HW (arena.c 4800 lifecycles x5 + stress x32 green).
-// Reaper is ON by default; set KX_NO_REAP to opt out (restores the leak for A/B).
+// This is safe as long as guest threads get their OWN glibc TLS: CLONE_SETTLS must reach the child emu
+// (x64syscall.c case 56), else all threads share the parent's tcache/thread_arena and the shared-arena
+// race corrupts the guest heap (it looked like a join-reaper bug because joining is what let arena.c
+// run long enough — 4800 lifecycles — to expose it). Clean on real HW (arena 4800 lifecycles + stress
+// x32 green). Reaper is ON by default; set KX_NO_REAP to opt out (restores the leak for A/B).
 #define NX_TPOOL_MAX  640            // > the ~600 thread ceiling -> the reap queue never overflows
 static pthread_t g_reap[NX_TPOOL_MAX];
 static int       g_reap_n = 0;
