@@ -66,9 +66,15 @@ static void nx_guest_log_raw(const void *buf, size_t len) {
     static size_t pending = 0;
     static u64 last_commit = 0;
     mutexLock(&mtx);
-    if (log_fd == -2)
-        log_fd = getenv("KX_GUEST_LOG")
-            ? open("sdmc:/box64/box64-guest.log", O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+    if (log_fd == -2) {
+        if (getenv("KX_GUEST_LOG")) {
+            log_fd = open("sdmc:/box64/box64-guest.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            // Loud failure: a host-side stale handle on the log (e.g. a killed emulator's
+            // crash-handler child inheriting it) makes this open fail — without this marker
+            // the log just silently stays stale and the harness misreads the run.
+            if (log_fd < 0) rlog("nx: KX_GUEST_LOG open FAILED — guest log disabled this run");
+        } else log_fd = -1;
+    }
     if (log_fd >= 0) {
         write(log_fd, buf, len);
         pending += len;
