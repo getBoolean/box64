@@ -70,13 +70,21 @@ typedef struct {
 #define NX_SHOBJ_MAX 48
 static shobj_t g_sh[NX_SHOBJ_MAX];
 
+// VK_DIR entry snapshot: read at open (opendir -> readdir all -> closedir immediately) so an open
+// dir vfd holds NO persistent fsdev directory handle. Horizon's per-session FS handle limit is low
+// (~30 concurrent open dirs exhausted it, making later file opens — the .reg registry files — fail
+// ENOSYS: the ntdll:directory flaky-hang / registry-save livelock).
+typedef struct { char name[256]; unsigned char type; } nx_dent_t;
+
 typedef struct {
     vkind_t  kind;
     int      refs;
     int      nonblock;
     unsigned ino;                 // synthetic identity for fstat
     // VK_DIR
-    DIR*     d;
+    DIR*     d;                   // legacy (unused now the snapshot is read at open)
+    nx_dent_t* dents;             // snapshot (malloc'd); NULL until first getdents
+    int      dent_n, dent_i;      // snapshot count, current read index
     char     host[512];
     char     guest[512];
     // VK_PIPE / VK_SOCK: inbound ring (the PEER writes into it)
@@ -221,50 +229,59 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
     if (v->kind != VK_DIR) { errno = ENOTDIR; return -1; }
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
       if (on) vlog("nx_vfd: GETDENTS pid=%d fd=%d dir='%s'\n", nx_guest_pid(), fd, v->guest); }
-    if (!v->d) { v->d = opendir(v->host); if (!v->d) { errno = ENOENT; return -1; } }
-    uint8_t* out = (uint8_t*)ubuf; size_t off = 0; long ord = 1;
-    for (;;) {
-        struct dirent* e = readdir(v->d);
-        if (!e) break;
-        size_t nl = strlen(e->d_name);
-        size_t rl = (19 + nl + 1 + 7) & ~(size_t)7;
-        if (off + rl > count) {
-            // no space left: readdir has no pushback on fsdev, so the entry is dropped for this
-            // pass (Wine/glibc read with 4KB+ buffers — a single entry always fits in practice);
-            // if we couldn't fit even one, report EINVAL like Linux
-            if (off == 0) { errno = EINVAL; return -1; }
-            break;
-        }
-        *(uint64_t*)(out + off)      = v->ino + (unsigned)ord;
-        *(int64_t*) (out + off + 8)  = ord++;
-        *(uint16_t*)(out + off + 16) = (uint16_t)rl;
-        unsigned char t = 0;                 // DT_UNKNOWN
+    // Snapshot the directory ONCE on the first getdents (opendir -> readdir all -> closedir), so the
+    // open dir vfd holds NO persistent fsdev handle. Serve subsequent getdents from the buffer.
+    if (!v->dents) {
+        DIR* d = opendir(v->host);
+        if (!d) { errno = ENOENT; return -1; }
+        int cap = 64;
+        v->dents = (nx_dent_t*)malloc((size_t)cap * sizeof(nx_dent_t));
+        if (!v->dents) { closedir(d); errno = ENOMEM; return -1; }
+        v->dent_n = 0; v->dent_i = 0;
+        struct dirent* e;
+        while ((e = readdir(d))) {
+            if (v->dent_n == cap) {
+                int nc = cap * 2;
+                nx_dent_t* nn = (nx_dent_t*)realloc(v->dents, (size_t)nc * sizeof(nx_dent_t));
+                if (!nn) break;                  // OOM: serve what we captured
+                v->dents = nn; cap = nc;
+            }
+            snprintf(v->dents[v->dent_n].name, sizeof v->dents[0].name, "%s", e->d_name);
+            unsigned char t = 0;                 // DT_UNKNOWN
 #ifdef DT_DIR
-        if (e->d_type == DT_DIR) t = 4; else if (e->d_type == DT_REG) t = 8;
+            if (e->d_type == DT_DIR) t = 4; else if (e->d_type == DT_REG) t = 8;
 #endif
-        out[off + 18] = t;
-        memcpy(out + off + 19, e->d_name, nl + 1);
-        off += rl;
-    }
-    // M2.5: Windows can't create files named "z:"/"c:" (reserved colon) on the SD, so synthesize the
-    // DOS-drive entries when Wine enumerates $WINEPREFIX/dosdevices — it then readlink()s each (see
-    // nx_readlink_common: z:->/, c:->../drive_c) to map the drives. Emit once (v->fpos as a guard).
-    if (!v->fpos) {
+            v->dents[v->dent_n].type = t;
+            v->dent_n++;
+        }
+        closedir(d);                             // release the fsdev handle NOW
+        // M2.5: Windows can't create "z:"/"c:" files on the SD, so synthesize the DOS-drive entries
+        // for a $WINEPREFIX/dosdevices dir; Wine readlink()s each (z:->/, <x>:->drive_<x>).
         size_t gl = strlen(v->guest);
         if (gl >= 11 && !strcmp(v->guest + gl - 11, "/dosdevices")) {
             static const char* drives[] = { "z:", "c:" };
-            for (int k = 0; k < 2; k++) {
-                size_t nl = 2, rl = (19 + nl + 1 + 7) & ~(size_t)7;
-                if (off + rl > count) break;
-                *(uint64_t*)(out + off)     = v->ino + 1000 + k;
-                *(int64_t*) (out + off + 8) = ord++;
-                *(uint16_t*)(out + off + 16)= (uint16_t)rl;
-                out[off + 18] = 10;              // DT_LNK (a symlink — Wine readlinks it)
-                memcpy(out + off + 19, drives[k], nl + 1);
-                off += rl;
+            for (int k = 0; k < 2 && v->dent_n < cap; k++) {
+                snprintf(v->dents[v->dent_n].name, sizeof v->dents[0].name, "%s", drives[k]);
+                v->dents[v->dent_n].type = 10;   // DT_LNK
+                v->dent_n++;
             }
         }
-        v->fpos = 1;                             // synthetic entries emitted (only on the first getdents)
+    }
+    // Serve buffered entries into the caller's getdents64 buffer (Linux layout: d_ino u64, d_off s64,
+    // d_reclen u16, d_type u8, name...). d_off is an opaque cookie; Wine/glibc read sequentially.
+    uint8_t* out = (uint8_t*)ubuf; size_t off = 0;
+    while (v->dent_i < v->dent_n) {
+        const char* name = v->dents[v->dent_i].name;
+        size_t nl = strlen(name);
+        size_t rl = (19 + nl + 1 + 7) & ~(size_t)7;
+        if (off + rl > count) { if (off == 0) { errno = EINVAL; return -1; } break; }
+        *(uint64_t*)(out + off)      = v->ino + (unsigned)(v->dent_i + 1);
+        *(int64_t*) (out + off + 8)  = (int64_t)(v->dent_i + 1);
+        *(uint16_t*)(out + off + 16) = (uint16_t)rl;
+        out[off + 18] = v->dents[v->dent_i].type;
+        memcpy(out + off + 19, name, nl + 1);
+        off += rl;
+        v->dent_i++;
     }
     return (long)off;
 }
@@ -427,7 +444,7 @@ int nx_vfd_close(int fd) {
         if (v->kind == VK_LOCK && o->lock_owner == nx_guest_pid()) o->lock_owner = 0;
         if (o->refs > 0) o->refs--;   // keep mem/lock alive while other fds reference it
     }
-    if (v->kind == VK_DIR && v->d) closedir(v->d);
+    if (v->kind == VK_DIR) { if (v->d) closedir(v->d); free(v->dents); }
     if ((v->kind == VK_PIPE || v->kind == VK_SOCK) && v->peer >= 0 && g_v[v->peer].kind != VK_FREE)
         g_v[v->peer].peer = -1;              // peer sees EOF/EPIPE
     if (v->kind == VK_LISTEN)
