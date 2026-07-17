@@ -984,6 +984,15 @@ long syscall(long number, ...) {
             if (a2 & O_DIRECTORY) { errno = ENOTDIR; return -1; }        // O_DIRECTORY on a non-dir
 #endif
             int fd = open(hp, (int)a2, (mode_t)a3);
+            // Robust registry save: if a reg<pid>.tmp open FAILS (the raw fsdev open can transiently
+            // return ENOSYS under shared-fd-table pressure — e.g. during a big dir enumeration), fall
+            // back to a write-discard SINK vfd so the wineserver's periodic flush COMPLETES instead of
+            // looping forever (the mark-after-open nerf never engaging -> registry-save livelock;
+            // `directory` hung ~1/6). Only on FAILURE — a successful open keeps the real-fd path (+ its
+            // existing write-discard nerf) unchanged, so cmd.exe's save is untouched. The reg*.tmp->*.reg
+            // rename is already short-circuited (nx_rename_guest); registry persistence is irrelevant here.
+            if (fd < 0) { extern int nx_regtmp_name(const char*); extern int nx_vfd_open_sink(void);
+                          if (nx_regtmp_name(p)) return nx_vfd_open_sink(); }
             // HW-visible diagnostic (KX_STATLOG): temp-file opens (the file test's GetTempFileName
             // create + FILE_APPEND_DATA reopen). rlog goes to box64-result.txt, which real HW captures
             // (svcOutputDebugString / nx_warnf do NOT). Bounded to temp paths so it can't flood.

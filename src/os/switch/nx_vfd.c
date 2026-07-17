@@ -54,7 +54,8 @@ static void vlog(const char* fmt, ...) {
 // in-process wineserver share. fsdev can't open the same file from both instances (2nd open -> EIO)
 // and file-backed mmap copies per instance, so back them with IN-PROCESS shared state keyed by path.
 typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN, VK_LOCK, VK_SHMEM,
-               VK_EPOLL, VK_TAKEN } vkind_t;   // TAKEN: slot_alloc'd, kind not yet set (never escapes g_mx)
+               VK_EPOLL, VK_SINK, VK_TAKEN } vkind_t;  // SINK: write-discard sink (reg*.tmp);
+               // TAKEN: slot_alloc'd, kind not yet set (never escapes g_mx)
 
 typedef struct { int fd; uint64_t at; } fdpass_t;
 
@@ -186,6 +187,24 @@ int nx_vfd_open_dir(const char* guest, const char* host) {
     return NX_VFD_BASE + i;
 }
 
+// A write-discard sink vfd. The wineserver's periodic registry flush writes each branch to a
+// reg<pid>.tmp then renames it over the .reg — but registry PERSISTENCE is irrelevant to the
+// tests, and doing the real save is both slow (fsdev) AND fragile: the raw open() of a reg file
+// can transiently FAIL (e88/ENOSYS — seen under the shared-fd-table pressure of a big dir
+// enumeration), and the existing "discard the writes" nerf never engages because it only marks a
+// reg*.tmp fd AFTER a successful open — so the failed open loops forever (registry-save livelock:
+// `directory` hung ~1/6). Routing reg*.tmp to a SINK vfd makes the open ALWAYS succeed WITHOUT
+// consuming a scarce newlib fd: writes are dropped, read is EOF, and the reg*.tmp->*.reg rename is
+// already short-circuited (nx_rename_guest). The real .reg files stay intact for a fast next-run.
+int nx_vfd_open_sink(void) {
+    pthread_mutex_lock(&g_mx);
+    int i = slot_alloc();
+    if (i < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
+    g_v[i].kind = VK_SINK;
+    pthread_mutex_unlock(&g_mx);
+    return NX_VFD_BASE + i;
+}
+
 const char* nx_vfd_dir_host(int fd)  { return nx_vfd_is(fd) ? V(fd)->host  : NULL; }
 const char* nx_vfd_dir_guest(int fd) { return nx_vfd_is(fd) ? V(fd)->guest : NULL; }
 
@@ -273,7 +292,9 @@ int nx_vfd_stat(int fd, struct stat* st) {
     memset(st, 0, sizeof *st);
     st->st_dev = 1; st->st_ino = v->ino; st->st_nlink = 1;
     st->st_blksize = 4096;
-    if (v->kind == VK_SHMEM || v->kind == VK_LOCK) {
+    if (v->kind == VK_SINK) {
+        st->st_mode = S_IFREG | 0600; st->st_size = 0;   // discard sink (reg*.tmp): empty regular file
+    } else if (v->kind == VK_SHMEM || v->kind == VK_LOCK) {
         st->st_mode = S_IFREG | 0600;
         st->st_size = (v->shobj >= 0) ? (off_t)g_sh[v->shobj].size : 0;
     } else {
@@ -348,6 +369,7 @@ static int shmem_ensure(shobj_t* o, size_t need) {   // g_mx held
 }
 
 int nx_vfd_ftruncate(int fd, off_t len) {
+    if (nx_vfd_is(fd) && V(fd)->kind == VK_SINK) { (void)len; return 0; }   // discard sink: accept
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = EINVAL; return -1; }
     pthread_mutex_lock(&g_mx);
     int r = shmem_ensure(&g_sh[V(fd)->shobj], (size_t)len);
@@ -369,6 +391,7 @@ void* nx_vfd_mmap(int fd, size_t length, off_t offset) {
 }
 
 long nx_vfd_lseek(int fd, off_t off, int whence) {
+    if (nx_vfd_is(fd) && V(fd)->kind == VK_SINK) return (whence == 0) ? (long)off : 0;  // sink: accept
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = ESPIPE; return -1; }
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd); shobj_t* o = &g_sh[v->shobj];
@@ -423,6 +446,7 @@ int nx_vfd_close(int fd) {
 
 long nx_vfd_read(int fd, void* buf, size_t n) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    if (V(fd)->kind == VK_SINK) { (void)buf; (void)n; return 0; }   // discard sink: always EOF
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, buf, n, 0);
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
@@ -457,6 +481,7 @@ long nx_vfd_write(int fd, const void* buf, size_t n) {
         if (on) { int rq = *(const int*)buf; if (rq > 0 && rq < 256)
             vlog("nx_vfd: REQ pid=%d fd=%d code=%d n=%zu\n", nx_guest_pid(), fd, rq, n); }
     }
+    if (V(fd)->kind == VK_SINK) return (long)n;   // discard sink (reg*.tmp): drop the bytes
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
       if (on) vlog("nx_vfd: VW pid=%d tid=%d fd=%d peer=%d n=%zu\n", nx_guest_pid(), nx_gettid(), fd, V(fd)->peer, n); }
@@ -494,6 +519,7 @@ long nx_vfd_writev(int fd, const void* iov, int iovcnt) {
     for (int i = 0; i < iovcnt; i++) if (v[i].base) want += v[i].len;
     if (!want) return 0;
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    if (V(fd)->kind == VK_SINK) return (long)want;   // discard sink (reg*.tmp): drop the bytes
     // Trace the request code (first int of the first iov = wine request_header.req) — the loop that
     // wedges the client uses writev, not write, so the nx_vfd_write REQ log misses it.
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
