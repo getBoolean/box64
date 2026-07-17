@@ -35,6 +35,7 @@
 extern int  nx_translate_path(const char* p, char* out, size_t outn);
 extern char* nx_cwd_buf(void);   // nx_posix.c — per-instance guest cwd
 extern int  nx_guest_pid(void);
+extern int  nx_gettid(void);     // nx_posix.c — guest thread id (for per-thread IPC tracing)
 void nx_guest_output(int fd, const void *buf, size_t len);   // nx_main.c
 
 static void vlog(const char* fmt, ...) {
@@ -440,8 +441,8 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
         if (v->peer < 0 || v->rd_shut) { pthread_mutex_unlock(&g_mx); return 0; }  // EOF (peer closed or shutdown(SHUT_WR))
         if (v->nonblock) { pthread_mutex_unlock(&g_mx); errno = EAGAIN; return -1; }
         { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
-          if (on) vlog("nx_vfd: RDBLK pid=%d fd=%d kind=%d peer=%d n=%zu\n",
-                       nx_guest_pid(), fd, (int)v->kind, v->peer, n); }
+          if (on) vlog("nx_vfd: RDBLK pid=%d tid=%d fd=%d kind=%d peer=%d n=%zu\n",
+                       nx_guest_pid(), nx_gettid(), fd, (int)v->kind, v->peer, n); }
         pthread_cond_wait(&g_cv, &g_mx);
     }
 }
@@ -458,7 +459,7 @@ long nx_vfd_write(int fd, const void* buf, size_t n) {
     }
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
-      if (on) vlog("nx_vfd: VW pid=%d fd=%d peer=%d n=%zu\n", nx_guest_pid(), fd, V(fd)->peer, n); }
+      if (on) vlog("nx_vfd: VW pid=%d tid=%d fd=%d peer=%d n=%zu\n", nx_guest_pid(), nx_gettid(), fd, V(fd)->peer, n); }
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
     if (v->kind != VK_PIPE && v->kind != VK_SOCK) { pthread_mutex_unlock(&g_mx); errno = EINVAL; return -1; }
