@@ -984,6 +984,16 @@ long syscall(long number, ...) {
             if (a2 & O_DIRECTORY) { errno = ENOTDIR; return -1; }        // O_DIRECTORY on a non-dir
 #endif
             int fd = open(hp, (int)a2, (mode_t)a3);
+            // HW-visible diagnostic (KX_STATLOG): temp-file opens (the file test's GetTempFileName
+            // create + FILE_APPEND_DATA reopen). rlog goes to box64-result.txt, which real HW captures
+            // (svcOutputDebugString / nx_warnf do NOT). Bounded to temp paths so it can't flood.
+            { static int on = -1; if (on < 0) on = getenv("KX_STATLOG") ? 1 : 0;
+              if (on && (strstr(p, "foo") || strstr(p, ".tmp") || strstr(p, "Temp") || strstr(p, "/tmp/"))) {
+                  extern void nx_result_log(const char*);
+                  char lb[240]; snprintf(lb, sizeof lb, "nx_open: pid=%d '%s' flags=0x%lx mode=0%o -> fd=%d errno=%d",
+                      nx_guest_pid(), p, (unsigned long)a2, (unsigned)a3, fd, fd < 0 ? errno : 0);
+                  nx_result_log(lb);
+              } }
             if (fd < 0) { nx_warnf("nx: openat '%s' -> '%s' FAIL e=%d\n", p, hp, errno); return -1; }
             nx_warnf("nx: openat '%s' -> '%s' fd=%d\n", p, hp, fd);
             // Fast registry save: mark a wineserver reg*.tmp fd so its writes are discarded (the file
