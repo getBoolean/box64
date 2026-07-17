@@ -53,7 +53,7 @@ static void vlog(const char* fmt, ...) {
 // in-process wineserver share. fsdev can't open the same file from both instances (2nd open -> EIO)
 // and file-backed mmap copies per instance, so back them with IN-PROCESS shared state keyed by path.
 typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN, VK_LOCK, VK_SHMEM,
-               VK_TAKEN } vkind_t;   // TAKEN: slot_alloc'd, real kind not yet set (never escapes g_mx)
+               VK_EPOLL, VK_TAKEN } vkind_t;   // TAKEN: slot_alloc'd, kind not yet set (never escapes g_mx)
 
 typedef struct { int fd; uint64_t at; } fdpass_t;
 
@@ -92,6 +92,9 @@ typedef struct {
     // VK_LOCK / VK_SHMEM
     int      shobj;               // index into g_sh
     size_t   fpos;                // per-fd position (shmem read/write/lseek)
+    // VK_EPOLL: the interest set (lazy). Each entry is a watched fd + its epoll events + user data.
+    void*    epset;               // struct nx_epitem[ep_cap]
+    int      ep_n, ep_cap;
 } vfd_t;
 
 static vfd_t g_v[NX_VFD_MAX];
@@ -407,6 +410,7 @@ int nx_vfd_close(int fd) {
         for (int i = 0; i < v->backlog_n; i++)
             if (g_v[v->backlog[i]].kind != VK_FREE) { g_v[v->backlog[i]].refs = 0; g_v[v->backlog[i]].kind = VK_FREE; }
     free(v->buf);
+    if (v->kind == VK_EPOLL) free(v->epset);
     for (int i = 0; i < v->fdq_n; i++)       // unclaimed passed fds: drop our reference
         if (nx_vfd_is(v->fdq[i].fd)) { pthread_mutex_unlock(&g_mx); nx_vfd_close(v->fdq[i].fd); pthread_mutex_lock(&g_mx); }
     memset(v, 0, sizeof *v);
@@ -892,6 +896,98 @@ int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
     }
 }
 
+// ---- epoll (vfd) ---------------------------------------------------------------------------------
+// A VK_EPOLL vfd holds an interest set; epoll_wait builds an l_pollfd array and reuses nx_poll (which
+// already handles vfd readiness + the condvar block/timeout). Linux x86-64 struct epoll_event is
+// PACKED: uint32 events; then an 8-byte data union (no padding) = 12 bytes. Wine (fsync/wineserver
+// select path) and glibc use epoll; ENOSYS forced the poll() fallback, which works but this closes
+// the gap. Levels only (EPOLLET/oneshot are ignored — a spurious extra wake is harmless for a
+// re-poll loop, and Wine re-arms each iteration).
+typedef struct { int fd; unsigned events; unsigned long long data; } nx_epitem;
+#pragma pack(push, 1)
+typedef struct { unsigned int events; unsigned long long data; } l_epoll_event;
+#pragma pack(pop)
+#define NX_EPOLL_CTL_ADD 1
+#define NX_EPOLL_CTL_DEL 2
+#define NX_EPOLL_CTL_MOD 3
+
+int nx_epoll_create(void) {
+    pthread_mutex_lock(&g_mx);
+    int i = slot_alloc();
+    if (i < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
+    g_v[i].kind = VK_EPOLL;
+    pthread_mutex_unlock(&g_mx);
+    return NX_VFD_BASE + i;
+}
+
+int nx_epoll_ctl(int epfd, int op, int fd, void* uev) {
+    if (!nx_vfd_is(epfd) || V(epfd)->kind != VK_EPOLL) { errno = EBADF; return -1; }
+    l_epoll_event* ev = (l_epoll_event*)uev;
+    pthread_mutex_lock(&g_mx);
+    vfd_t* v = V(epfd);
+    nx_epitem* set = (nx_epitem*)v->epset;
+    int found = -1;
+    for (int k = 0; k < v->ep_n; k++) if (set[k].fd == fd) { found = k; break; }
+    long r = 0;
+    if (op == NX_EPOLL_CTL_DEL) {
+        if (found < 0) { errno = ENOENT; r = -1; }
+        else set[found] = set[--v->ep_n];
+    } else if (op == NX_EPOLL_CTL_ADD || op == NX_EPOLL_CTL_MOD) {
+        if (!ev) { errno = EFAULT; r = -1; }
+        else if (op == NX_EPOLL_CTL_ADD && found >= 0) { errno = EEXIST; r = -1; }
+        else if (op == NX_EPOLL_CTL_MOD && found < 0) { errno = ENOENT; r = -1; }
+        else {
+            if (found < 0) {
+                if (v->ep_n == v->ep_cap) {
+                    int nc = v->ep_cap ? v->ep_cap * 2 : 8;
+                    nx_epitem* ns = (nx_epitem*)realloc(set, (size_t)nc * sizeof *ns);
+                    if (!ns) { pthread_mutex_unlock(&g_mx); errno = ENOMEM; return -1; }
+                    v->epset = set = ns; v->ep_cap = nc;
+                }
+                found = v->ep_n++;
+            }
+            set[found].fd = fd; set[found].events = ev->events; set[found].data = ev->data;
+        }
+    } else { errno = EINVAL; r = -1; }
+    pthread_mutex_unlock(&g_mx);
+    return r;
+}
+
+int nx_epoll_wait(int epfd, void* uevents, int maxevents, int timeout_ms) {
+    if (!nx_vfd_is(epfd) || V(epfd)->kind != VK_EPOLL) { errno = EBADF; return -1; }
+    if (maxevents <= 0) { errno = EINVAL; return -1; }
+    // Snapshot the interest set under the lock, then poll it via nx_poll (which takes the lock itself).
+    pthread_mutex_lock(&g_mx);
+    int n = V(epfd)->ep_n;
+    if (n > maxevents) n = maxevents;
+    nx_epitem* set = (nx_epitem*)V(epfd)->epset;
+    l_pollfd pf[64]; nx_epitem snap[64];
+    if (n > 64) n = 64;
+    for (int k = 0; k < n; k++) {
+        snap[k] = set[k];
+        pf[k].fd = set[k].fd;
+        // epoll IN/OUT/HUP/ERR map 1:1 to poll bits (0x001/0x004/0x010/0x008).
+        pf[k].events = (short)(set[k].events & (0x001 | 0x004));
+        pf[k].revents = 0;
+    }
+    pthread_mutex_unlock(&g_mx);
+    if (n == 0) {   // nothing registered: just honor the timeout
+        if (timeout_ms > 0) svcSleepThread((u64)timeout_ms * 1000000ULL);
+        return 0;
+    }
+    int ready = nx_poll(pf, (unsigned long)n, timeout_ms);
+    if (ready <= 0) return ready;
+    l_epoll_event* out = (l_epoll_event*)uevents;
+    int o = 0;
+    for (int k = 0; k < n && o < maxevents; k++) {
+        if (!pf[k].revents) continue;
+        out[o].events = (unsigned)(pf[k].revents & (0x001 | 0x004 | 0x010 | 0x008));
+        out[o].data = snap[k].data;
+        o++;
+    }
+    return o;
+}
+
 // ---- fcntl / ioctl (vfd subset) ------------------------------------------------------------------
 
 // Linux x86-64 struct flock: short l_type; short l_whence; off_t l_start; off_t l_len; pid_t l_pid;
@@ -984,6 +1080,20 @@ int nx_rmdir_guest(const char* p) {
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     return rmdir(hp);
+}
+// unlinkat(dirfd, path, flags): resolve a relative path against a vfd dir fd (the dir-fd layer —
+// open(O_DIRECTORY) yields a vfd, and glibc's remove()/unlinkat() pass that fd), then unlink or
+// (AT_REMOVEDIR) rmdir the joined guest path. Mirrors the openat dirfd resolution (nx_posix.c:349).
+#define NX_AT_REMOVEDIR 0x200
+int nx_unlinkat_guest(int dirfd, const char* p, int flags) {
+    if (!p) { errno = EFAULT; return -1; }
+    char gp[1024];
+    const char* path = p;
+    if (p[0] != '/' && nx_vfd_is(dirfd) && nx_vfd_dir_guest(dirfd)) {
+        snprintf(gp, sizeof gp, "%s/%s", nx_vfd_dir_guest(dirfd), p);
+        path = gp;
+    }
+    return (flags & NX_AT_REMOVEDIR) ? nx_rmdir_guest(path) : nx_unlink_guest(path);
 }
 int nx_access_guest(const char* p, int mode) {
     char hp[512]; struct stat st;
@@ -1120,6 +1230,12 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
         case 83: r = nx_mkdir_guest((const char*)a1, (unsigned)a2); break;
         case 84: r = nx_rmdir_guest((const char*)a1); break;
         case 87: r = nx_unlink_guest((const char*)a1); break;
+        case 263: r = nx_unlinkat_guest((int)a1, (const char*)a2, (int)a3); break;  // unlinkat
+        case 213: r = nx_epoll_create(); break;                                     // epoll_create(size)
+        case 291: r = nx_epoll_create(); break;                                     // epoll_create1(flags)
+        case 233: r = nx_epoll_ctl((int)a1, (int)a2, (int)a3, (void*)a4); break;    // epoll_ctl
+        case 232: r = nx_epoll_wait((int)a1, (void*)a2, (int)a3, (int)a4); break;   // epoll_wait
+        case 281: r = nx_epoll_wait((int)a1, (void*)a2, (int)a3, (int)a4); break;   // epoll_pwait (sigmask ignored)
         case 95: r = 022; break;             // umask
         case 112: r = nx_guest_pid(); break; // setsid
         default:
