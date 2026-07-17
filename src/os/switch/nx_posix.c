@@ -1063,10 +1063,20 @@ long syscall(long number, ...) {
             if (nx_vfd_is((int)a0)) return nx_vfd_lseek((int)a0, (off_t)a1, (int)a2);
             return (long)lseek((int)a0, (off_t)a1, (int)a2);
         case 67: {  // pread64(fd, buf, count, offset) — ld.so reads ELF headers at offsets
-            off_t cur = lseek((int)a0, 0, SEEK_CUR);             // save position (newlib may lack pread)
-            if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) return -1;
+            // Emulated via lseek+read (newlib lacks pread). A NON-SEEKABLE fd (pipe/socket/vfd) makes
+            // lseek fail; newlib reports that as ENOSYS(88), which box64 would forward to the guest as
+            // Linux ENOSYS(38). But real Linux pread64 on a non-seekable fd returns ESPIPE(29), and Wine
+            // (e.g. NtReadFile's positioned-read path around get_token_sid) branches on ESPIPE to fall
+            // back to a plain read — on the unexpected ENOSYS it left its buffer unfilled and then
+            // dereferenced garbage (InvalidMemoryRegion fault). Map any lseek failure to ESPIPE.
+            if (nx_vfd_is((int)a0)) { errno = ESPIPE; return -1; }  // vfd pipes/sockets aren't seekable
+            off_t cur = lseek((int)a0, 0, SEEK_CUR);
+            if (cur < 0)                     { errno = ESPIPE; return -1; }
+            if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) { errno = ESPIPE; return -1; }
             ssize_t r = read((int)a0, (void*)a1, (size_t)a2);
+            int e = errno;
             lseek((int)a0, cur, SEEK_SET);                       // restore
+            errno = e;
             return (long)r;
         }
         case 68: {  // pwrite64(fd, buf, count, offset)
