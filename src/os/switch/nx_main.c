@@ -60,32 +60,51 @@ static int g_hold_done = 0;   // ensures the on-screen "press + to exit" hold ru
 // open-per-line, with fsdevCommitDevice throttled to every 8 KiB or ~500 ms — a per-line commit
 // would crawl on a flood, and the throttle still bounds how much a crash can lose. Mutex because
 // the client and the in-process wineserver both write from their own host threads.
+static Mutex  g_glog_mtx;          // zero-init is a valid unlocked libnx Mutex
+static int    g_glog_fd = -2;      // -2 = not probed yet; -1 = disabled or open failed
+static size_t g_glog_pending = 0;
+static u64    g_glog_last_commit = 0;
 static void nx_guest_log_raw(const void *buf, size_t len) {
-    static Mutex mtx;              // zero-init is a valid unlocked libnx Mutex
-    static int log_fd = -2;        // -2 = not probed yet; -1 = disabled or open failed
-    static size_t pending = 0;
-    static u64 last_commit = 0;
-    mutexLock(&mtx);
-    if (log_fd == -2) {
+    mutexLock(&g_glog_mtx);
+    if (g_glog_fd == -2) {
         if (getenv("KX_GUEST_LOG")) {
-            log_fd = open("sdmc:/box64/box64-guest.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            g_glog_fd = open("sdmc:/box64/box64-guest.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
             // Loud failure: a host-side stale handle on the log (e.g. a killed emulator's
             // crash-handler child inheriting it) makes this open fail — without this marker
             // the log just silently stays stale and the harness misreads the run.
-            if (log_fd < 0) rlog("nx: KX_GUEST_LOG open FAILED — guest log disabled this run");
-        } else log_fd = -1;
+            if (g_glog_fd < 0) rlog("nx: KX_GUEST_LOG open FAILED — guest log disabled this run");
+        } else g_glog_fd = -1;
     }
-    if (log_fd >= 0) {
-        write(log_fd, buf, len);
-        pending += len;
+    if (g_glog_fd >= 0) {
+        write(g_glog_fd, buf, len);
+        g_glog_pending += len;
         u64 now = svcGetSystemTick();
-        if (pending >= 8192 || now - last_commit > 9600000ULL) {   // 19200 ticks/ms * 500 ms
+        if (g_glog_pending >= 8192 || now - g_glog_last_commit > 9600000ULL) {   // 19200 ticks/ms * 500 ms
             fsdevCommitDevice("sdmc");
-            pending = 0;
-            last_commit = now;
+            g_glog_pending = 0;
+            g_glog_last_commit = now;
         }
     }
-    mutexUnlock(&mtx);
+    mutexUnlock(&g_glog_mtx);
+}
+
+// Force the guest log onto the HOST filesystem NOW, via close+reopen. The exit_group
+// KX_GUEST_EXITED marker is typically the log's LAST write, and Ryujinx flushes an open SD file's
+// host-side buffer on handle CLOSE, not on IFileSystem::Commit — empirically (threads green-gate
+// 2026-07-18) a Commit issued right after the marker write still left the final bytes unflushed, and
+// the harness's force-kill then lost them, silently regressing completion detection to the stall
+// timeout. Closing the fd flushes everything written so far; the O_APPEND reopen keeps later writers
+// (the in-process wineserver outlives the client's exit_group) working.
+void nx_guest_log_flush(void) {
+    mutexLock(&g_glog_mtx);
+    if (g_glog_fd >= 0) {
+        close(g_glog_fd);
+        g_glog_fd = open("sdmc:/box64/box64-guest.log", O_WRONLY | O_APPEND);
+        fsdevCommitDevice("sdmc");
+        g_glog_pending = 0;
+        g_glog_last_commit = svcGetSystemTick();
+    }
+    mutexUnlock(&g_glog_mtx);
 }
 
 // Guest stdout/stderr tee (x64syscall.c write + nx_posix.c writev call this): mirror to the debug

@@ -599,6 +599,9 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             // completed Wine ExitProcess test from a hang.
             int n = snprintf(b, sizeof b, "\nKX_GUEST_EXITED=%d pid=%d\n", (int)R_EDI, nx_guest_pid());
             nx_guest_output(2, b, (size_t)n);
+            // The marker is usually the guest log's LAST write — force the throttled commit or it
+            // sits in the buffer and the harness (polling the host file) never sees it.
+            { extern void nx_guest_log_flush(void); nx_guest_log_flush(); }
         }
         emu->quit = 1;
         emu->exit = 1;   // box64-nx (M2.2c2): mark a REAL guest exit, not just a loop-unwind. Needed when
