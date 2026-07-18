@@ -515,14 +515,14 @@ extern int nx_guest_pid(void);
 // INCLUDING the box64-internal ENOSYS the nx_stub log misses. Used to pin the syscall behind the
 // wineserver's "file_set_error() can't map error" choke. Total-capped so a livelock can't flood;
 // attribute by guest pid (in-process wineserver=2, client=100).
-static void nx_diag_enosys(long s) {
+static void nx_diag_enosys(long s, unsigned long a1) {
     static int on = -1;
     if (on < 0) on = getenv("KX_ENOSYS_LOG") ? 1 : 0;
     if (!on) return;
     static int cnt = 0;
     if (cnt >= 64) return;
     cnt++;
-    char b[96]; int n = snprintf(b, sizeof b, "nx: ENOSYS syscall=%ld pid=%d\n", s, nx_guest_pid());
+    char b[112]; int n = snprintf(b, sizeof b, "nx: ENOSYS syscall=%ld a1=0x%lx pid=%d\n", s, a1, nx_guest_pid());
     if (n > 0) svcOutputDebugString(b, n);
 }
 #endif
@@ -584,6 +584,22 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     // GetEAX() then returns it to nx_main (which prints it and exits the NRO cleanly).
     if (s == 231 || s == 60) {
         R_EAX = R_EDI;
+        // Completion marker on exit_group(231) ONLY: a Wine ExitProcess reaches exit_group from deep
+        // inside a nested DynaCall (wineshim -> __wine_main -> test), and that unwind doesn't always
+        // reach nx_main's "guest exited" print — so a completed Wine test looks identical to a hang to
+        // the test harness. s==60 is per-THREAD exit: guest worker threads (clone) unwind through this
+        // branch too, and a marker there would false-complete the harness 3 s after the FIRST worker
+        // exit and spam box64-result.txt with per-thread lines. pid-tagged (client=100, in-process
+        // wineserver=2) so run-winetest.ps1 can prefer the client's code over the server's.
+        if (s == 231) {
+            extern void nx_result_log(const char*); extern void nx_guest_output(int, const void*, size_t);
+            char b[64]; snprintf(b, sizeof b, "guest exited=%d", (int)R_EDI); nx_result_log(b);
+            // The 16 KiB result-file tee fills with Wine's startup chatter before a test even runs, so
+            // ALSO emit to the uncapped guest log (KX_GUEST_LOG) so run-winetest.ps1 can distinguish a
+            // completed Wine ExitProcess test from a hang.
+            int n = snprintf(b, sizeof b, "\nKX_GUEST_EXITED=%d pid=%d\n", (int)R_EDI, nx_guest_pid());
+            nx_guest_output(2, b, (size_t)n);
+        }
         emu->quit = 1;
         emu->exit = 1;   // box64-nx (M2.2c2): mark a REAL guest exit, not just a loop-unwind. Needed when
                          // the guest reaches exit_group from INSIDE a nested DynaCall — e.g. a signal
@@ -622,7 +638,7 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         long pr;
         if (nx_x64_precase(s, R_RDI, R_RSI, R_RDX, R_R10, R_R8, R_R9, &pr)) {
             if (pr < 0 && pr > -4096) { pr = -(long)nx_errno_h2l((int)-pr);   // host->Linux errno (M2.3)
-                                        if (pr == -38) nx_diag_enosys(s); }
+                                        if (pr == -38) nx_diag_enosys(s, R_RDI); }
             S_RAX = (uint64_t)pr;
             return;
         }
@@ -665,7 +681,7 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             S_RAX = -errno;
 #endif
 #ifdef __SWITCH__
-        if((int64_t)S_RAX == -38) nx_diag_enosys(s);   // KX_ENOSYS_LOG: pin the file_set_error choke
+        if((int64_t)S_RAX == -38) nx_diag_enosys(s, R_RDI);   // KX_ENOSYS_LOG: pin the file_set_error choke
 #endif
         if(log) snprintf(buffret, 127, "0x%x%s", R_EAX, buff2);
         if(log && !BOX64ENV(rolling_log)) printf_log_prefix(0, LOG_NONE, "=> %s\n", buffret);
@@ -1175,7 +1191,7 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     // returned before reaching here, as does clone3's early -38. (No-op on non-newlib hosts.)
     if ((int64_t)R_RAX <= -1 && (int64_t)R_RAX >= -4095) {
         R_RAX = (uint64_t)(int64_t)(-nx_errno_h2l((int)(-(int64_t)R_RAX)));
-        if ((int64_t)R_RAX == -38) nx_diag_enosys(s);   // KX_ENOSYS_LOG: pin the file_set_error choke
+        if ((int64_t)R_RAX == -38) nx_diag_enosys(s, R_RDI);   // KX_ENOSYS_LOG: pin the file_set_error choke
     }
 #endif
     if(log) {
