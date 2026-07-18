@@ -1218,10 +1218,19 @@ long syscall(long number, ...) {
         }
         case 167: return 0;                          // prctl(option, ...) -> accept (PR_SET_NAME etc.)
         case 179: {  // sysinfo(struct sysinfo*) — zero-fill + a plausible RAM figure (mem_unit=1)
+            // Layout MUST match the kernel uapi struct exactly: the tail is
+            // char _f[20 - 2*sizeof(long) - sizeof(int)] = ZERO bytes on 64-bit (total 112 bytes).
+            // A hand-inlined `_f[20]` made sizeof 128 and the memset overflowed 16 bytes past the
+            // guest's on-stack struct — glibc get_phys_pages() has ONLY the canary above it, so every
+            // sysconf(_SC_PHYS_PAGES) died "*** stack smashing detected ***" (the ntdll:directory
+            // deterministic smash, 2026-07-18; deterministic + engine-independent = this libos bug).
             struct kx_sysinfo { long uptime; unsigned long loads[3];
                 unsigned long totalram, freeram, sharedram, bufferram, totalswap, freeswap;
                 unsigned short procs, pad; unsigned long totalhigh, freehigh;
-                unsigned int mem_unit; char _f[20]; } *si = (struct kx_sysinfo*)a0;
+                unsigned int mem_unit;
+                char _f[20 - 2 * sizeof(unsigned long) - sizeof(unsigned int)]; }
+                *si = (struct kx_sysinfo*)a0;
+            _Static_assert(sizeof(struct kx_sysinfo) == 112, "kernel sysinfo is 112 bytes on 64-bit");
             if (si) { memset(si, 0, sizeof *si);
                       si->mem_unit = 1; si->totalram = 0x40000000UL; si->freeram = 0x20000000UL;
                       si->procs = 1; }
