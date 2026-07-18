@@ -789,6 +789,28 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     if(sig<=0 || sig>MAX_SIGNAL)
         return;
     uintptr_t h = my_context->signals[sig];
+    { static int siglog = -1; if (siglog < 0) siglog = getenv("KX_SIGLOG") ? 1 : 0;
+      if (siglog) {
+          printf_log(LOG_NONE, "nx_sig: deliver self sig=%d rip=%p handler=0x%lx\n",
+                     sig, (void*)R_RIP, (unsigned long)h);
+          if (sig == 6) {   // SIGABRT (abort/stack-smash): dump the guest stack so the smashed frame's
+              uintptr_t rsp = R_RSP;   // return-address chain (raise<-abort<-__fortify_fail<-smashed) is visible
+              uintptr_t fsb = emu->segs_offs[_FS], gsb = emu->segs_offs[_GS];
+              // false-positive-canary test: the glibc master canary lives at %fs:0x28. If it differs from
+              // the on-stack copy, the smash is a %fs-base/canary corruption, not a real buffer overflow.
+              uint64_t master = fsb ? *(volatile uint64_t*)(fsb + 0x28) : 0;
+              printf_log(LOG_NONE, "nx_sig: fsbase=0x%lx gsbase=0x%lx master_canary=0x%lx\n",
+                         (unsigned long)fsb, (unsigned long)gsb, (unsigned long)master);
+              for (int qi = 0; qi < 128; qi++) {
+                  uint64_t val = *(volatile uint64_t*)(rsp + (uintptr_t)qi * 8);
+                  // flag code addresses in the test-exe (0x1.4xxx) / low-VA PE (0x0.bxxx-0x0.exxx) ranges
+                  const char* tag = "";
+                  if (val >= 0x140000000ULL && val < 0x141000000ULL) tag = " <TESTEXE>";
+                  else if (val >= 0x0b000000ULL && val < 0x10000000ULL) tag = " <PE-lowva>";
+                  printf_log(LOG_NONE, "nx_sig: stk +0x%03x = 0x%lx%s\n", qi * 8, (unsigned long)val, tag);
+              }
+          }
+      } }
     if(h==1)                        // SIG_IGN
         return;
     if(h==0) {                      // SIG_DFL -> terminate (matches RunFunctionHandler's fnc==0 path)
@@ -811,6 +833,22 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     // handler that changes control flow via longjmp isn't honored — both are follow-ups for wider programs.
     uint64_t s_rax=R_RAX, s_rcx=R_RCX, s_rdx=R_RDX, s_r8=R_R8, s_r9=R_R9, s_r10=R_R10, s_r11=R_R11;
     x64flags_t s_eflags = emu->eflags;
+    // box64-nx: a real kernel sigframe would ALSO preserve the guest's SSE state, not just the GPRs
+    // above — the handler runs on this emu in-place (RunFunctionHandler), and glibc/Wine use SSE heavily
+    // (memcpy / strlen / string ops), so a handler that clobbers xmm/ymm/mxcsr corrupts the interrupted
+    // code when it resumes. OPT-IN (KX_XMM_SAVE=1) until the gap is DEMONSTRATED by the xmmsig probe
+    // (tests/m2/xmmsig.c): it was added speculatively for the ntdll:directory stack-smash and did NOT
+    // fix it, and an unverified default-on change to every signal delivery is exactly the "don't ship
+    // blind" class. Flip default-on (with an opt-out) only once the probe shows corruption without it.
+    // x87 is not preserved either way (rare in signal-interruptible paths).
+    static int xmm_save = -1;
+    if (xmm_save < 0) xmm_save = getenv("KX_XMM_SAVE") ? 1 : 0;
+    sse_regs_t s_xmm[16], s_ymm[16]; mmxcontrol_t s_mxcsr;
+    if (xmm_save) {
+        memcpy(s_xmm, emu->xmm, sizeof(s_xmm));
+        memcpy(s_ymm, emu->ymm, sizeof(s_ymm));
+        s_mxcsr = emu->mxcsr;
+    }
     int exits = 0;
     uint64_t hret;
     if(my_context->is_sigaction[sig]) {
@@ -831,6 +869,11 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     if(exits) {
         char b[64]; snprintf(b, sizeof b, "guest exited=%d (in signal handler)", (int)hret); nx_result_log(b);
         exit((int)hret);
+    }
+    if (xmm_save) {
+        memcpy(emu->xmm, s_xmm, sizeof(s_xmm));
+        memcpy(emu->ymm, s_ymm, sizeof(s_ymm));
+        emu->mxcsr = s_mxcsr;
     }
     R_RAX=s_rax; R_RCX=s_rcx; R_RDX=s_rdx; R_R8=s_r8; R_R9=s_r9; R_R10=s_r10; R_R11=s_r11;
     emu->eflags = s_eflags;

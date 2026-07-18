@@ -754,8 +754,17 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
     size_t rounded = VM_ROUND(length);
 
     vm_ensure_init();
-    if (vm_backend == VM_HEAP)
-        return nx_mmap_heap(addr, rounded, flags, prot);
+    if (vm_backend == VM_HEAP) {
+        void* rp = nx_mmap_heap(addr, rounded, flags, prot);
+        // KX_MMAP_LOG: log large anonymous maps (Wine relocates PE DLL images here) to the UNCAPPED
+        // debug log so a fault's guest RIP (X[27]) resolves to which relocated image + offset.
+        { static int mlog = -1; if (mlog < 0) mlog = getenv("KX_MMAP_LOG") ? 1 : 0;
+          if (mlog && rounded >= 0x10000 && rp != MAP_FAILED) {
+              char b[128]; int n = snprintf(b, sizeof b, "nx_map: anon hint=0x%lx len=0x%lx prot=%d -> 0x%lx",
+                  (unsigned long)addr, (unsigned long)rounded, prot, (unsigned long)rp);
+              if (n > 0) svcOutputDebugString(b, (size_t)n); } }
+        return rp;
+    }
 
     // PHYS or UNSAFE arena
     if (flags & MAP_FIXED) {
