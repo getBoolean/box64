@@ -833,16 +833,17 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     // handler that changes control flow via longjmp isn't honored — both are follow-ups for wider programs.
     uint64_t s_rax=R_RAX, s_rcx=R_RCX, s_rdx=R_RDX, s_r8=R_R8, s_r9=R_R9, s_r10=R_R10, s_r11=R_R11;
     x64flags_t s_eflags = emu->eflags;
-    // box64-nx: a real kernel sigframe would ALSO preserve the guest's SSE state, not just the GPRs
-    // above — the handler runs on this emu in-place (RunFunctionHandler), and glibc/Wine use SSE heavily
+    // box64-nx: a real kernel sigframe ALSO preserves the guest's SSE state, not just the GPRs above —
+    // the handler runs on this emu in-place (RunFunctionHandler), and glibc/Wine use SSE heavily
     // (memcpy / strlen / string ops), so a handler that clobbers xmm/ymm/mxcsr corrupts the interrupted
-    // code when it resumes. OPT-IN (KX_XMM_SAVE=1) until the gap is DEMONSTRATED by the xmmsig probe
-    // (tests/m2/xmmsig.c): it was added speculatively for the ntdll:directory stack-smash and did NOT
-    // fix it, and an unverified default-on change to every signal delivery is exactly the "don't ship
-    // blind" class. Flip default-on (with an opt-out) only once the probe shows corruption without it.
-    // x87 is not preserved either way (rare in signal-interruptible paths).
+    // code when it resumes. DEFAULT-ON since 2026-07-18, PROVEN by tests/m2/xmmsig.c (kurokonx): without
+    // the save, a clobbering handler returns ALL 16 xmm as garbage and leaks mxcsr (exit 50); with it,
+    // exit 42 — a real kernel always preserves. (Historically added speculatively for the ntdll:directory
+    // stack-smash, which it did NOT fix — kept for correctness, not as that fix.) KX_NO_XMM_SAVE=1
+    // restores the old GPR-only delivery for A/B. x87 is not preserved either way (rare in
+    // signal-interruptible paths).
     static int xmm_save = -1;
-    if (xmm_save < 0) xmm_save = getenv("KX_XMM_SAVE") ? 1 : 0;
+    if (xmm_save < 0) xmm_save = getenv("KX_NO_XMM_SAVE") ? 0 : 1;
     sse_regs_t s_xmm[16], s_ymm[16]; mmxcontrol_t s_mxcsr;
     if (xmm_save) {
         memcpy(s_xmm, emu->xmm, sizeof(s_xmm));
