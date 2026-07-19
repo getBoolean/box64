@@ -123,6 +123,57 @@ static int nx_exc_log_all(void) {
     return e;
 }
 
+// ---- KX_DIAG-CASC (temporary): nested-fault CASCADE ring buffer -----------------------------------
+// The om/exception crash is an intermittent NESTED-FAULT CASCADE: a 2nd CPU fault taken WHILE box64 is
+// mid-delivery of a 1st fault, i.e. while the handler runs ON a slot stack. We need to see WHERE each
+// nested level re-faults (native PC + is-SP-on-a-slot-stack + chain depth) — but per-fault rlog commits
+// the SD filesystem and PERTURBS the timing (the Heisenbug: a no-log run trips the depth cap at ~fault
+// 8, a KX_EXC_LOG run reaches ~50 then corrupts). So capture EVERY fault into a per-thread in-memory
+// ring (a cheap struct store, NO I/O) and flush it to box64-result.txt ONLY at a give-up/crash tail.
+// Native TLS (__thread / TPIDR_EL0) IS valid in the Horizon exception context (exc_chain/exc_depth/uctx
+// already rely on it) — only the pthread key layer (pthread_getspecific) is not. Symbolize each pc
+// field offline against box64.elf (aarch64-none-elf-addr2line); expect the cascade levels to land in
+// nx_jit_rx_to_rw / FindDynablockFromNativeAddress (the unlocked dynablock/JIT walk).
+void __libnx_exception_handler(ThreadExceptionDump* ctx);   // fwd decl (for &anchor below; defined later)
+#define NX_CASC_N 32
+struct nx_casc_rec { uint32_t nfault; int dpre, dpost, slot, spslot;
+                     uint64_t sp, pc, far, lr, x64pc; };
+static __thread struct nx_casc_rec g_casc[NX_CASC_N];
+static __thread uint32_t g_casc_w = 0;   // monotonic write count (index = w % NX_CASC_N)
+// Which slot-pool stack (if any) the interrupted SP lives on. >=0 => the fault interrupted box64's own
+// handler/delivery code running on a slot stack (a nested fault); <0 => the guest/JIT stack (a 1st-level
+// fault, the common case). Pure arithmetic over the contiguous kx_exc_stacks[][] — deref-free.
+static int nx_exc_sp_slot(uintptr_t sp) {
+    uintptr_t base = (uintptr_t)&kx_exc_stacks[0][0];
+    uintptr_t end  = base + (uintptr_t)KX_EXC_NSLOTS * KX_EXC_STKSZ;
+    if (sp <= base || sp > end) return -1;
+    return (int)((sp - 1 - base) / KX_EXC_STKSZ);
+}
+static void nx_casc_push(uint32_t nfault, int dpre, int dpost, int slot, int spslot, ThreadExceptionDump* ctx) {
+    struct nx_casc_rec* r = &g_casc[g_casc_w % NX_CASC_N];
+    r->nfault = nfault; r->dpre = dpre; r->dpost = dpost; r->slot = slot; r->spslot = spslot;
+    r->sp = ctx->sp.x; r->pc = ctx->pc.x; r->far = ctx->far.x; r->lr = ctx->lr.x;
+    r->x64pc = ctx->cpu_gprs[27].x;
+    g_casc_w++;
+}
+// Flush this thread's ring newest-first at a give-up/crash site (one-time, so the fsdev commits are fine).
+static void nx_casc_flush(const char* why) {
+    if (!g_casc_w) return;
+    { char b[112]; int n = snprintf(b, sizeof b, "nx_casc: FLUSH %s total=%u anchor=%p",
+        why, g_casc_w, (void*)&__libnx_exception_handler); if (n > 0) nx_result_log(b); }
+    uint32_t n = g_casc_w < NX_CASC_N ? g_casc_w : NX_CASC_N;
+    for (uint32_t k = 0; k < n; ++k) {
+        struct nx_casc_rec* r = &g_casc[(g_casc_w - 1 - k) % NX_CASC_N];   // newest first
+        char b[208];
+        int m = snprintf(b, sizeof b,
+            "nx_casc[%u]: #%u dpre=%d dpost=%d slot=%d spslot=%d sp=0x%llx pc=0x%llx far=0x%llx lr=0x%llx x64pc=0x%llx",
+            k, r->nfault, r->dpre, r->dpost, r->slot, r->spslot, (unsigned long long)r->sp,
+            (unsigned long long)r->pc, (unsigned long long)r->far, (unsigned long long)r->lr,
+            (unsigned long long)r->x64pc);
+        if (m > 0) nx_result_log(b);
+    }
+}
+
 // Unhandled-fault tail (+-exit guarantee): both give-up paths route here before returning to the
 // trampoline (-> svcBreak -> creport -> the am error dialog, A drops to HOME). When the fault PC is
 // in guest/JIT code (rw!=rx or a dynablock matched) the faulting thread cannot hold box64's console/
@@ -140,6 +191,7 @@ static void nx_exc_unhandled_tail(ThreadExceptionDump* ctx, void* cur_db, void* 
             sig, si_code, (unsigned long long)ctx->far.x, cur_db, (unsigned long long)x64pc);
         if (n > 0) nx_result_log(b);
     }
+    nx_casc_flush("unhandled");   // KX_DIAG-CASC: dump the nested-fault history behind this crash
     if (rw != rx || cur_db) {
         extern void nx_wait_for_exit_button(void);
         nx_wait_for_exit_button();
@@ -172,13 +224,17 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     if (!kx_exc_single) {
         int slot = nx_exc_slot_of(ctx);
         if (slot >= 0) {
+            int dpre   = exc_depth;                       // KX_DIAG-CASC: chain depth BEFORE the prune
+            int spslot = nx_exc_sp_slot(ctx->sp.x);       // KX_DIAG-CASC: SP on a slot stack? (>=0 => nested)
             int keep = 0;
             for (int i = exc_depth - 1; i >= 0; --i)
                 if (nx_exc_sp_in_slot(ctx->sp.x, exc_chain[i])) { keep = i + 1; break; }
             for (int i = keep; i < exc_depth; ++i) nx_exc_release(exc_chain[i]);
             exc_depth = keep;
+            nx_casc_push(nfault, dpre, exc_depth, slot, spslot, ctx);   // dpost = post-prune (pre-push)
             if (exc_depth >= KX_EXC_MAXDEPTH) {
                 nx_result_log("nx_exc: nested-fault depth cap hit — giving up to crash report");
+                nx_casc_flush("depthcap");
                 return;
             }
             exc_chain[exc_depth++] = (uint8_t)slot;
@@ -199,6 +255,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
         if (cap < 0) { const char* s = getenv("KX_EXC_MAX"); cap = s ? atoi(s) : 0; }
         if (cap > 0 && nfault >= (uint32_t)cap) {
             nx_result_log("nx_exc: KX_EXC_MAX fault cap exceeded — giving up to crash report");
+            nx_casc_flush("kxexcmax");
             return;
         }
     }
