@@ -65,6 +65,11 @@ void my_sigactionhandler_oldcode(x64emu_t* emu, int32_t sig, int simple, x64_sig
 // A/B gate (nx_main.c sets it from box64.env): slot 0 unconditionally, no claim/release bookkeeping.
 #include "nx_exc_pool.h"
 uint32_t kx_exc_single = 0;
+// Bumped by the delivery core (nx_signals.c) whenever the guest handler CHANGES the context (a
+// recovery/progress: syscall-status recovery, KiUserExceptionDispatcher, or a longjmp). The same-fault
+// loop guard resets on it, so a finite guest loop of recovered syscall-boundary faults isn't mistaken
+// for a stuck box64 delivery. Per-thread (the guard is per-thread).
+__thread uint32_t kx_recov_seq = 0;
 uint32_t kx_exc_owner[KX_EXC_NSLOTS];                 // 0=free, 1=claimed (entry asm ldaxr/stlxr)
 typedef struct { ThreadExceptionDump d; } __attribute__((aligned(16))) kx_exc_dump_t;
 _Static_assert(sizeof(kx_exc_dump_t) == KX_EXC_DUMPSZ, "KX_EXC_DUMPSZ != sizeof(ThreadExceptionDump) rounded to 16");
@@ -358,6 +363,17 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             (unsigned long long)x64pc, rw, cur_db);
         if (n > 0) nx_result_log(b);
     }
+    // KX_DIAG-INSN (temporary): dump the guest instruction bytes at the faulting RIP so a repeating
+    // fault (e.g. the om.c:149 write loop at a non-ntdll module) can be decoded — read vs SSE store,
+    // which base register. getProtection-guarded so a bad x64pc doesn't nest-fault.
+    if (verbose && getProtection((uintptr_t)x64pc)) {
+        const uint8_t* ib = (const uint8_t*)x64pc;
+        char b[128];
+        int n = snprintf(b, sizeof b,
+            "nx_insn: rip=0x%llx b=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+            (unsigned long long)x64pc, ib[0],ib[1],ib[2],ib[3],ib[4],ib[5],ib[6],ib[7],ib[8],ib[9],ib[10],ib[11]);
+        if (n > 0) nx_result_log(b);
+    }
 
     // 3) Classify the ARM64 exception into an x86 signal + siginfo.
     //    ESR: EC = esr>>26, DFSC = esr&0x3f, WnR = (esr>>6)&1.
@@ -433,17 +449,24 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     {
         static __thread uintptr_t last_far = ~0ULL, last_rip = ~0ULL;
         static __thread uint32_t  last_val = 0;
+        static __thread uint32_t  last_seq = 0;
         static __thread int repeat = 0;
         uint32_t cur_val = 0;
         if (((esr >> 6) & 1) /*WnR*/ && getProtection(ctx->far.x))
             cur_val = *(volatile uint32_t*)ctx->far.x;   // store target — mapped, safe to read
-        if (ctx->far.x == last_far && x64pc == last_rip && cur_val == last_val) {
+        // Count a repeat ONLY when the same (far,rip,value) recurs AND the guest handler did NOT recover
+        // anything since the last such fault (kx_recov_seq unchanged). If a recovery happened
+        // (kx_recov_seq advanced), the guest is progressing — a finite loop of recovered syscall-boundary
+        // bad-pointer faults (e.g. om.c:149's NtCreateNamedPipeFile) re-faults at one identical (far,rip)
+        // but each returns STATUS_ACCESS_VIOLATION and the test advances. Only a genuine no-recovery
+        // re-fault (chg=0, box64 re-running the same insn / delivery broken) trips the guard.
+        if (ctx->far.x == last_far && x64pc == last_rip && cur_val == last_val && kx_recov_seq == last_seq) {
             if (++repeat >= 16) {
                 nx_result_log("nx_exc: same fault repeated 16x with no progress — giving up");
                 nx_exc_unhandled_tail(ctx, cur_db, rx, rw, sig, si_code, x64pc);
                 return;
             }
-        } else { last_far = ctx->far.x; last_rip = x64pc; last_val = cur_val; repeat = 0; }
+        } else { last_far = ctx->far.x; last_rip = x64pc; last_val = cur_val; last_seq = kx_recov_seq; repeat = 0; }
     }
 
 #ifdef DYNAREC

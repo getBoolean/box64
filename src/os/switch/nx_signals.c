@@ -578,15 +578,28 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
     // clean syscall-status recovery; new = KiUserExceptionDispatcher => user-mode exception dispatch
     // (is_inside_syscall returned FALSE). A known nRIP function entry also anchors the ntdll base.
     { extern void nx_result_log(const char*); static int on=-1; if(on<0) on=getenv("KX_EXC_LOG")?1:0;
-      if(on) { int chg = memcmp(sigcontext,&sigcontext_copy,sizeof(x64_ucontext_t))?1:0; char b[176];
-        int n=snprintf(b,sizeof b,"nx_recov: chg=%d oRIP=0x%llx nRIP=0x%llx oRSP=0x%llx nRSP=0x%llx",
-          chg, (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RIP],
+      if(on) { int chg = memcmp(sigcontext,&sigcontext_copy,sizeof(x64_ucontext_t))?1:0; char b[240];
+        // far = si_addr distinguishes the failing WRITE (0xdeadbee0) from the recovering READ (0xdeadbef7)
+        // faults; err = the DELIVERED ERR (bit1 = write) box64 handed Wine (pre-handler snapshot). Wine's
+        // is_inside_syscall is RSP-only, so oRSP is the decider — compare WRITE vs READ oRSP.
+        int n=snprintf(b,sizeof b,"nx_recov: far=0x%llx err=0x%llx chg=%d oRIP=0x%llx nRIP=0x%llx oRSP=0x%llx nRSP=0x%llx",
+          (unsigned long long)(uintptr_t)info2->si_addr,
+          (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_ERR], chg,
+          (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RIP],
           (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RIP],
           (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RSP],
           (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RSP]);
         if(n>0) nx_result_log(b); } }
 #endif
     if(memcmp(sigcontext, &sigcontext_copy, sizeof(x64_ucontext_t))) {
+        // The guest handler CHANGED the context => it resolved this fault (syscall-status recovery to
+        // __wine_syscall_dispatcher_return, or KiUserExceptionDispatcher, or a longjmp target) and the
+        // guest is now progressing elsewhere. Bump a per-thread progress counter so the exception
+        // handler's same-fault loop guard resets: a finite guest loop of syscall-boundary bad-pointer
+        // faults (e.g. om.c:149's NtCreateNamedPipeFile bad handle ptr -> Wine recovers each) re-faults
+        // at one identical (far,rip) but is PROGRESS, not a stuck box64 delivery. Only a no-recovery
+        // re-fault (chg=0, box64 re-running the same insn) must trip the guard.
+        { extern __thread uint32_t kx_recov_seq; kx_recov_seq++; }
         #if defined(DYNAREC)
         if(db || emu->jmpbuf)
             mctx2emu(emu, &sigcontext->uc_mcontext);
