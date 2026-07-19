@@ -31,6 +31,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "custommem.h"   // getProtection — validate guest buffers before deref (EFAULT, not a fault)
+
 // nx_posix.c
 extern int  nx_translate_path(const char* p, char* out, size_t outn);
 extern char* nx_cwd_buf(void);   // nx_posix.c — per-instance guest cwd
@@ -42,6 +44,23 @@ static void vlog(const char* fmt, ...) {
     char b[256]; va_list ap; va_start(ap, fmt);
     int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
     if (n > 0) svcOutputDebugString(b, (size_t)n);
+}
+
+// A bad guest pointer passed to write(2)/writev(2) must return -EFAULT on Linux, NEVER a SIGSEGV — but
+// the vfd copy loops dereference the guest buffer directly, so a wild pointer (e.g. an om error-path
+// test's 0xdeadbee0) faults INSIDE box64. The libnx exception handler then mis-delivers that as a guest
+// SIGSEGV with a syscall-boundary context Wine isn't prepared for, seeding a nested-fault cascade in the
+// delivery core (root-caused 2026-07-19, porting-log + [[box64-signal-delivery-notes]]). Guard the
+// deref: getProtection()==0 means the page is unmapped (rb_get(memprot,·) miss) => bad. Cheap memprot
+// lookup on the buffer endpoints; KX_NO_VFD_FAULTCHECK=1 restores the old raw-deref for A/B.
+static int nx_vfd_buf_bad(const void* base, size_t len) {
+    static int chk = -1;
+    if (chk < 0) chk = getenv("KX_NO_VFD_FAULTCHECK") ? 0 : 1;
+    if (!chk || !base || !len) return 0;
+    uintptr_t a = (uintptr_t)base;
+    if (!getProtection(a)) return 1;              // first byte's page unmapped
+    if (!getProtection(a + len - 1)) return 1;    // last byte's page unmapped
+    return 0;
 }
 
 #define NX_VFD_BASE 0x40000000
@@ -500,6 +519,7 @@ long nx_vfd_write(int fd, const void* buf, size_t n) {
     }
     if (V(fd)->kind == VK_SINK) return (long)n;   // discard sink (reg*.tmp): drop the bytes
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
+    if (nx_vfd_buf_bad(buf, n)) { errno = EFAULT; return -1; }   // bad guest buffer -> -EFAULT, not a fault
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
       if (on) vlog("nx_vfd: VW pid=%d tid=%d fd=%d peer=%d n=%zu\n", nx_guest_pid(), nx_gettid(), fd, V(fd)->peer, n); }
     pthread_mutex_lock(&g_mx);
@@ -537,6 +557,9 @@ long nx_vfd_writev(int fd, const void* iov, int iovcnt) {
     if (!want) return 0;
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     if (V(fd)->kind == VK_SINK) return (long)want;   // discard sink (reg*.tmp): drop the bytes
+    // -EFAULT on a bad guest buffer (Linux writev semantics), NOT a box64 fault -> cascade (see nx_vfd_buf_bad).
+    for (int i = 0; i < iovcnt; i++)
+        if (nx_vfd_buf_bad(v[i].base, v[i].len)) { errno = EFAULT; return -1; }
     // Trace the request code (first int of the first iov = wine request_header.req) — the loop that
     // wedges the client uses writev, not write, so the nx_vfd_write REQ log misses it.
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
