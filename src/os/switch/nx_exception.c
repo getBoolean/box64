@@ -183,6 +183,13 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             }
             exc_chain[exc_depth++] = (uint8_t)slot;
         }
+        // KX_DIAG-S (temporary): log the claimed slot + post-prune depth. Monotonic slot with a
+        // growing/stuck depth => the syscall-recovery siglongjmp leaks a slot per fault (pool exhausts
+        // at NSLOTS => the ~fault-48 corruption). Cycling slot + depth==1 => no leak.
+        if (verbose) { char b[80];
+            int n = snprintf(b, sizeof b, "nx_slot: idx=%d depth=%d sp=0x%llx",
+                slot, exc_depth, (unsigned long long)ctx->sp.x);
+            if (n > 0) nx_result_log(b); }
     }
 
     // KX_EXC_MAX storm guard (default OFF — stress legitimately takes 6400 faults, Wine SMC loads

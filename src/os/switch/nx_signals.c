@@ -571,6 +571,21 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
         exit((int)ret);
     }
 #endif
+#ifdef __SWITCH__
+    // KX_DIAG-R (temporary): which recovery path did Wine's segv_handler choose? Log old (faulting)
+    // RIP/RSP vs the handler-set RIP/RSP. old==new (chg=0) => the line-2005 same-RIP loop
+    // (virtual_handle_fault falsely returned SUCCESS); new = __wine_syscall_dispatcher_return =>
+    // clean syscall-status recovery; new = KiUserExceptionDispatcher => user-mode exception dispatch
+    // (is_inside_syscall returned FALSE). A known nRIP function entry also anchors the ntdll base.
+    { extern void nx_result_log(const char*); static int on=-1; if(on<0) on=getenv("KX_EXC_LOG")?1:0;
+      if(on) { int chg = memcmp(sigcontext,&sigcontext_copy,sizeof(x64_ucontext_t))?1:0; char b[176];
+        int n=snprintf(b,sizeof b,"nx_recov: chg=%d oRIP=0x%llx nRIP=0x%llx oRSP=0x%llx nRSP=0x%llx",
+          chg, (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RIP],
+          (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RIP],
+          (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RSP],
+          (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RSP]);
+        if(n>0) nx_result_log(b); } }
+#endif
     if(memcmp(sigcontext, &sigcontext_copy, sizeof(x64_ucontext_t))) {
         #if defined(DYNAREC)
         if(db || emu->jmpbuf)
