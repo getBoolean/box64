@@ -344,6 +344,17 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             (void*)emu, cur_db, sig, (unsigned long long)hh, rw);
         if (n > 0) nx_result_log(b);
     }
+    // KX_DIAG-C (temporary, DEREF-FREE): the guest TLS bases (%fs=TEB / %gs) + guest pid. If Wine's
+    // dispatcher re-faults reading NtCurrentTeb()->ExceptionList, a WRONG fs/gs base is the smoking gun
+    // (box64 delivered the fault with the wrong thread's TEB). segs_offs is plain emu state, no deref.
+    if (verbose && emu) {
+        extern int nx_guest_pid(void);
+        char b[160];
+        int n = snprintf(b, sizeof b, "nx_exc2c: fsbase=0x%llx gsbase=0x%llx pid=%d",
+            (unsigned long long)emu->segs_offs[_FS], (unsigned long long)emu->segs_offs[_GS],
+            nx_guest_pid());
+        if (n > 0) nx_result_log(b);
+    }
 
     // Defensive loop guard: if a fault recurs with NO forward progress, delivery/resume is broken —
     // bail to a crash report instead of hanging forever (a hung HOME-launched title needs a reboot).
