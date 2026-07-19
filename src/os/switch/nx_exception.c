@@ -70,6 +70,10 @@ uint32_t kx_exc_single = 0;
 // loop guard resets on it, so a finite guest loop of recovered syscall-boundary faults isn't mistaken
 // for a stuck box64 delivery. Per-thread (the guard is per-thread).
 __thread uint32_t kx_recov_seq = 0;
+// The hardware ESR.WnR (write/not-read) bit of the in-flight async CPU fault, handed to the delivery
+// core so the x86 sigcontext ERR write-bit is exact even for SSE/AVX/POP stores x86 write_opcode()
+// mis-decodes. -1 = not a CPU fault (self-delivered signal -> write_opcode fallback).
+__thread int kx_fault_wnr = -1;
 uint32_t kx_exc_owner[KX_EXC_NSLOTS];                 // 0=free, 1=claimed (entry asm ldaxr/stlxr)
 typedef struct { ThreadExceptionDump d; } __attribute__((aligned(16))) kx_exc_dump_t;
 _Static_assert(sizeof(kx_exc_dump_t) == KX_EXC_DUMPSZ, "KX_EXC_DUMPSZ != sizeof(ThreadExceptionDump) rounded to 16");
@@ -599,6 +603,14 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     if (emu && h > 1) {
         static __thread int old_code = -1;
         old_code = -1;
+        // Hand the delivery core the HARDWARE write/not-read bit (ESR.WnR) so the x86 sigcontext ERR
+        // write-bit is exact for ALL faulting instructions — including SSE2/AVX stores (66/F2/F3 0F,
+        // VEX) that box64's x86 write_opcode() decoder can't classify. It's the reported
+        // ExceptionInformation[0] read/write flag; the ESR is ground truth. -1 = "not a CPU fault"
+        // (self-delivered signals fall back to write_opcode). Data aborts only; else 0.
+        { extern __thread int kx_fault_wnr;
+          uint32_t ec = ctx->esr >> 26;
+          kx_fault_wnr = (ec == 0x24 || ec == 0x25) ? (int)((ctx->esr >> 6) & 1) : 0; }
         my_sigactionhandler_oldcode(emu, sig, 0, &info, &uctx, &old_code, cur_db, x64pc);
         // Reached only if the core RETURNED (handler fixed the fault and wants to retry the instruction).
         // Resume at the restored R_RIP via siglongjmp — must not return (that goes to libnx -> svcBreak).

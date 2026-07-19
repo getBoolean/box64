@@ -448,8 +448,13 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
         } else {
             sigcontext->uc_mcontext.gregs[X64_TRAPNO] = 14;
             sigcontext->uc_mcontext.gregs[X64_ERR] = 4|((sysmapped && !(real_prot&PROT_READ))?0:1);
-            if(write_opcode(sigcontext->uc_mcontext.gregs[X64_RIP], (uintptr_t)pc, (R_CS==0x23)))
-                sigcontext->uc_mcontext.gregs[X64_ERR] |= 2;
+            // Prefer the hardware ESR.WnR bit (set by the async CPU-fault handler) for the write-bit —
+            // exact for SSE2/AVX/POP stores x86 write_opcode() can't decode. -1 => self-delivered signal,
+            // fall back to the x86 opcode decode.
+            { extern __thread int kx_fault_wnr;
+              int is_write = (kx_fault_wnr >= 0) ? kx_fault_wnr
+                  : (write_opcode(sigcontext->uc_mcontext.gregs[X64_RIP], (uintptr_t)pc, (R_CS==0x23)) ? 1 : 0);
+              if(is_write) sigcontext->uc_mcontext.gregs[X64_ERR] |= 2; }
         }
         if(info->si_code == X64_SEGV_ACCERR && old_code)
             *old_code = -1;
@@ -816,6 +821,8 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
         emu = thread_get_emu();
     if(sig<=0 || sig>MAX_SIGNAL)
         return;
+    // Not a CPU fault — clear any stale ESR.WnR so the delivery core's write-bit uses write_opcode().
+    { extern __thread int kx_fault_wnr; kx_fault_wnr = -1; }
     uintptr_t h = my_context->signals[sig];
     { static int siglog = -1; if (siglog < 0) siglog = getenv("KX_SIGLOG") ? 1 : 0;
       if (siglog) {
