@@ -895,6 +895,28 @@ int  nx_vfd_open_shared(const char* guestpath, int is_lock);   // wineserver loc
 int  nx_vfd_flock(int fd, int op);
 int  nx_vfd_ftruncate(int fd, off_t len);
 long nx_vfd_lseek(int fd, off_t off, int whence);
+// ptrace/wait4 NO-OP emulation for the in-process wineserver's DEBUG-REGISTER path (M2.7 ntdll:exception).
+// Wine's server set_thread_context(SERVER_CTX_DEBUG_REGISTERS) drives suspend_for_ptrace() ->
+// PTRACE_ATTACH -> waitpid(SIGSTOP) -> PTRACE_POKEUSER(DR_OFFSET n) -> PTRACE_DETACH (server/ptrace.c).
+// box64-nx has no ptrace and no x86 debug registers, so this whole dance used to ENOSYS at PTRACE_ATTACH
+// -> the server returned STATUS_ACCESS_DENIED -> NtSetContextThread(self,Dr) failed -> NtContinue RETURNED
+// 0xC0000022 instead of resuming -> the dreg test's 0xC0000025 re-raise loop. The target (client) thread
+// is already blocked inside the server call (effectively stopped), so faking the dance as a no-op is safe
+// AND correct: the debug registers can't work on box64 regardless (the test then lands as a Dr-emulation
+// FAIL-DELTA, not a crash). Scope is deliberately tight: ONLY ATTACH/DETACH/CONT/POKEUSER/PEEKUSER + a
+// SIGSTOP wait4 for tids we "attached"; PEEKDATA/POKEDATA/GETREGS stay ENOSYS so cross-thread memory/reg
+// behavior is unchanged (om/cmd never used those). KX_NO_PTRACE_EMU=1 restores the old ENOSYS for A/B.
+static pthread_mutex_t g_ptmx = PTHREAD_MUTEX_INITIALIZER;
+static int g_pt_tids[32];   // tids currently "ptrace-attached" (only the in-process wineserver uses this)
+static int nx_ptrace_emu_on(void){ static int on=-1; if(on<0) on=getenv("KX_NO_PTRACE_EMU")?0:1; return on; }
+static int nx_pt_find(int tid){ for(int i=0;i<32;i++) if(g_pt_tids[i]==tid) return i; return -1; }
+static void nx_pt_add(int tid){ pthread_mutex_lock(&g_ptmx); if(nx_pt_find(tid)<0) for(int i=0;i<32;i++) if(!g_pt_tids[i]){ g_pt_tids[i]=tid; break; } pthread_mutex_unlock(&g_ptmx); }
+static void nx_pt_del(int tid){ pthread_mutex_lock(&g_ptmx); int i=nx_pt_find(tid); if(i>=0) g_pt_tids[i]=0; pthread_mutex_unlock(&g_ptmx); }
+static int  nx_pt_has(int tid){ pthread_mutex_lock(&g_ptmx); int r=nx_pt_find(tid)>=0; pthread_mutex_unlock(&g_ptmx); return r; }
+// PUBLIC: is `tid` currently ptrace-attached (by the debug-reg emu above)? box64's wait4 special-case
+// (x64syscall.c) queries this to report "stopped(SIGSTOP)" for the attached thread instead of "exited 0".
+int nx_ptrace_attached(int tid){ return nx_ptrace_emu_on() && tid > 0 && nx_pt_has(tid); }
+
 long syscall(long number, ...) {
     va_list ap; va_start(ap, number);
     unsigned long a0 = va_arg(ap, unsigned long);
@@ -935,6 +957,23 @@ long syscall(long number, ...) {
         case 99:  return 0;                          // set_robust_list -> accept
         case 293: errno = ENOSYS; return -1;         // rseq -> glibc tolerates ENOSYS (benign probe)
         case 233: return 0;                          // madvise -> advisory; no-op success (glibc malloc + thread-stack mgmt spam it per thread)
+        case 117: {  // ptrace(request, pid, addr, data) — DEBUG-REGISTER no-op emulation (see note above syscall())
+            if (!nx_ptrace_emu_on()) { errno = ENOSYS; return -1; }
+            int req = (int)a0, tid = (int)a1;
+            switch (req) {
+                case PTRACE_ATTACH: case PTRACE_SEIZE:
+                    nx_pt_add(tid);
+                    { extern void nx_result_log(const char*); static int logged=0; if(!logged){ logged=1; nx_result_log("nx: ptrace-emu active — wineserver debug-reg set becomes a no-op (ntdll:exception)"); } }
+                    return 0;
+                case PTRACE_DETACH: nx_pt_del(tid); return 0;
+                case PTRACE_CONT:   return 0;
+                case PTRACE_POKEUSER: return 0;   // pretend the debug register was written (box64 has none)
+                case PTRACE_PEEKUSER: return 0;   // debug registers read back as 0
+                default: errno = ENOSYS; return -1;   // PEEKDATA/POKEDATA/GETREGS/... unchanged (memory/regs)
+            }
+        }
+        // NB: wait4(asm-generic 260)/waitid(95) never reach here — box64 intercepts them in x64syscall.c
+        // (the fork()-no-op fake-child + the ptrace "stopped(SIGSTOP)" report use nx_ptrace_attached()).
         case 261: errno = ENOSYS; return -1;         // prlimit64 -> glibc falls back to getrlimit/defaults (sane-limits TODO after arena root-cause)
         case 278:                                    // getrandom(buf, len, flags)
             if (a0 && a1) { randomGet((void*)a0, a1); return (long)a1; }

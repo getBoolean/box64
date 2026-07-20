@@ -626,8 +626,18 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     if (s == 62)  { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // kill(pid,sig)
     if (s == 200) { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // tkill(tid,sig)
     if (s == 234) { S_RAX = my_tgkill(emu, (int)R_RDI, (int)R_RSI, (int)R_RDX); return; }   // tgkill(tgid,tid,sig)
-    if (s == 61) { // wait4(pid, status*, options, rusage) — pair with the fork() no-op (M2.5): the
-                   // "child" (fake pid 4242 from server_connect's start_server) reports exited 0.
+    if (s == 61) { // wait4(pid, status*, options, rusage)
+        // ntdll:exception: the in-process wineserver's set_thread_context(DEBUG_REGISTERS) does
+        // PTRACE_ATTACH -> waitpid(SIGSTOP) -> POKEUSER -> DETACH on a client thread it just "attached"
+        // (nx_posix.c ptrace no-op emu). For that attached tid, report STOPPED(SIGSTOP) so waitpid_thread
+        // succeeds; "exited 0" would make the server mark the thread dead and deny the whole request.
+        { extern int nx_ptrace_attached(int tid);
+          if (nx_ptrace_attached((int)R_RDI)) {
+              if (R_RSI) *(int*)R_RSI = 0x137f;   // WIFSTOPPED + WSTOPSIG=SIGSTOP(19): ((19<<8)|0x7f)
+              S_RAX = R_RDI; return;
+          } }
+        // Otherwise pair with the fork() no-op (M2.5): the "child" (fake pid 4242 from server_connect's
+        // start_server) reports exited 0.
         if (R_RSI) *(int*)R_RSI = 0;   // WIFEXITED, code 0
         S_RAX = R_RDI ? R_RDI : 4242; return;
     }
