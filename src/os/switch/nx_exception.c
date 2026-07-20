@@ -132,7 +132,7 @@ static int nx_exc_log_all(void) {
     return e;
 }
 
-// ---- KX_DIAG-CASC (temporary): nested-fault CASCADE ring buffer -----------------------------------
+// ---- KX_DIAG-CASC (standing): nested-fault CASCADE ring buffer -----------------------------------
 // The om/exception crash is an intermittent NESTED-FAULT CASCADE: a 2nd CPU fault taken WHILE box64 is
 // mid-delivery of a 1st fault, i.e. while the handler runs ON a slot stack. We need to see WHERE each
 // nested level re-faults (native PC + is-SP-on-a-slot-stack + chain depth) — but per-fault rlog commits
@@ -248,7 +248,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             }
             exc_chain[exc_depth++] = (uint8_t)slot;
         }
-        // KX_DIAG-S (temporary): log the claimed slot + post-prune depth. Monotonic slot with a
+        // KX_DIAG-S (standing): log the claimed slot + post-prune depth. Monotonic slot with a
         // growing/stuck depth => the syscall-recovery siglongjmp leaks a slot per fault (pool exhausts
         // at NSLOTS => the ~fault-48 corruption). Cycling slot + depth==1 => no leak.
         if (verbose) { char b[80];
@@ -269,7 +269,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
         }
     }
 
-    // KX_DIAG-A (temporary, DEREF-FREE): box64 .text anchor (symbolize the host fault PC of a nested crash)
+    // KX_DIAG-A (standing, DEREF-FREE): box64 .text anchor (symbolize the host fault PC of a nested crash)
     // + the live xEmu register (cpu_gprs[0]). Emitted BEFORE any structure walk (thread_get_emu / dynablock
     // lookup) so it survives even if THOSE nest-crash. Only channel that survives a 2nd fault.
     if (verbose) {
@@ -359,7 +359,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     }
 #endif
 
-    // KX_DIAG-B (temporary): the PRECISE guest RIP (getX64Address) + rw + db. If DIAG-A logged but DIAG-B
+    // KX_DIAG-B (standing): the PRECISE guest RIP (getX64Address) + rw + db. If DIAG-A logged but DIAG-B
     // does not, the nest-crash is in the FindDynablock/getX64Address lookup (lines above).
     if (verbose) {
         char b[160];
@@ -367,7 +367,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             (unsigned long long)x64pc, rw, cur_db);
         if (n > 0) nx_result_log(b);
     }
-    // KX_DIAG-INSN (temporary): dump the guest instruction bytes at the faulting RIP so a repeating
+    // KX_DIAG-INSN (standing): dump the guest instruction bytes at the faulting RIP so a repeating
     // fault (e.g. the om.c:149 write loop at a non-ntdll module) can be decoded — read vs SSE store,
     // which base register. getProtection-guarded so a bad x64pc doesn't nest-fault.
     if (verbose && getProtection((uintptr_t)x64pc)) {
@@ -416,7 +416,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
     info.si_code  = si_code;
     info.si_addr  = (void*)ctx->far.x;
 
-    // KX_DIAG (temporary): log the PRECISE guest RIP (getX64Address) + a box64 .text anchor (to symbolize
+    // KX_DIAG (standing): log the PRECISE guest RIP (getX64Address) + a box64 .text anchor (to symbolize
     // the nested-handler fault PC) + emu/db + the (process-GLOBAL) guest handler for this signal, BEFORE
     // the delivery path (which nest-crashes on real HW). This is the only channel that survives a 2nd fault.
     if (verbose) {
@@ -428,7 +428,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             (void*)emu, cur_db, sig, (unsigned long long)hh, rw);
         if (n > 0) nx_result_log(b);
     }
-    // KX_DIAG-C (temporary, DEREF-FREE): the guest TLS bases (%fs=TEB / %gs) + guest pid. If Wine's
+    // KX_DIAG-C (standing, DEREF-FREE): the guest TLS bases (%fs=TEB / %gs) + guest pid. If Wine's
     // dispatcher re-faults reading NtCurrentTeb()->ExceptionList, a WRONG fs/gs base is the smoking gun
     // (box64 delivered the fault with the wrong thread's TEB). segs_offs is plain emu state, no deref.
     if (verbose && emu) {

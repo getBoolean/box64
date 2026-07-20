@@ -577,7 +577,7 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
     }
 #endif
 #ifdef __SWITCH__
-    // KX_DIAG-R (temporary): which recovery path did Wine's segv_handler choose? Log old (faulting)
+    // KX_DIAG-R (standing): which recovery path did Wine's segv_handler choose? Log old (faulting)
     // RIP/RSP vs the handler-set RIP/RSP. old==new (chg=0) => the line-2005 same-RIP loop
     // (virtual_handle_fault falsely returned SUCCESS); new = __wine_syscall_dispatcher_return =>
     // clean syscall-status recovery; new = KiUserExceptionDispatcher => user-mode exception dispatch
@@ -595,7 +595,7 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
           (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RSP],
           (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RSP]);
         if(n>0) nx_result_log(b);
-        // KX_DIAG-RECFLAGS (temporary): when the guest handler set up KiUserExceptionDispatcher (chg=1),
+        // KX_DIAG-RECFLAGS (standing): when the guest handler set up KiUserExceptionDispatcher (chg=1),
         // Wine's setup_raise_exception placed a stack_layout at the new RSP: {CONTEXT; CONTEXT_EX;
         // EXCEPTION_RECORD; ...}. Scan the low part of that frame for the EXCEPTION_RECORD (ExceptionCode
         // 0xCxxxxxxx) and dump its ExceptionFlags — the ntdll:exception 0xC0000025 fingerprint is
