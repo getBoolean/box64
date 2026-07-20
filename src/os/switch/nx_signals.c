@@ -594,7 +594,34 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, x64_s
           (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RIP],
           (unsigned long long)sigcontext_copy.uc_mcontext.gregs[X64_RSP],
           (unsigned long long)sigcontext->uc_mcontext.gregs[X64_RSP]);
-        if(n>0) nx_result_log(b); } }
+        if(n>0) nx_result_log(b);
+        // KX_DIAG-RECFLAGS (temporary): when the guest handler set up KiUserExceptionDispatcher (chg=1),
+        // Wine's setup_raise_exception placed a stack_layout at the new RSP: {CONTEXT; CONTEXT_EX;
+        // EXCEPTION_RECORD; ...}. Scan the low part of that frame for the EXCEPTION_RECORD (ExceptionCode
+        // 0xCxxxxxxx) and dump its ExceptionFlags — the ntdll:exception 0xC0000025 fingerprint is
+        // EH_NONCONTINUABLE(bit0) set on a rec that dreg_handler "continues". flags=0 here => the
+        // noncontinuable bit is introduced LATER in guest dispatch (an emulation-fidelity bug); flags!=0 =>
+        // box64 delivered / Wine built the record noncontinuable at the source.
+        if(chg) {
+            static __thread int rf_n = 0;
+            uintptr_t nrsp = (uintptr_t)sigcontext->uc_mcontext.gregs[X64_RSP];
+            if(rf_n < 4 && nrsp && getProtection(nrsp)) {
+                for(int off=0x400; off<=0x520; off+=8) {
+                    if(!getProtection(nrsp+off)) break;
+                    uint32_t code  = *(volatile uint32_t*)(nrsp+off);
+                    uint32_t flags = *(volatile uint32_t*)(nrsp+off+4);
+                    if((code & 0xF0000000u) == 0xC0000000u) {
+                        char rb[176];
+                        snprintf(rb, sizeof rb, "nx_recflags: nRSP=0x%llx off=0x%x code=0x%x flags=0x%x nparam=0x%x info0=0x%llx",
+                            (unsigned long long)nrsp, off, code, flags,
+                            *(volatile uint32_t*)(nrsp+off+24),
+                            (unsigned long long)*(volatile uint64_t*)(nrsp+off+32));
+                        nx_result_log(rb); rf_n++; break;
+                    }
+                }
+            }
+        }
+    } }
 #endif
     if(memcmp(sigcontext, &sigcontext_copy, sizeof(x64_ucontext_t))) {
         // The guest handler CHANGED the context => it resolved this fault (syscall-status recovery to
