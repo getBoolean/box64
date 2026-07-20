@@ -455,22 +455,38 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
         static __thread uint32_t  last_val = 0;
         static __thread uint32_t  last_seq = 0;
         static __thread int repeat = 0;
+        static __thread uint32_t site_total = 0;    // faults at this (far,rip) IGNORING recovery
+        static int loopmax = -1;
+        if (loopmax < 0) { const char* s = getenv("KX_EXC_LOOPMAX"); loopmax = s ? atoi(s) : 100000; }
         uint32_t cur_val = 0;
         if (((esr >> 6) & 1) /*WnR*/ && getProtection(ctx->far.x))
             cur_val = *(volatile uint32_t*)ctx->far.x;   // store target — mapped, safe to read
-        // Count a repeat ONLY when the same (far,rip,value) recurs AND the guest handler did NOT recover
-        // anything since the last such fault (kx_recov_seq unchanged). If a recovery happened
-        // (kx_recov_seq advanced), the guest is progressing — a finite loop of recovered syscall-boundary
-        // bad-pointer faults (e.g. om.c:149's NtCreateNamedPipeFile) re-faults at one identical (far,rip)
-        // but each returns STATUS_ACCESS_VIOLATION and the test advances. Only a genuine no-recovery
-        // re-fault (chg=0, box64 re-running the same insn / delivery broken) trips the guard.
-        if (ctx->far.x == last_far && x64pc == last_rip && cur_val == last_val && kx_recov_seq == last_seq) {
-            if (++repeat >= 16) {
-                nx_result_log("nx_exc: same fault repeated 16x with no progress — giving up");
+        if (ctx->far.x == last_far && x64pc == last_rip) {
+            // Runaway BACKSTOP: an INFINITE loop of RECOVERED faults at one site never trips the
+            // no-progress guard below (the recovery-reset keeps clearing it — e.g. ntdll:time
+            // re-faulting a bad-pointer write Wine "recovers" forever), which would HANG a
+            // HOME-launched title (needs a reboot). Bail at a high per-site count REGARDLESS of
+            // recovery so it crash-reports cleanly instead. A finite recovered loop (om.c:149) is far
+            // under the cap; SMC faults hit DIFFERENT (far,rip) each iteration so they never accumulate
+            // here (and go via the SMC branch, not this delivery path). KX_EXC_LOOPMAX tunes it; 0=off.
+            if (loopmax > 0 && ++site_total >= (uint32_t)loopmax) {
+                nx_result_log("nx_exc: same fault site past KX_EXC_LOOPMAX — runaway recovered loop, giving up");
                 nx_exc_unhandled_tail(ctx, cur_db, rx, rw, sig, si_code, x64pc);
                 return;
             }
-        } else { last_far = ctx->far.x; last_rip = x64pc; last_val = cur_val; last_seq = kx_recov_seq; repeat = 0; }
+            // No-progress (chg=0) sub-check: count a repeat ONLY when (value) recurs AND the guest
+            // handler did NOT recover anything since (kx_recov_seq unchanged). A recovery (seq advanced)
+            // means the guest is progressing — a finite loop of recovered bad-pointer faults returns
+            // STATUS_ACCESS_VIOLATION each time and the test advances. Only a genuine no-recovery
+            // re-fault (chg=0, box64 re-running the same insn / delivery broken) trips this at 16.
+            if (cur_val == last_val && kx_recov_seq == last_seq) {
+                if (++repeat >= 16) {
+                    nx_result_log("nx_exc: same fault repeated 16x with no progress — giving up");
+                    nx_exc_unhandled_tail(ctx, cur_db, rx, rw, sig, si_code, x64pc);
+                    return;
+                }
+            } else { last_val = cur_val; last_seq = kx_recov_seq; repeat = 0; }
+        } else { last_far = ctx->far.x; last_rip = x64pc; last_val = cur_val; last_seq = kx_recov_seq; repeat = 0; site_total = 0; }
     }
 
 #ifdef DYNAREC
