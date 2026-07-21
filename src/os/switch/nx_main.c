@@ -76,8 +76,16 @@ static void nx_guest_log_raw(const void *buf, size_t len) {
         } else g_glog_fd = -1;
     }
     if (g_glog_fd >= 0) {
-        write(g_glog_fd, buf, len);
-        g_glog_pending += len;
+        // B: cap the log so a chatty guest (WINEDEBUG=+seh) can't write gigabytes to the SD and starve the
+        // FS path. Only the fsdev COMMIT was throttled before; the write() itself was unbounded. Default
+        // 16 MiB; KX_GUEST_LOG_CAP overrides (bytes; 0 = unbounded for a deliberate full-capture run).
+        static size_t written = 0; static long cap = -1; static int capnote = 0;
+        if (cap < 0) { const char* s = getenv("KX_GUEST_LOG_CAP"); cap = s ? atol(s) : (16L * 1024 * 1024); }
+        size_t wlen = len;
+        if (cap > 0 && written + wlen > (size_t)cap) wlen = written < (size_t)cap ? (size_t)cap - written : 0;
+        if (wlen) { write(g_glog_fd, buf, wlen); written += wlen; g_glog_pending += wlen; }
+        else if (!capnote) { capnote = 1; const char m[] = "\n[nx: box64-guest.log hit KX_GUEST_LOG_CAP]\n";
+                             write(g_glog_fd, m, sizeof m - 1); g_glog_pending += sizeof m - 1; }
         u64 now = svcGetSystemTick();
         if (g_glog_pending >= 8192 || now - g_glog_last_commit > 9600000ULL) {   // 19200 ticks/ms * 500 ms
             fsdevCommitDevice("sdmc");
@@ -123,7 +131,16 @@ void nx_guest_output(int fd, const void *buf, size_t len) {
     // next main-thread present — nx_applet_keepalive() pumps one every ~30 ms. All of it tees to the SD
     // file below too, so it's LOGGED as well as shown.
     fwrite(buf, 1, len, stdout); fflush(stdout);
-    if (threadGetCurHandle() == g_main_thread) consoleUpdate(NULL);
+    // THROTTLE the gfx present (fix A). A per-line consoleUpdate() is vsync-bound (~16 ms) on the main
+    // thread, so a chatty guest (WINEDEBUG=+seh) keeps the main thread HERE and never pumps appletMainLoop()
+    // -> the app goes unresponsive and `am` panics/terminates it (cost a hard reset 2026-07-20). All lines
+    // are already rendered into the console grid by the fwrite above; only the PRESENT needs throttling.
+    // nx_applet_keepalive() is main-thread-guarded, throttles the present to 30 ms, AND pumps appletMainLoop()
+    // so the layer stays alive+responsive under a flood. KX_NO_PRESENT_THROTTLE=1 restores per-line for A/B.
+    { extern void nx_applet_keepalive(void); static int thr = -1;
+      if (thr < 0) thr = getenv("KX_NO_PRESENT_THROTTLE") ? 0 : 1;
+      if (thr) nx_applet_keepalive();
+      else if (threadGetCurHandle() == g_main_thread) consoleUpdate(NULL); }
     // Bounded so a chatty guest can't flood the SD, but generous enough that a wineserver's startup
     // chatter (registry-save warnings, ~1 KiB) doesn't crowd out the actual command output that
     // follows — this file is the ONLY result channel on real HW.

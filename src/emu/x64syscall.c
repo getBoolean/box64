@@ -727,6 +727,10 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
 #endif
             S_RAX = write(S_EDI, (void*)R_RSI, (size_t)R_RDX);
 #ifdef __SWITCH__
+            // fix C-alt: yield CPU under a sustained real-file write storm (ntdll:file/dirstress) so the
+            // co-scheduled sysmodules (sys-ftpd, HDLS, network) don't starve. Real files only (fd 1/2 are
+            // tee'd above and handled by the present-throttle / log-cap, not this governor).
+            if ((int)S_EDI > 2 && (long)S_RAX > 0) { extern void nx_write_governor(size_t); nx_write_governor((size_t)S_RAX); }
             { static int on = -1; if (on < 0) { extern char* getenv(const char*); on = getenv("KX_REQLOG") ? 1 : 0; }
               if (on && (int)S_EDI > 2) { char b[80]; extern int nx_guest_pid(void);
                 int n = snprintf(b, sizeof b, "nx: WR> pid=%d fd=%d ret=%d\n", nx_guest_pid(), (int)S_EDI, (int)S_RAX);

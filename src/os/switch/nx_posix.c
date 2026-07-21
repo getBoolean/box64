@@ -917,6 +917,29 @@ static int  nx_pt_has(int tid){ pthread_mutex_lock(&g_ptmx); int r=nx_pt_find(ti
 // (x64syscall.c) queries this to report "stopped(SIGSTOP)" for the attached thread instead of "exited 0".
 int nx_ptrace_attached(int tid){ return nx_ptrace_emu_on() && tid > 0 && nx_pt_has(tid); }
 
+// Write governor (fix C-alt): CPU-yield under a SUSTAINED guest file-write storm. A tight loop of real-file
+// writes (the ntdll:file / dirstress temp-file churn) is a storm of fsdev IPC that saturates CPU + the FS
+// sysmodule, starving the CO-SCHEDULED sysmodules (sys-ftpd, HDLS/switch-mcp, network) so the console wedges
+// — the root cause is resource monopolisation, NOT SD throughput (switch-mcp, which never touches the SD,
+// also dies). A brief svcSleepThread yields the core so those sysmodules get scheduled AND stops the guest
+// issuing more fsdev IPC, letting the FS queue drain. RAM-NEUTRAL (no buffering) — preferred over a RAM-
+// backed /tmp for RAM-hungry games. Only a sustained run (writes < 2 ms apart) is paced, so a game's
+// occasional saves never trigger it. Per-thread. Tunables (need HW tuning): KX_NO_WRGOV (off), KX_WRGOV_OPS
+// (rapid writes per yield, default 64), KX_WRGOV_US (yield microseconds, default 500).
+void nx_write_governor(size_t bytes) {
+    static int on = -1, ops_lim = 64; static long yield_ns = 500000;
+    if (on < 0) { on = getenv("KX_NO_WRGOV") ? 0 : 1;
+                  const char* o = getenv("KX_WRGOV_OPS"); if (o) ops_lim = atoi(o);
+                  const char* u = getenv("KX_WRGOV_US");  if (u) yield_ns = atol(u) * 1000; }
+    if (!on) return;
+    (void)bytes;
+    static __thread u64 last = 0; static __thread int run = 0;
+    u64 now = svcGetSystemTick();
+    if (now - last > 38400ULL) run = 0;    // > 2 ms since the last write => sparse, not a storm; reset
+    last = now;
+    if (++run >= ops_lim) { svcSleepThread((u64)yield_ns); run = 0; }
+}
+
 long syscall(long number, ...) {
     va_list ap; va_start(ap, number);
     unsigned long a0 = va_arg(ap, unsigned long);
@@ -1131,6 +1154,7 @@ long syscall(long number, ...) {
             off_t cur = lseek(wfd, 0, SEEK_CUR);
             if (lseek(wfd, (off_t)a3, SEEK_SET) < 0) return -1;
             ssize_t r = write(wfd, (const void*)a1, (size_t)a2);
+            { extern void nx_write_governor(size_t); if (r > 0) nx_write_governor((size_t)r); }   // fix C-alt
             lseek(wfd, cur, SEEK_SET);
             return (long)r;
         }
@@ -1155,7 +1179,8 @@ long syscall(long number, ...) {
                 long r;
                 if (to) nx_guest_output(to, v[i].base, v[i].len);
                 if (wfd == 1 || wfd == 2) r = (long)v[i].len;   // the tee IS the console channel
-                else                      r = write(wfd, v[i].base, v[i].len);
+                else { r = write(wfd, v[i].base, v[i].len);
+                       extern void nx_write_governor(size_t); if (r > 0) nx_write_governor((size_t)r); }  // fix C-alt
                 if (r < 0) return total ? total : -1;
                 total += r;
                 if ((size_t)r < v[i].len) break;
