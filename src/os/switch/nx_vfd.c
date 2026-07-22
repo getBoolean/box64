@@ -251,6 +251,10 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
     // Snapshot the directory ONCE on the first getdents (opendir -> readdir all -> closedir), so the
     // open dir vfd holds NO persistent fsdev handle. Serve subsequent getdents from the buffer.
     if (!v->dents) {
+        // fix C-alt (metadata governor): the opendir->readdir->closedir snapshot below is a real fsdev
+        // enumeration burst that does NOT pass through nx_translate_path, so pace it here too — one yield-
+        // decision per enumeration keeps a readdir storm (dirstress) from starving the sysmodules.
+        { extern void nx_meta_governor(void); nx_meta_governor(); }
         DIR* d = opendir(v->host);
         if (!d) { errno = ENOENT; return -1; }
         int cap = 64;

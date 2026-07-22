@@ -815,6 +815,11 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
     // symbol scope (ntdll's __wine_main becomes unresolvable). Force ENOENT for hwcaps variant paths so
     // ld.so falls back to the single base libc. (Must precede the flat-basename fallback below.)
     if (strstr(p, "/glibc-hwcaps/")) { errno = ENOENT; return -1; }
+    // fix C-alt (metadata governor): this block is the ONE choke point every real fsdev metadata op
+    // (openat/stat/access/mkdir/rmdir/unlink/rename) funnels through — the synthetic cases (/proc, /dev,
+    // hwcaps, sdmc:) all returned above. One yield-decision here paces the whole metadata class under a
+    // storm (ntdll:file/dirstress) so the co-scheduled sysmodules survive. KX_NO_METAGOV opts out.
+    { extern void nx_meta_governor(void); nx_meta_governor(); }
     // Rootfs tree first, then the flat lib/<basename> fallback, else the rootfs path
     // (so an O_CREAT of a new file still lands somewhere sane under the rootfs).
     {
@@ -936,6 +941,30 @@ void nx_write_governor(size_t bytes) {
     static __thread u64 last = 0; static __thread int run = 0;
     u64 now = svcGetSystemTick();
     if (now - last > 38400ULL) run = 0;    // > 2 ms since the last write => sparse, not a storm; reset
+    last = now;
+    if (++run >= ops_lim) { svcSleepThread((u64)yield_ns); run = 0; }
+}
+
+// Metadata governor (fix C-alt sibling): CPU-yield under a SUSTAINED guest directory/METADATA storm
+// (open/stat/unlink/mkdir/rmdir/rename/access + readdir). The write governor above only paces write()
+// BYTES, but the real ntdll:file / dirstress wedge is dominated by metadata OPS — create/stat/readdir/
+// unlink over thousands of DISTINCT files — each a full fsdev IPC round-trip that starves the co-scheduled
+// sysmodules exactly like the write storm (floodfile could not reproduce the wedge because it churns bytes,
+// not distinct-name metadata). Same rationale + policy as nx_write_governor but a SEPARATE op class +
+// counter, so the HW-verified write path stays byte-for-byte unchanged and each class A/Bs independently.
+// Called ONCE per real fsdev metadata op from the single choke point nx_translate_path (below) + the
+// getdents64 enumeration in nx_vfd.c. Per-thread; only a sustained run (ops < 2 ms apart) is paced, so a
+// game's occasional file ops never trip it. RAM-NEUTRAL. Tunables (need HW tuning): KX_NO_METAGOV (off),
+// KX_METAGOV_OPS (rapid meta ops per yield, default 64), KX_METAGOV_US (yield microseconds, default 500).
+void nx_meta_governor(void) {
+    static int on = -1, ops_lim = 64; static long yield_ns = 500000;
+    if (on < 0) { on = getenv("KX_NO_METAGOV") ? 0 : 1;
+                  const char* o = getenv("KX_METAGOV_OPS"); if (o) ops_lim = atoi(o);
+                  const char* u = getenv("KX_METAGOV_US");  if (u) yield_ns = atol(u) * 1000; }
+    if (!on) return;
+    static __thread u64 last = 0; static __thread int run = 0;
+    u64 now = svcGetSystemTick();
+    if (now - last > 38400ULL) run = 0;    // > 2 ms since the last meta op => sparse, not a storm; reset
     last = now;
     if (++run >= ops_lim) { svcSleepThread((u64)yield_ns); run = 0; }
 }
