@@ -24,6 +24,17 @@
 #define NX_GUEST_PATH "sdmc:/box64/box64-guest"
 #endif
 
+// Horizon timing units. svcGetSystemTick() ticks at 19.2 MHz (19200/ms); a 60 Hz frame is ~16 ms.
+#define NX_TICKS_PER_MS        19200ULL     // svcGetSystemTick rate — for the ms->tick throttle math below
+#define NX_FRAME_SLEEP_NS      16000000ULL  // ~16 ms (one 60 Hz frame): present-loop / +-poll sleep quantum
+#define NX_FRAMES_PER_SEC      60           // present-loop iterations per on-screen second
+#define NX_PRESENT_THROTTLE_MS 30           // nx_applet_keepalive: min gap between gfx presents on the hot path
+#define NX_HOMEBREW_HOLD_SEC   8            // NRO tail hold: keep the result on screen this long before teardown
+#define NX_TITLE_HOLD_SEC      30           // installed-title tail hold (longer; no nxlink to read the result)
+#define NX_GLOG_COMMIT_BYTES   8192         // flush the guest log to SD after this many pending bytes...
+#define NX_GLOG_COMMIT_MS      500          // ...or after this long, whichever comes first
+#define NX_GLOG_DEFAULT_CAP    (16L * 1024 * 1024)  // default guest-log cap (KX_GUEST_LOG_CAP overrides; 0 = unbounded)
+
 // FS concurrency: DO NOT raise libnx's __nx_fs_num_sessions (default 3). Every guest file op is an fsp-srv
 // IPC funnelled through libnx's g_fsSessionMgr pool of N cloned sessions. Raising N was MEASURED on real HW
 // (floodmeta T=12, governors off) and REGRESSES throughput: 3 sessions ~126 files/s -> 8 sessions ~95
@@ -89,14 +100,14 @@ static void nx_guest_log_raw(const void *buf, size_t len) {
         // FS path. Only the fsdev COMMIT was throttled before; the write() itself was unbounded. Default
         // 16 MiB; KX_GUEST_LOG_CAP overrides (bytes; 0 = unbounded for a deliberate full-capture run).
         static size_t written = 0; static long cap = -1; static int capnote = 0;
-        if (cap < 0) { const char* s = getenv("KX_GUEST_LOG_CAP"); cap = s ? atol(s) : (16L * 1024 * 1024); }
+        if (cap < 0) { const char* s = getenv("KX_GUEST_LOG_CAP"); cap = s ? atol(s) : NX_GLOG_DEFAULT_CAP; }
         size_t wlen = len;
         if (cap > 0 && written + wlen > (size_t)cap) wlen = written < (size_t)cap ? (size_t)cap - written : 0;
         if (wlen) { write(g_glog_fd, buf, wlen); written += wlen; g_glog_pending += wlen; }
         else if (!capnote) { capnote = 1; const char m[] = "\n[nx: box64-guest.log hit KX_GUEST_LOG_CAP]\n";
                              write(g_glog_fd, m, sizeof m - 1); g_glog_pending += sizeof m - 1; }
         u64 now = svcGetSystemTick();
-        if (g_glog_pending >= 8192 || now - g_glog_last_commit > 9600000ULL) {   // 19200 ticks/ms * 500 ms
+        if (g_glog_pending >= NX_GLOG_COMMIT_BYTES || now - g_glog_last_commit > NX_GLOG_COMMIT_MS * NX_TICKS_PER_MS) {
             fsdevCommitDevice("sdmc");
             g_glog_pending = 0;
             g_glog_last_commit = now;
@@ -252,7 +263,7 @@ void nx_wait_for_exit_button(void) {
         padUpdate(&pad);
         if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
         consoleUpdate(NULL);
-        svcSleepThread(16000000ULL);
+        svcSleepThread(NX_FRAME_SLEEP_NS);
     }
     rlog("hold: + pressed, exiting");
 }
@@ -267,7 +278,7 @@ void nx_applet_keepalive(void) {
     if (threadGetCurHandle() != g_main_thread) return;
     static u64 last = 0;
     u64 now = svcGetSystemTick();
-    if (now - last < 576000ULL) return;   // 19200 ticks/ms * 30 ms
+    if (now - last < NX_PRESENT_THROTTLE_MS * NX_TICKS_PER_MS) return;   // ~30 ms between presents
     last = now;
     appletMainLoop();
     consoleUpdate(NULL);
@@ -282,8 +293,8 @@ static void nx_hold_and_exit(void) {
     if (!g_hold_done) {
         kout("\n(returning to the menu shortly)\n");
         consoleUpdate(NULL);
-        if (g_homebrew) for (int i = 0; i < 8 * 60 && appletMainLoop(); ++i) svcSleepThread(16000000ULL);
-        else            for (int i = 0; i < 30 * 60; ++i) svcSleepThread(16000000ULL);
+        if (g_homebrew) for (int i = 0; i < NX_HOMEBREW_HOLD_SEC * NX_FRAMES_PER_SEC && appletMainLoop(); ++i) svcSleepThread(NX_FRAME_SLEEP_NS);
+        else            for (int i = 0; i < NX_TITLE_HOLD_SEC * NX_FRAMES_PER_SEC; ++i) svcSleepThread(NX_FRAME_SLEEP_NS);
     }
     if (g_have_romfs) romfsExit();
     if (g_nxlink_fd >= 0) close(g_nxlink_fd);
