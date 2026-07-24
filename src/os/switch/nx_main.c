@@ -24,6 +24,15 @@
 #define NX_GUEST_PATH "sdmc:/box64/box64-guest"
 #endif
 
+// FS concurrency: DO NOT raise libnx's __nx_fs_num_sessions (default 3). Every guest file op is an fsp-srv
+// IPC funnelled through libnx's g_fsSessionMgr pool of N cloned sessions. Raising N was MEASURED on real HW
+// (floodmeta T=12, governors off) and REGRESSES throughput: 3 sessions ~126 files/s -> 8 sessions ~95
+// files/s (~25% slower, two consistent windows). Reason: the SD media + FS sysmodule serialise real I/O, so
+// more in-flight sessions add only dispatch/condvar/context-switch overhead with no media parallelism to
+// gain. The "12 threads slower than 1" concurrency penalty is NOT fixable by session count — the real lever
+// is algorithmic (fewer IPCs per op: kill openat's double-stat, cache stats, drop the pread/pwrite lseek
+// dance). Leaving the libnx default in place. (2026-07-23; see porting-log.)
+
 static void kdbg(const char *s) { svcOutputDebugString(s, strlen(s)); }
 
 // Append a line to a result file on the SD. A title (NSP) has no nxlink and its console is replaced by
@@ -352,6 +361,13 @@ int main(int argc, char **argv) {
     // demands multiple GiB and ordinary mallocs ENOMEM (stress.c p3 exit 4). 4 arenas ~= one per core
     // + main; box64.env can override (overwrite=0 -> the env file wins).
     setenv("MALLOC_ARENA_MAX", "4", 0);
+    // Wine needs HOME: ntdll's set_home_dir() (loader.c) does strdup(getenv("HOME")) with NO NULL guard,
+    // and Horizon has no /etc/passwd (box64's getpwuid is an ENOSYS stub), so getpwuid() can't supply it
+    // either -> a bare `wine cmd.exe` with no HOME crashes in strdup(NULL)->__strlen_avx2(NULL). Inject a
+    // default (overwrite=0 -> box64.env / the tests/wine harness still win); /root matches the staged
+    // WINEPREFIX=/root/.wine. Fixes the client AND the in-process wineserver (server/request.c reads HOME).
+    setenv("HOME", "/root", 0);
+    setenv("USER", "root", 0);
     // Declare supported pads to Horizon ASAP (after load_env_file so KX_PAD_CONFIG can force it on):
     // without a hidSetSupportedNpadStyleSet/IdType call the npad arbiter cannot bind a Bluetooth
     // controller to any slot and powers it off (see the comment above). 8 players so a switch-mcp
