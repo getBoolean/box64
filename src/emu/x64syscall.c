@@ -602,6 +602,10 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             // The marker is usually the guest log's LAST write — force the throttled commit or it
             // sits in the buffer and the harness (polling the host file) never sees it.
             { extern void nx_guest_log_flush(void); nx_guest_log_flush(); }
+            // KX_REQLOG: dump the cumulative fsdev-IPC counters once, here at the true process exit — this
+            // path fires for BOTH the simple test guests AND the wine cmd run (which exits from inside
+            // emulate() and never reaches nx_main's "guest exited" line). One-shot + KX_REQLOG-gated inside.
+            { extern void nx_ipc_stats_dump(void); nx_ipc_stats_dump(); }
         }
         emu->quit = 1;
         emu->exit = 1;   // box64-nx (M2.2c2): mark a REAL guest exit, not just a loop-unwind. Needed when

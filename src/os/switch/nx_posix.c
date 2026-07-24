@@ -314,6 +314,22 @@ int nx_stdfd_regularize(int fd, unsigned mode) {
     }
     return is;
 }
+// ---- Fewer FS-service IPCs per guest file op (2026-07-23; see the resolver + nx_main.c:27) -----------
+// box64-nx guest file I/O is fsdev-IPC-bound: ~160 ops/s floor and 12 threads AGGREGATE SLOWER than 1
+// (g_fsSessionMgr + the single SD/FS-sysmodule serialize real media). The session-pool lever measured
+// NEGATIVE on HW (3->8 = ~25% slower, reverted); the ONLY remaining lever is algorithmic — cut the IPC
+// count per op (nx_translate_path_ex dir-probe dedup + the resolution cache below the resolver). These
+// cumulative counters (dumped once at guest exit under KX_REQLOG, nx_ipc_stats_dump) sit at each real
+// fsdev site. Plain unsigned long + __atomic (matches the g_fdino idiom below) — no _Atomic needed. The
+// four mutation counters are written from nx_vfd.c, so they are file-scope (non-static) globals.
+unsigned long nx_ipc_unlink = 0, nx_ipc_mkdir = 0, nx_ipc_rmdir = 0, nx_ipc_rename = 0;
+static unsigned long nx_ipc_probe1 = 0;   // rootfs stat probe (nx_translate_path_ex)
+static unsigned long nx_ipc_probe2 = 0;   // flat-lib stat probe (nx_translate_path_ex)
+static unsigned long nx_ipc_fstatat = 0;  // fstatat's stat (below)
+static unsigned long nx_ipc_open   = 0;   // openat's real open
+static unsigned long g_pc_hit = 0, g_pc_miss = 0;   // resolution-cache hit/miss
+#define NX_IPC_INC(c) __atomic_add_fetch(&(c), 1, __ATOMIC_RELAXED)
+
 int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     int r;
     extern int nx_vfd_is(int fd);
@@ -357,6 +373,7 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
           if (nx_vfd_path_stat(path, b) == 0) return 0; }
         if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
         have_hp = 1;
+        NX_IPC_INC(nx_ipc_fstatat);
         r = stat(hp, b);
     }
     // Every stat MUST return a non-zero st_ino: ld.so dedups loaded objects by (dev,ino), so a zero
@@ -794,13 +811,68 @@ static void nx_normalize_guest(const char* p, char* out, size_t outn) {
     }
 }
 
-int nx_translate_path(const char* p, char* out, size_t outn) {
+// Phase 2 resolution cache: memoizes ONLY the probe block below (the 1-2 live stat IPCs). A hit returns
+// the winning host path + captured stat/exists/is_dir with ZERO fsdev IPC. Correctness rests on host-path
+// immutability (a normalized guest path P resolves to NX_ROOTFS+P, or on a rootfs-miss+flat-lib-hit to
+// NX_LIBDIR+basename — a static staging dir) plus nx_pc_invalidate on every successful mutation. Negative
+// entries (exists=0) are safe: the caller still decides existence (fstatat re-stats; openat just skips the
+// dir-redirect and open()s). KX_NO_PATHCACHE=1 restores the un-cached path exactly for A/B.
+#define NX_PC_SIZE 64
+typedef struct {
+    unsigned long hash, gen;
+    int used, exists, is_dir;
+    char guest[512], host[512];
+    struct stat st;
+} nx_pc_ent;
+static nx_pc_ent g_pc[NX_PC_SIZE];
+static unsigned long g_pc_gen = 0;
+static pthread_mutex_t g_pc_mx = PTHREAD_MUTEX_INITIALIZER;
+
+static int nx_pc_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("KX_NO_PATHCACHE") ? 0 : 1;
+    return on;
+}
+static unsigned long nx_pc_hash(const char* s) {
+    unsigned long h = 1469598103934665603UL;             // FNV-1a 64 (same constants as path_ino/fstatat)
+    for (const char* c = s; c && *c; ++c) { h ^= (unsigned char)*c; h *= 1099511628211UL; }
+    return h ? h : 1;
+}
+// Drop the cached entry for a raw guest path (normalized here to match the key) after a successful
+// mutation that changes existence/type at that path. Declared in nx_posix.h; called from the nx_vfd.c
+// mutation helpers + openat's O_CREAT-success hook.
+void nx_pc_invalidate(const char* raw) {
+    if (!raw || !raw[0] || !nx_pc_on()) return;
+    char norm[512]; nx_normalize_guest(raw, norm, sizeof norm);
+    unsigned long h = nx_pc_hash(norm);
+    pthread_mutex_lock(&g_pc_mx);
+    for (int i = 0; i < NX_PC_SIZE; i++)
+        if (g_pc[i].used && g_pc[i].hash == h && !strcmp(g_pc[i].guest, norm)) { g_pc[i].used = 0; break; }
+    pthread_mutex_unlock(&g_pc_mx);
+}
+// Whole-table flush — for directory rmdir/rename, which can strand cached child entries under the
+// removed/renamed dir (rare; cheaper than tracking child relationships). Uses a local extern at callers.
+void nx_pc_flush(void) {
+    if (!nx_pc_on()) return;
+    pthread_mutex_lock(&g_pc_mx);
+    for (int i = 0; i < NX_PC_SIZE; i++) g_pc[i].used = 0;
+    pthread_mutex_unlock(&g_pc_mx);
+}
+
+// M2.4 rootfs VFS resolver, Phase-1/2 aware. *exists (nullable) is 0 on entry and set 1 ONLY on a probe
+// hit, when *out_st (nullable) receives that stat; every synthetic/passthrough return leaves *exists=0
+// (its host path is a materialized regular file or an sdmc: passthrough — openat must NOT dir-redirect
+// it). Return: 0 with `out` set even when !exists (the caller decides existence — the fallthrough
+// contract), -1 (ENOENT) only for the hwcaps force-miss / empty path.
+int nx_translate_path_ex(const char* p, char* out, size_t outn, int* exists, struct stat* out_st) {
+    if (exists) *exists = 0;
     if (!p || !p[0]) { errno = ENOENT; return -1; }
     if (!strncmp(p, "sdmc:", 5)) { snprintf(out, outn, "%s", p); return 0; }   // already Horizon
     char norm[512];
     nx_normalize_guest(p, norm, sizeof norm);
     p = norm;
-    // Synthetic pseudo-files, backed by a materialized SD temp file.
+    // Synthetic pseudo-files, backed by a materialized SD temp file. These MUST run every call — esp.
+    // /dev/urandom, which re-fills fresh randomGet bytes each open — so they precede the resolution cache.
     if (!strcmp(p, "/proc/cpuinfo"))
         return nx_materialize("proc-cpuinfo", kx_cpuinfo, sizeof kx_cpuinfo - 1, out, outn);
     if (!strcmp(p, "/dev/urandom") || !strcmp(p, "/dev/random") || !strcmp(p, "/dev/hwrng")) {
@@ -813,25 +885,101 @@ int nx_translate_path(const char* p, char* out, size_t outn) {
     // .../glibc-hwcaps/x86-64-v3/libc.so.6 FIRST. If our flat-lib fallback answered that with the base
     // libc, ld.so would load libc TWICE under two host paths (base + hwcaps) -> two inodes -> a split
     // symbol scope (ntdll's __wine_main becomes unresolvable). Force ENOENT for hwcaps variant paths so
-    // ld.so falls back to the single base libc. (Must precede the flat-basename fallback below.)
+    // ld.so falls back to the single base libc. (Must precede the flat-basename fallback + the cache.)
     if (strstr(p, "/glibc-hwcaps/")) { errno = ENOENT; return -1; }
-    // fix C-alt (metadata governor): this block is the ONE choke point every real fsdev metadata op
-    // (openat/stat/access/mkdir/rmdir/unlink/rename) funnels through — the synthetic cases (/proc, /dev,
-    // hwcaps, sdmc:) all returned above. One yield-decision here paces the whole metadata class under a
-    // storm (ntdll:file/dirstress) so the co-scheduled sysmodules survive. KX_NO_METAGOV opts out.
+
+    // ---- Phase 2: resolution cache wraps ONLY the probe block below. --------------------------------
+    // Lookup BEFORE nx_meta_governor: a hit does ZERO fsdev IPC, so it must NOT be paced (pacing a free
+    // op would only slow warm Wine startup). A miss pays the governor + the real probes, then inserts.
+    int on = nx_pc_on();
+    if (on) {
+        unsigned long h = nx_pc_hash(p);
+        pthread_mutex_lock(&g_pc_mx);
+        for (int i = 0; i < NX_PC_SIZE; i++) {
+            if (g_pc[i].used && g_pc[i].hash == h && !strcmp(g_pc[i].guest, p)) {
+                snprintf(out, outn, "%s", g_pc[i].host);
+                if (exists) *exists = g_pc[i].exists;
+                if (out_st && g_pc[i].exists) *out_st = g_pc[i].st;
+                g_pc[i].gen = ++g_pc_gen;                          // LRU touch
+                pthread_mutex_unlock(&g_pc_mx);
+                NX_IPC_INC(g_pc_hit);
+                return 0;
+            }
+        }
+        pthread_mutex_unlock(&g_pc_mx);
+        NX_IPC_INC(g_pc_miss);
+    }
+
+    // ---- miss (or cache disabled): pace the metadata class, then the real 1-2 probes (OUTSIDE the lock).
+    // This is the ONE choke point every real fsdev metadata op funnels through; one yield-decision here
+    // paces the whole class under a storm (ntdll:file/dirstress) so co-scheduled sysmodules survive.
     { extern void nx_meta_governor(void); nx_meta_governor(); }
-    // Rootfs tree first, then the flat lib/<basename> fallback, else the rootfs path
-    // (so an O_CREAT of a new file still lands somewhere sane under the rootfs).
-    {
-        struct stat st;
-        snprintf(out, outn, "%s%s", NX_ROOTFS, p);
-        if (stat(out, &st) == 0) return 0;
+    struct stat st; int ex = 0, isdir = 0; char host[512];
+    snprintf(host, sizeof host, "%s%s", NX_ROOTFS, p);
+    NX_IPC_INC(nx_ipc_probe1);
+    if (stat(host, &st) == 0) { ex = 1; isdir = S_ISDIR(st.st_mode); }         // rootfs hit
+    else {
         const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
         char lib[512]; snprintf(lib, sizeof lib, "%s/%s", NX_LIBDIR, b);
-        if (stat(lib, &st) == 0) { snprintf(out, outn, "%s", lib); return 0; }
-        snprintf(out, outn, "%s%s", NX_ROOTFS, p);
-        return 0;
+        NX_IPC_INC(nx_ipc_probe2);
+        if (stat(lib, &st) == 0) { ex = 1; isdir = S_ISDIR(st.st_mode); snprintf(host, sizeof host, "%s", lib); }
+        // else: genuine miss -> rootfs path default (host already = NX_ROOTFS+p; ex stays 0), so an
+        // O_CREAT of a new file still lands somewhere sane under the rootfs.
     }
+    snprintf(out, outn, "%s", host);
+    if (exists) *exists = ex;
+    if (out_st && ex) *out_st = st;
+
+    // Insert (last-writer-wins): reuse an existing entry for p, else a free slot, else LRU-evict lowest gen.
+    if (on) {
+        unsigned long h = nx_pc_hash(p);
+        pthread_mutex_lock(&g_pc_mx);
+        nx_pc_ent* e = NULL;
+        for (int i = 0; i < NX_PC_SIZE; i++)
+            if (g_pc[i].used && g_pc[i].hash == h && !strcmp(g_pc[i].guest, p)) { e = &g_pc[i]; break; }
+        if (!e) for (int i = 0; i < NX_PC_SIZE; i++) if (!g_pc[i].used) { e = &g_pc[i]; break; }
+        if (!e) { unsigned long lo = ~0UL; int li = 0;
+                  for (int i = 0; i < NX_PC_SIZE; i++) if (g_pc[i].gen < lo) { lo = g_pc[i].gen; li = i; }
+                  e = &g_pc[li]; }
+        e->used = 1; e->hash = h; e->exists = ex; e->is_dir = isdir;
+        snprintf(e->guest, sizeof e->guest, "%s", p);
+        snprintf(e->host,  sizeof e->host,  "%s", host);
+        if (ex) e->st = st; else memset(&e->st, 0, sizeof e->st);
+        e->gen = ++g_pc_gen;
+        pthread_mutex_unlock(&g_pc_mx);
+    }
+    return 0;
+}
+
+int nx_translate_path(const char* p, char* out, size_t outn) {
+    return nx_translate_path_ex(p, out, outn, NULL, NULL);
+}
+
+// KX_REQLOG: one cumulative fsdev-IPC line to box64-result.txt (survives on HW) at guest exit. One-shot
+// so it can be called from the exit_group(231) handler (covers both simple test guests and the wine cmd
+// run, which exits from inside emulate() and never reaches nx_main's "guest exited" line). Default builds
+// are untouched — the counters sit only on already-slow syscall paths and this dump is gated + one-shot.
+void nx_ipc_stats_dump(void) {
+    static int done = 0;
+    if (done || !getenv("KX_REQLOG")) return;
+    done = 1;
+    unsigned long p1 = __atomic_load_n(&nx_ipc_probe1,  __ATOMIC_RELAXED);
+    unsigned long p2 = __atomic_load_n(&nx_ipc_probe2,  __ATOMIC_RELAXED);
+    unsigned long fs = __atomic_load_n(&nx_ipc_fstatat, __ATOMIC_RELAXED);
+    unsigned long op = __atomic_load_n(&nx_ipc_open,    __ATOMIC_RELAXED);
+    unsigned long ul = __atomic_load_n(&nx_ipc_unlink,  __ATOMIC_RELAXED);
+    unsigned long mk = __atomic_load_n(&nx_ipc_mkdir,   __ATOMIC_RELAXED);
+    unsigned long rd = __atomic_load_n(&nx_ipc_rmdir,   __ATOMIC_RELAXED);
+    unsigned long rn = __atomic_load_n(&nx_ipc_rename,  __ATOMIC_RELAXED);
+    unsigned long hit = __atomic_load_n(&g_pc_hit,  __ATOMIC_RELAXED);
+    unsigned long miss = __atomic_load_n(&g_pc_miss, __ATOMIC_RELAXED);
+    unsigned long total = p1 + p2 + fs + op + ul + mk + rd + rn;
+    char b[256];
+    snprintf(b, sizeof b, "nx_ipc: probe1=%lu probe2=%lu fstatat=%lu open=%lu unlink=%lu mkdir=%lu "
+             "rmdir=%lu rename=%lu | pc_hit=%lu pc_miss=%lu | fsdev_total=%lu",
+             p1, p2, fs, op, ul, mk, rd, rn, hit, miss, total);
+    extern void nx_result_log(const char*);
+    nx_result_log(b);
 }
 
 // M2.1 libos: the guest's real ld.so/glibc issue raw Linux syscalls; box64 translates the x86-64 number
@@ -1063,9 +1211,14 @@ long syscall(long number, ...) {
               }
             }
             char hp[512];
-            if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
-            struct stat st;
-            if (stat(hp, &st) == 0 && S_ISDIR(st.st_mode)) {
+            // Phase 1: nx_translate_path_ex hands back the stat it already computes on the winning probe,
+            // so we branch on it instead of re-stat'ing the same host path (the old separate stat(hp,&st)
+            // was a 3rd fsdev IPC — pure waste on every O_CREAT of a new file too). exists==0 (materialized
+            // /proc,/dev file, O_CREAT-new, or genuine miss) skips the dir-redirect: the O_DIRECTORY guard
+            // and the real open() below stay authoritative.
+            int t_exists = 0; struct stat st;
+            if (nx_translate_path_ex(p, hp, sizeof hp, &t_exists, &st) != 0) return -1;
+            if (t_exists && S_ISDIR(st.st_mode)) {
                 if ((a2 & 3) != 0) { errno = EISDIR; return -1; }        // write access on a dir
                 int dfd = nx_vfd_open_dir(p, hp);
                 nx_warnf("nx: openat dir '%s' -> vfd=%d\n", p, dfd);
@@ -1074,7 +1227,13 @@ long syscall(long number, ...) {
 #ifdef O_DIRECTORY
             if (a2 & O_DIRECTORY) { errno = ENOTDIR; return -1; }        // O_DIRECTORY on a non-dir
 #endif
+            NX_IPC_INC(nx_ipc_open);
             int fd = open(hp, (int)a2, (mode_t)a3);
+            // Phase 2: a successful O_CREAT of a previously-missing path flips its cached exists 0->1
+            // (and it is always a REGULAR file, never a dir), so drop the stale negative entry. Flags
+            // here are host-converted (see the note above), so O_CREAT is the newlib macro. (t_exists==1
+            // means the file already existed — no create happened — so nothing to invalidate.)
+            if (!t_exists && (a2 & O_CREAT) && fd >= 0) nx_pc_invalidate(p);
             // Robust registry save: if a reg<pid>.tmp open FAILS (the raw fsdev open can transiently
             // return ENOSYS under shared-fd-table pressure — e.g. during a big dir enumeration), fall
             // back to a write-discard SINK vfd so the wineserver's periodic flush COMPLETES instead of

@@ -34,6 +34,16 @@ int nx_errno_h2l(int host_errno);
 // pseudo-file. Guest "/" is rooted at sdmc:/box64/rootfs/, with a flat sdmc:/box64/lib/<basename>
 // fallback and synthetic /proc,/dev entries. out[outn] receives the Horizon path. 0 ok, -1 (ENOENT).
 int nx_translate_path(const char *guest_path, char *out, size_t outn);
+// Phase 1/2 (2026-07-23): resolution-cache-aware translate that also hands back the probe result so the
+// caller (openat) needn't re-stat. *exists (nullable) is set 1 ONLY on a probe hit, when *out_st
+// (nullable) receives that stat; the 3-arg nx_translate_path is a wrapper passing NULL,NULL. See the
+// "Fewer FS-service IPCs per guest file op" block in nx_posix.c.
+struct stat;
+int nx_translate_path_ex(const char *guest_path, char *out, size_t outn, int *exists, struct stat *out_st);
+// Drop a cached guest-path->host resolution after a successful mutation at that path (mkdir/unlink/rmdir/
+// rename/O_CREAT). Takes a RAW guest path; normalized internally to match the cache key. No-op when the
+// cache is disabled (KX_NO_PATHCACHE). Companion nx_pc_flush()/nx_ipc_stats_dump() use local externs.
+void nx_pc_invalidate(const char *raw_guest_path);
 // Convert Linux open()/openat() flags (what the guest passes) to newlib/host <fcntl.h> flags.
 int nx_oflags_l2h(int linux_flags);
 

@@ -1132,25 +1132,41 @@ long nx_vfd_ioctl(int fd, unsigned long req, void* arg) {
 
 // ---- guest-path helpers for the big-switch fallback cases ----------------------------------------
 
+// Phase 1/2 (2026-07-23): resolution-cache invalidation + fsdev-IPC counters. Every SUCCESSFUL mutation
+// here drops the stale cached path->host resolution (nx_pc_invalidate for a single path; nx_pc_flush for
+// a directory removal/rename that could strand cached child entries). The counters (defined in nx_posix.c)
+// feed nx_ipc_stats_dump under KX_REQLOG. See "Fewer FS-service IPCs per guest file op" in nx_posix.c.
+extern void nx_pc_invalidate(const char* raw_guest_path);
+extern void nx_pc_flush(void);
+extern unsigned long nx_ipc_unlink, nx_ipc_mkdir, nx_ipc_rmdir, nx_ipc_rename;
+
 int nx_mkdir_guest(const char* p, unsigned mode) {
     char hp[512];
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
+    __atomic_add_fetch(&nx_ipc_mkdir, 1, __ATOMIC_RELAXED);
     int r = mkdir(hp, (mode_t)mode);
-    if (r < 0 && errno == EEXIST) return 0;
+    if (r < 0 && errno == EEXIST) r = 0;         // dir already exists -> success (still invalidate below)
+    if (r == 0) nx_pc_invalidate(p);             // a new (or now-known-present) dir flips a cached exists 0->1
     return r;
 }
 int nx_unlink_guest(const char* p) {
     char hp[512];
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
-    return unlink(hp);
+    __atomic_add_fetch(&nx_ipc_unlink, 1, __ATOMIC_RELAXED);
+    int r = unlink(hp);
+    if (r == 0) nx_pc_invalidate(p);             // removed -> flip a cached exists 1->0
+    return r;
 }
 int nx_rmdir_guest(const char* p) {
     char hp[512];
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
-    return rmdir(hp);
+    __atomic_add_fetch(&nx_ipc_rmdir, 1, __ATOMIC_RELAXED);
+    int r = rmdir(hp);
+    if (r == 0) nx_pc_flush();                    // a removed dir can strand cached child entries -> flush
+    return r;
 }
 // unlinkat(dirfd, path, flags): resolve a relative path against a vfd dir fd (the dir-fd layer —
 // open(O_DIRECTORY) yields a vfd, and glibc's remove()/unlinkat() pass that fd), then unlink or
@@ -1182,7 +1198,11 @@ int nx_rename_guest(const char* a, const char* b) {
     // so DON'T clobber the real .reg with it — report success and drop the empty temp. The in-memory
     // registry the server already loaded is authoritative for this run; the on-disk .reg stays valid
     // for a fast next-run startup. (Applies only to the reg*.tmp->*.reg save rename.)
-    if (nx_regtmp_name(a)) { unlink(ha); return 0; }
+    // reg*.tmp save short-circuit: only the temp source was unlinked, so drop just its cached entry —
+    // NOT a whole-table flush, which would cold-cache every warm library resolution on each periodic
+    // wineserver registry save and defeat the cache during a long Wine run.
+    if (nx_regtmp_name(a)) { unlink(ha); nx_pc_invalidate(a); return 0; }
+    __atomic_add_fetch(&nx_ipc_rename, 1, __ATOMIC_RELAXED);
     int r = rename(ha, hb);
     if (r != 0) {
         // fsdev's rename does NOT atomically replace an existing target (POSIX rename overwrites; fsdev
@@ -1190,8 +1210,10 @@ int nx_rename_guest(const char* a, const char* b) {
         // a failed rename left the registry "unsaved" (dirty), so its flush timer re-saved FOREVER,
         // starving the single-threaded server and the wine client. Remove the target and retry.
         unlink(hb);
+        __atomic_add_fetch(&nx_ipc_rename, 1, __ATOMIC_RELAXED);
         r = rename(ha, hb);
     }
+    if (r == 0) nx_pc_flush();                    // rename can move a DIR (stranding cached children) + changes both a and b
     return r;
 }
 
