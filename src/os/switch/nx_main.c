@@ -138,8 +138,19 @@ void nx_guest_log_flush(void) {
 // Guest stdout/stderr tee (x64syscall.c write + nx_posix.c writev call this): mirror to the debug
 // log (Ryujinx) AND — bounded, so a chatty guest can't flood the SD — to the result file, which is
 // the only channel an installed title has on real HW (e.g. wine --version's one banner line).
+// Benchmark timer (set right before emulate()): the guest's FIRST fd-1 output = "time to first output",
+// i.e. Wine startup (load all DLLs) + cmd -> echo. One-shot rlog to box64-result.txt (survives on real HW).
+u64 g_bench_tick = 0;
 void nx_guest_output(int fd, const void *buf, size_t len) {
     if (!buf || !len) return;
+    if (fd == 1 && g_bench_tick) {
+        static int first = 1;
+        if (first) { first = 0;
+            u64 ms = armTicksToNs(armGetSystemTick() - g_bench_tick) / 1000000ULL;
+            char tb[72]; int tn = snprintf(tb, sizeof tb, "nx_bench: first fd1 output +%llu ms", (unsigned long long)ms);
+            rlog(tb); (void)tn;
+        }
+    }
     svcOutputDebugString((const char*)buf, len);
     nx_guest_log_raw(buf, len);
     // Mirror ALL guest output to the ON-SCREEN console (svcOutputDebugString isn't captured on real HW) —
@@ -481,7 +492,10 @@ int main(int argc, char **argv) {
                                              : "nx_spawn: wineserver not listening (continuing anyway)");
             }
         }
+        g_bench_tick = armGetSystemTick();     // benchmark reference: emulate start (see nx_guest_output)
         code = emulate(emu, elf);
+        { u64 ms = armTicksToNs(armGetSystemTick() - g_bench_tick) / 1000000ULL;
+          char tb[72]; snprintf(tb, sizeof tb, "nx_bench: guest total +%llu ms", (unsigned long long)ms); rlog(tb); }
         kout("\nguest exited: %d\n", code);
         { char b[48]; snprintf(b, sizeof b, "nx_main: guest exited %d\n", code); kdbg(b); }
         { char b[64]; snprintf(b, sizeof b, "guest exited=%d", code); rlog(b); }
