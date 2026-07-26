@@ -198,6 +198,12 @@ static inline size_t rused(vfd_t* v){ return v->wr - v->rd; }
 
 int nx_vfd_is(int fd) { return is_vfd(fd) && g_v[fd - NX_VFD_BASE].kind != VK_FREE; }
 
+// v2 data-op guard (Phase A): true only for a REAL SD-file fd, so the data funnel skips std fds, vfds
+// (>=NX_VFD_BASE), stdout/err tee-dup targets, and reg*.tmp discard fds (all handled on the caller thread).
+int nx_fs_real_file(int fd) {
+    return fd > 2 && !nx_vfd_is(fd) && !nx_tee_origin(fd) && !nx_regtmp_is(fd);
+}
+
 static int slot_alloc(void) {          // g_mx held
     for (int i = 0; i < NX_VFD_MAX; i++)
         if (g_v[i].kind == VK_FREE) {

@@ -706,7 +706,13 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     }
     switch (s) {
         case 0:  // sys_read
+#ifdef __SWITCH__
+            { extern int nx_fs_real_file(int); extern long nx_fs_read(int, void*, size_t);   // SD I/O funnel (v2)
+              S_RAX = nx_fs_real_file(S_EDI) ? nx_fs_read(S_EDI, (void*)R_RSI, (size_t)R_RDX)
+                                             : read(S_EDI, (void*)R_RSI, (size_t)R_RDX); }
+#else
             S_RAX = read(S_EDI, (void*)R_RSI, (size_t)R_RDX);
+#endif
             if(S_RAX==-1)
                 S_RAX = -errno;
             break;
@@ -729,12 +735,16 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                 int n = snprintf(b, sizeof b, "nx: WR< pid=%d fd=%d len=%d\n", nx_guest_pid(), (int)S_EDI, (int)R_RDX);
                 svcOutputDebugString(b, n); } }
 #endif
-            S_RAX = write(S_EDI, (void*)R_RSI, (size_t)R_RDX);
 #ifdef __SWITCH__
-            // fix C-alt: yield CPU under a sustained real-file write storm (ntdll:file/dirstress) so the
-            // co-scheduled sysmodules (sys-ftpd, HDLS, network) don't starve. Real files only (fd 1/2 are
-            // tee'd above and handled by the present-throttle / log-cap, not this governor).
-            if ((int)S_EDI > 2 && (long)S_RAX > 0) { extern void nx_write_governor(size_t); nx_write_governor((size_t)S_RAX); }
+            { extern int nx_fs_real_file(int); extern long nx_fs_write(int, const void*, size_t);   // SD I/O funnel (v2)
+              S_RAX = nx_fs_real_file(S_EDI) ? nx_fs_write(S_EDI, (void*)R_RSI, (size_t)R_RDX)
+                                             : write(S_EDI, (void*)R_RSI, (size_t)R_RDX); }
+#else
+            S_RAX = write(S_EDI, (void*)R_RSI, (size_t)R_RDX);
+#endif
+#ifdef __SWITCH__
+            // nx_write_governor moved into nx_fs_write's body (Phase A); it fires for real-file fds there,
+            // in both funnel modes. fd 1/2 are tee'd above and never needed pacing.
             { static int on = -1; if (on < 0) { extern char* getenv(const char*); on = getenv("KX_REQLOG") ? 1 : 0; }
               if (on && (int)S_EDI > 2) { char b[80]; extern int nx_guest_pid(void);
                 int n = snprintf(b, sizeof b, "nx: WR> pid=%d fd=%d ret=%d\n", nx_guest_pid(), (int)S_EDI, (int)S_RAX);
@@ -1278,8 +1288,16 @@ long EXPORT my_syscall(x64emu_t *emu)
     }
     switch (s) {
         case 0:  // sys_read
+#ifdef __SWITCH__
+            { extern int nx_fs_real_file(int); extern long nx_fs_read(int, void*, size_t);   // SD I/O funnel (v2)
+              if (nx_fs_real_file(R_ESI)) return nx_fs_read(R_ESI, (void*)R_RDX, R_ECX); }
+#endif
             return read(R_ESI, (void*)R_RDX, R_ECX);
         case 1:  // sys_write
+#ifdef __SWITCH__
+            { extern int nx_fs_real_file(int); extern long nx_fs_write(int, const void*, size_t);   // real files only
+              if (nx_fs_real_file(R_ESI)) return nx_fs_write(R_ESI, (void*)R_RDX, R_ECX); }
+#endif
             return write(R_ESI, (void*)R_RDX, R_ECX);
         case 2: // sys_open
             return my_open(emu, (char*)R_RSI, of_convert(R_EDX), R_ECX);

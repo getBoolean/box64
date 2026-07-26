@@ -44,6 +44,15 @@ int  nx_fs_ftruncate(int fd, off_t len);
 int  nx_fs_close(int fd);
 int  nx_fs_in_worker(void);   // 1 iff called on a funnel worker (a nested FS op then runs direct)
 
+// v2 data ops (Phase A). pread/pwrite funnel the WHOLE lseek+read/write+restore as ONE job (atomic at
+// N=1). The write bodies own nx_write_governor. Callers guard with nx_fs_real_file() (real SD file fd).
+long nx_fs_read(int fd, void* buf, size_t n);
+long nx_fs_write(int fd, const void* buf, size_t n);
+long nx_fs_pread(int fd, void* buf, size_t n, off_t off);
+long nx_fs_pwrite(int fd, const void* buf, size_t n, off_t off);
+long nx_fs_writev(int fd, const void* iov, int iovcnt);   // iov = {const char* base; size_t len;}[]
+int  nx_fs_real_file(int fd);   // fd>2 && !nx_vfd_is && !nx_tee_origin && !nx_regtmp_is (nx_vfd.c)
+
 // Op "direct" bodies that need caller-module state (rootfs macros / IPC counters); the worker calls
 // these instead of re-implementing them. Defined where their dependencies live.
 int  nx_fs_resolve_direct(const char* guest, char* out, size_t outn,

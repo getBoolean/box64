@@ -34,13 +34,15 @@
 // IPC counters / the metadata governor). nx_result_log writes one heap-free line to box64-result.txt
 // (survives on real HW — the funnel's "active" proof channel, like the nx_vm backend banner).
 extern void nx_meta_governor(void);
+extern void nx_write_governor(size_t bytes);   // v2 write bodies pace real-file writes (moved off the call site)
 extern void nx_result_log(const char* msg);
 
 // ---- request -------------------------------------------------------------------------------------
 
 typedef enum {
     FSOP_RESOLVE, FSOP_OPEN, FSOP_STAT, FSOP_MKDIR, FSOP_UNLINK,
-    FSOP_RMDIR, FSOP_RENAME, FSOP_GETDENTS, FSOP_FTRUNCATE, FSOP_CLOSE
+    FSOP_RMDIR, FSOP_RENAME, FSOP_GETDENTS, FSOP_FTRUNCATE, FSOP_CLOSE,
+    FSOP_READ, FSOP_WRITE, FSOP_PREAD, FSOP_PWRITE, FSOP_WRITEV   // v2 data ops (Phase A)
 } fsop_t;
 
 // Stack-allocated by the producer; its lifetime spans the blocking call (the producer does not return
@@ -57,6 +59,8 @@ typedef struct {
     int*         p_exists; int* p_isdir; struct stat* p_st;  // FSOP_RESOLVE outputs
     struct stat* stbuf;                                 // FSOP_STAT out
     nx_dent_t**  p_dents; int* p_dn; int* p_dcap;       // FSOP_GETDENTS outputs
+    void*        buf; size_t len;                        // v2 read/write/pread/pwrite buffer (off reuses `off`)
+    const void*  iov; int iovcnt;                        // v2 writev
     long         ret;                                   // op result (worker -> producer)
     int          err;                                   // captured host errno (worker -> producer)
     int          done;                                  // completion futex word (0 -> 1); 4-byte aligned
@@ -130,6 +134,49 @@ static long fs_getdents_body(const char* host, nx_dent_t** out_dents, int* out_n
     return 0;
 }
 
+// ---- v2 data bodies (Phase A) --------------------------------------------------------------------
+static long fs_write_body(int fd, const void* buf, size_t n) {
+    long r = write(fd, buf, n);
+    if (r > 0) nx_write_governor((size_t)r);
+    return r;
+}
+// pread/pwrite: newlib has none, so emulate lseek+read/write bracketed by save/restore. A NON-seekable
+// fd -> ESPIPE (Wine's positioned-read path branches on it; see nx_posix.c). One job ⇒ atomic at N=1.
+static long fs_pread_body(int fd, void* buf, size_t n, off_t off) {
+    off_t cur = lseek(fd, 0, SEEK_CUR);
+    if (cur < 0)                      { errno = ESPIPE; return -1; }
+    if (lseek(fd, off, SEEK_SET) < 0) { errno = ESPIPE; return -1; }
+    ssize_t r = read(fd, buf, n);
+    int e = errno;
+    lseek(fd, cur, SEEK_SET);
+    errno = e;
+    return (long)r;
+}
+static long fs_pwrite_body(int fd, const void* buf, size_t n, off_t off) {
+    off_t cur = lseek(fd, 0, SEEK_CUR);
+    if (lseek(fd, off, SEEK_SET) < 0) return -1;
+    ssize_t r = write(fd, buf, n);
+    int e = errno;
+    if (r > 0) nx_write_governor((size_t)r);
+    lseek(fd, cur, SEEK_SET);
+    errno = e;
+    return (long)r;
+}
+static long fs_writev_body(int fd, const void* iovp, int iovcnt) {   // real scatter write (tee stays on the caller)
+    struct kx_iovec { const char* base; size_t len; };
+    const struct kx_iovec* v = (const struct kx_iovec*)iovp;
+    long total = 0;
+    for (int i = 0; i < iovcnt && v; ++i) {
+        if (!v[i].base || !v[i].len) continue;
+        long r = write(fd, v[i].base, v[i].len);
+        if (r > 0) nx_write_governor((size_t)r);
+        if (r < 0) return total ? total : -1;
+        total += r;
+        if ((size_t)r < v[i].len) break;
+    }
+    return total;
+}
+
 static void fsreq_run(fsreq_t* r) {
     switch (r->op) {
         case FSOP_RESOLVE:   r->ret = nx_fs_resolve_direct(r->path, r->host, r->hostn,
@@ -143,6 +190,11 @@ static void fsreq_run(fsreq_t* r) {
         case FSOP_GETDENTS:  r->ret = fs_getdents_body(r->path, r->p_dents, r->p_dn, r->p_dcap); break;
         case FSOP_FTRUNCATE: r->ret = ftruncate(r->fd, r->off);               break;
         case FSOP_CLOSE:     r->ret = close(r->fd);                            break;
+        case FSOP_READ:      r->ret = read(r->fd, r->buf, r->len);            break;
+        case FSOP_WRITE:     r->ret = fs_write_body(r->fd, r->buf, r->len);   break;
+        case FSOP_PREAD:     r->ret = fs_pread_body(r->fd, r->buf, r->len, r->off);  break;
+        case FSOP_PWRITE:    r->ret = fs_pwrite_body(r->fd, r->buf, r->len, r->off); break;
+        case FSOP_WRITEV:    r->ret = fs_writev_body(r->fd, r->iov, r->iovcnt); break;
         default:             r->ret = -1; errno = ENOSYS;                      break;
     }
     r->err = errno;   // captured on the worker's per-pthread errno; the producer copies it back on failure
@@ -232,9 +284,14 @@ static int fsfunnel_on(void) {
 
 // ---- dispatch + wrappers -------------------------------------------------------------------------
 
+// KX_NO_DATAFUNNEL: run the v2 data ops (READ..WRITEV) direct while metadata still funnels — an A/B for
+// the data extension against landed v1. Metadata ops (op < FSOP_READ) ignore it.
+static int datafunnel_on(void) { static int on = -1; if (on < 0) on = getenv("KX_NO_DATAFUNNEL") ? 0 : 1; return on; }
+
 static long fsreq_dispatch(fsreq_t* r) {
-    if (!fsfunnel_on() || g_in_worker) {
-        fsreq_run(r);                        // direct: run on this thread (funnel off / already a worker)
+    int funnel = fsfunnel_on() && !g_in_worker && !(r->op >= FSOP_READ && !datafunnel_on());
+    if (!funnel) {
+        fsreq_run(r);                        // direct: run on this thread (funnel off / worker / data A/B)
     } else {
         r->done = 0;
         fsq_submit(r);
@@ -299,6 +356,32 @@ int nx_fs_close(int fd) {
     fsreq_t r; memset(&r, 0, sizeof r);
     r.op = FSOP_CLOSE; r.fd = fd;
     return (int)fsreq_dispatch(&r);
+}
+// v2 data wrappers (Phase A)
+long nx_fs_read(int fd, void* buf, size_t n) {
+    fsreq_t r; memset(&r, 0, sizeof r);
+    r.op = FSOP_READ; r.fd = fd; r.buf = buf; r.len = n;
+    return fsreq_dispatch(&r);
+}
+long nx_fs_write(int fd, const void* buf, size_t n) {
+    fsreq_t r; memset(&r, 0, sizeof r);
+    r.op = FSOP_WRITE; r.fd = fd; r.buf = (void*)buf; r.len = n;
+    return fsreq_dispatch(&r);
+}
+long nx_fs_pread(int fd, void* buf, size_t n, off_t off) {
+    fsreq_t r; memset(&r, 0, sizeof r);
+    r.op = FSOP_PREAD; r.fd = fd; r.buf = buf; r.len = n; r.off = off;
+    return fsreq_dispatch(&r);
+}
+long nx_fs_pwrite(int fd, const void* buf, size_t n, off_t off) {
+    fsreq_t r; memset(&r, 0, sizeof r);
+    r.op = FSOP_PWRITE; r.fd = fd; r.buf = (void*)buf; r.len = n; r.off = off;
+    return fsreq_dispatch(&r);
+}
+long nx_fs_writev(int fd, const void* iov, int iovcnt) {
+    fsreq_t r; memset(&r, 0, sizeof r);
+    r.op = FSOP_WRITEV; r.fd = fd; r.iov = iov; r.iovcnt = iovcnt;
+    return fsreq_dispatch(&r);
 }
 
 #endif // __SWITCH__

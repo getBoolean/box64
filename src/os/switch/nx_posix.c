@@ -1343,6 +1343,8 @@ long syscall(long number, ...) {
             // back to a plain read — on the unexpected ENOSYS it left its buffer unfilled and then
             // dereferenced garbage (InvalidMemoryRegion fault). Map any lseek failure to ESPIPE.
             if (nx_vfd_is((int)a0)) { errno = ESPIPE; return -1; }  // vfd pipes/sockets aren't seekable
+            { extern int nx_fs_real_file(int); extern long nx_fs_pread(int, void*, size_t, off_t);   // SD I/O funnel (v2)
+              if (nx_fs_real_file((int)a0)) return nx_fs_pread((int)a0, (void*)a1, (size_t)a2, (off_t)a3); }
             off_t cur = lseek((int)a0, 0, SEEK_CUR);
             if (cur < 0)                     { errno = ESPIPE; return -1; }
             if (lseek((int)a0, (off_t)a3, SEEK_SET) < 0) { errno = ESPIPE; return -1; }
@@ -1362,6 +1364,8 @@ long syscall(long number, ...) {
                 return (long)a2;
             }
             // wineserver sizes/inits its shared-mem file via positioned writes
+            { extern int nx_fs_real_file(int); extern long nx_fs_pwrite(int, const void*, size_t, off_t);   // SD I/O funnel (v2)
+              if (nx_fs_real_file(wfd)) return nx_fs_pwrite(wfd, (const void*)a1, (size_t)a2, (off_t)a3); }
             off_t cur = lseek(wfd, 0, SEEK_CUR);
             if (lseek(wfd, (off_t)a3, SEEK_SET) < 0) return -1;
             ssize_t r = write(wfd, (const void*)a1, (size_t)a2);
@@ -1384,6 +1388,8 @@ long syscall(long number, ...) {
             // full request arriving as one unit. Route vfds through the atomic writev.
             if (nx_vfd_is(wfd)) return nx_vfd_writev(wfd, (const void*)a1, (int)a2);
             int to  = nx_tee_origin(wfd);
+            { extern int nx_fs_real_file(int); extern long nx_fs_writev(int, const void*, int);   // SD I/O funnel (v2)
+              if (!to && nx_fs_real_file(wfd)) return nx_fs_writev(wfd, (const void*)a1, (int)a2); }
             long total = 0;
             for (unsigned i = 0; i < (unsigned)a2 && v; ++i) {
                 if (!v[i].base || !v[i].len) continue;

@@ -713,30 +713,36 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
     if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
         void* p = nx_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return MAP_FAILED;
-        off_t save = lseek(fd, 0, SEEK_CUR);
-        if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1) {
-            // Read via a HEAP bounce buffer, not directly into the mapped region. The region is
-            // CodeMemory (svcControlCodeMemory MapOwner) on Horizon; fsdev's ReadFile IPC receive
-            // buffer must be in a Normal/heap memory state. Passing a Code-state buffer makes
-            // svcSendSyncRequest fail — Ryujinx returns InvalidCurrentMemory and, for a
-            // get_handle_fd-passed section fd, the read HANGS instead of returning an error, wedging
-            // the wine client mid-DLL-load (e.g. the 0x8330000 section after kernelbase). A heap
-            // bounce buffer is always a valid IPC state; memcpy into the region afterwards (CPU, no
-            // IPC). If the tiny malloc ever fails, fall back to the old direct read.
+        // Read via a HEAP bounce buffer, not directly into the mapped region. The region is
+        // CodeMemory (svcControlCodeMemory MapOwner) on Horizon; fsdev's ReadFile IPC receive
+        // buffer must be in a Normal/heap memory state. Passing a Code-state buffer makes
+        // svcSendSyncRequest fail — Ryujinx returns InvalidCurrentMemory and, for a
+        // get_handle_fd-passed section fd, the read HANGS instead of returning an error, wedging
+        // the wine client mid-DLL-load (e.g. the 0x8330000 section after kernelbase). A heap
+        // bounce buffer is always a valid IPC state; memcpy into the region afterwards (CPU, no IPC).
+        // v2 (Phase A): a real-file fd reads via the SD I/O funnel's POSITIONED read (nx_fs_pread) — the
+        // running offset removes the lseek save/restore, and concurrent DLL-load section reads stop
+        // oversubscribing the fsp-srv pool. A non-real fd (not expected here — vfds map via nx_vfd_mmap)
+        // keeps the classic lseek+read. If the tiny bounce malloc fails, fall back to a direct read.
+        extern int nx_fs_real_file(int); extern long nx_fs_pread(int, void*, size_t, off_t);
+        int rf = nx_fs_real_file(fd);
+        off_t save = rf ? (off_t)-1 : lseek(fd, 0, SEEK_CUR);
+        if (rf || lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1) {
             size_t done = 0;
             size_t bufsz = 256 * 1024; if (bufsz > length) bufsz = length;
             char* bounce = (char*)malloc(bufsz);
             while (done < length) {
                 size_t want = length - done; if (want > bufsz) want = bufsz;
-                ssize_t r = bounce ? read(fd, bounce, want)
-                                   : read(fd, (char*)p + done, length - done);
+                char* dst = bounce ? bounce : (char*)p + done;
+                size_t n  = bounce ? want : length - done;
+                ssize_t r = rf ? nx_fs_pread(fd, dst, n, (off_t)offset + (off_t)done) : read(fd, dst, n);
                 if (r <= 0) break;
                 if (bounce) memcpy((char*)p + done, bounce, (size_t)r);
                 done += (size_t)r;
             }
             free(bounce);
         }
-        if (save != (off_t)-1) lseek(fd, save, SEEK_SET);
+        if (!rf && save != (off_t)-1) lseek(fd, save, SEEK_SET);
         // KUSER_SHARED_DATA is file-backed MAP_SHARED at 0x7ffe0000; the file read above just wrote
         // the wineserver's per-instance copy (SystemCall=0) over the page, so re-assert SystemCall=1
         // AFTER the read (see nx_kuser_fixup — the client must use the dispatcher, not raw syscalls).
