@@ -32,6 +32,7 @@
 #include <sys/time.h>
 
 #include "custommem.h"   // getProtection — validate guest buffers before deref (EFAULT, not a fault)
+#include "nx_fsfunnel.h" // SD I/O funnel: nx_fs_* wrappers + the nx_dent_t snapshot type
 
 // nx_posix.c
 extern int  nx_translate_path(const char* p, char* out, size_t outn);
@@ -92,8 +93,8 @@ static shobj_t g_sh[NX_SHOBJ_MAX];
 // VK_DIR entry snapshot: read at open (opendir -> readdir all -> closedir immediately) so an open
 // dir vfd holds NO persistent fsdev directory handle. Horizon's per-session FS handle limit is low
 // (~30 concurrent open dirs exhausted it, making later file opens — the .reg registry files — fail
-// ENOSYS: the ntdll:directory flaky-hang / registry-save livelock).
-typedef struct { char name[256]; unsigned char type; } nx_dent_t;
+// ENOSYS: the ntdll:directory flaky-hang / registry-save livelock). nx_dent_t now lives in
+// nx_fsfunnel.h — nx_fs_getdents hands back the snapshot and funnels the enumeration onto the worker.
 
 typedef struct {
     vkind_t  kind;
@@ -251,37 +252,23 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
     // Snapshot the directory ONCE on the first getdents (opendir -> readdir all -> closedir), so the
     // open dir vfd holds NO persistent fsdev handle. Serve subsequent getdents from the buffer.
     if (!v->dents) {
-        // fix C-alt (metadata governor): the opendir->readdir->closedir snapshot below is a real fsdev
-        // enumeration burst that does NOT pass through nx_translate_path, so pace it here too — one yield-
-        // decision per enumeration keeps a readdir storm (dirstress) from starving the sysmodules.
-        { extern void nx_meta_governor(void); nx_meta_governor(); }
-        DIR* d = opendir(v->host);
-        if (!d) { errno = ENOENT; return -1; }
-        int cap = 64;
-        v->dents = (nx_dent_t*)malloc((size_t)cap * sizeof(nx_dent_t));
-        if (!v->dents) { closedir(d); errno = ENOMEM; return -1; }
-        v->dent_n = 0; v->dent_i = 0;
-        struct dirent* e;
-        while ((e = readdir(d))) {
-            if (v->dent_n == cap) {
-                int nc = cap * 2;
-                nx_dent_t* nn = (nx_dent_t*)realloc(v->dents, (size_t)nc * sizeof(nx_dent_t));
-                if (!nn) break;                  // OOM: serve what we captured
-                v->dents = nn; cap = nc;
-            }
-            snprintf(v->dents[v->dent_n].name, sizeof v->dents[0].name, "%s", e->d_name);
-            unsigned char t = 0;                 // DT_UNKNOWN
-#ifdef DT_DIR
-            if (e->d_type == DT_DIR) t = 4; else if (e->d_type == DT_REG) t = 8;
-#endif
-            v->dents[v->dent_n].type = t;
-            v->dent_n++;
-        }
-        closedir(d);                             // release the fsdev handle NOW
+        // The whole opendir->readdir*->closedir enumeration (+ its metadata governor) funnels onto the
+        // SD I/O worker as ONE job (a DIR* handle can't cross threads mid-iteration): it is a real fsdev
+        // burst that does NOT pass through nx_translate_path, so funneling it keeps a readdir storm
+        // (dirstress) from anti-scaling onto the serial device. It hands back the malloc'd nx_dent_t[]
+        // snapshot + count + capacity; the dosdevices synth below stays on THIS thread (pure memory).
+        int cap = 0;
+        if (nx_fs_getdents(v->host, &v->dents, &v->dent_n, &cap) < 0) return -1;   // errno set (ENOENT/ENOMEM)
+        v->dent_i = 0;
         // M2.5: Windows can't create "z:"/"c:" files on the SD, so synthesize the DOS-drive entries
         // for a $WINEPREFIX/dosdevices dir; Wine readlink()s each (z:->/, <x>:->drive_<x>).
         size_t gl = strlen(v->guest);
         if (gl >= 11 && !strcmp(v->guest + gl - 11, "/dosdevices")) {
+            if (v->dent_n + 2 > cap) {           // ensure room for the 2 synth entries (worker may size tight)
+                int nc = v->dent_n + 2;
+                nx_dent_t* nn = (nx_dent_t*)realloc(v->dents, (size_t)nc * sizeof(nx_dent_t));
+                if (nn) { v->dents = nn; cap = nc; }
+            }
             static const char* drives[] = { "z:", "c:" };
             for (int k = 0; k < 2 && v->dent_n < cap; k++) {
                 snprintf(v->dents[v->dent_n].name, sizeof v->dents[0].name, "%s", drives[k]);
@@ -1145,7 +1132,7 @@ int nx_mkdir_guest(const char* p, unsigned mode) {
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     __atomic_add_fetch(&nx_ipc_mkdir, 1, __ATOMIC_RELAXED);
-    int r = mkdir(hp, (mode_t)mode);
+    int r = nx_fs_mkdir(hp, (mode_t)mode);       // SD I/O funnel (host path; counter + invalidate stay here)
     if (r < 0 && errno == EEXIST) r = 0;         // dir already exists -> success (still invalidate below)
     if (r == 0) nx_pc_invalidate(p);             // a new (or now-known-present) dir flips a cached exists 0->1
     return r;
@@ -1155,7 +1142,7 @@ int nx_unlink_guest(const char* p) {
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     __atomic_add_fetch(&nx_ipc_unlink, 1, __ATOMIC_RELAXED);
-    int r = unlink(hp);
+    int r = nx_fs_unlink(hp);                    // SD I/O funnel (host path)
     if (r == 0) nx_pc_invalidate(p);             // removed -> flip a cached exists 1->0
     return r;
 }
@@ -1164,7 +1151,7 @@ int nx_rmdir_guest(const char* p) {
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     __atomic_add_fetch(&nx_ipc_rmdir, 1, __ATOMIC_RELAXED);
-    int r = rmdir(hp);
+    int r = nx_fs_rmdir(hp);                     // SD I/O funnel (host path)
     if (r == 0) nx_pc_flush();                    // a removed dir can strand cached child entries -> flush
     return r;
 }
@@ -1187,7 +1174,26 @@ int nx_access_guest(const char* p, int mode) {
     if (!p) { errno = EFAULT; return -1; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     (void)mode;                                  // fsdev has no perms — existence check suffices
-    return stat(hp, &st);
+    return nx_fs_stat(hp, &st);                  // SD I/O funnel (host path)
+}
+// Composite REPLACE, run as ONE funnel job so the rename+clobber+retry is ATOMIC on the single SD worker
+// (else another thread's rename of the same target could interpose between a failed rename and the retry).
+// HOST paths only. The two rename counters + the uncounted clobber unlink stay HERE, so the KX_REQLOG
+// nx_ipc: totals are byte-identical funnel-on vs -off. Called by the FSOP_RENAME worker (or directly on
+// the caller thread when the funnel is off); nx_fs_rename() is the wrapper that funnels it.
+int nx_fs_rename_direct(const char* ha, const char* hb) {
+    __atomic_add_fetch(&nx_ipc_rename, 1, __ATOMIC_RELAXED);
+    int r = rename(ha, hb);
+    if (r != 0) {
+        // fsdev's rename does NOT atomically replace an existing target (POSIX rename overwrites; fsdev
+        // fails EEXIST). The wineserver's registry save renames reg*.tmp OVER system.reg every flush —
+        // a failed rename left the registry "unsaved" (dirty), so its flush timer re-saved FOREVER,
+        // starving the single-threaded server and the wine client. Remove the target and retry.
+        unlink(hb);
+        __atomic_add_fetch(&nx_ipc_rename, 1, __ATOMIC_RELAXED);
+        r = rename(ha, hb);
+    }
+    return r;
 }
 int nx_rename_guest(const char* a, const char* b) {
     char ha[512], hb[512];
@@ -1201,18 +1207,8 @@ int nx_rename_guest(const char* a, const char* b) {
     // reg*.tmp save short-circuit: only the temp source was unlinked, so drop just its cached entry —
     // NOT a whole-table flush, which would cold-cache every warm library resolution on each periodic
     // wineserver registry save and defeat the cache during a long Wine run.
-    if (nx_regtmp_name(a)) { unlink(ha); nx_pc_invalidate(a); return 0; }
-    __atomic_add_fetch(&nx_ipc_rename, 1, __ATOMIC_RELAXED);
-    int r = rename(ha, hb);
-    if (r != 0) {
-        // fsdev's rename does NOT atomically replace an existing target (POSIX rename overwrites; fsdev
-        // fails EEXIST). The wineserver's registry save renames reg*.tmp OVER system.reg every flush —
-        // a failed rename left the registry "unsaved" (dirty), so its flush timer re-saved FOREVER,
-        // starving the single-threaded server and the wine client. Remove the target and retry.
-        unlink(hb);
-        __atomic_add_fetch(&nx_ipc_rename, 1, __ATOMIC_RELAXED);
-        r = rename(ha, hb);
-    }
+    if (nx_regtmp_name(a)) { nx_fs_unlink(ha); nx_pc_invalidate(a); return 0; }   // funneled empty-temp drop
+    int r = nx_fs_rename(ha, hb);                 // funneled atomic replace (nx_fs_rename_direct body)
     if (r == 0) nx_pc_flush();                    // rename can move a DIR (stranding cached children) + changes both a and b
     return r;
 }

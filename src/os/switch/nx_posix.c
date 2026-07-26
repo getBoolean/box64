@@ -2,6 +2,7 @@
 #ifdef __SWITCH__
 
 #include "nx_posix.h"
+#include "nx_fsfunnel.h"   // SD I/O funnel: real fsdev metadata ops route onto a worker (nx_fs_*)
 
 #include <switch.h>
 #include <stdlib.h>
@@ -374,7 +375,7 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
         if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
         have_hp = 1;
         NX_IPC_INC(nx_ipc_fstatat);
-        r = stat(hp, b);
+        r = nx_fs_stat(hp, b);                       // SD I/O funnel (real host path; counter stays here)
     }
     // Every stat MUST return a non-zero st_ino: ld.so dedups loaded objects by (dev,ino), so a zero
     // ino makes libc/ntdll/... all look like the SAME already-loaded object and ld.so drops them
@@ -859,6 +860,33 @@ void nx_pc_flush(void) {
     pthread_mutex_unlock(&g_pc_mx);
 }
 
+// Resolve-MISS body (the cache-miss half of nx_translate_path_ex): pace the metadata class, then run the
+// real 1-2 rootfs/flat-lib stat probes and build the host path. Extracted so the SD I/O funnel can run
+// these fsdev stats on its worker (FSOP_RESOLVE); nx_fs_resolve() calls it directly when the funnel is
+// off. HOST-side outputs only — the caller does the out/exists/cache-insert bookkeeping. Always returns 0
+// (a genuine miss still yields a rootfs default path). Uses the file-local NX_ROOTFS/NX_LIBDIR + probe
+// counters, so it lives here rather than in nx_fsfunnel.c.
+int nx_fs_resolve_direct(const char* p, char* host, size_t hostn,
+                         int* p_exists, int* p_isdir, struct stat* p_st) {
+    { extern void nx_meta_governor(void); nx_meta_governor(); }
+    struct stat st; int ex = 0, isdir = 0;
+    snprintf(host, hostn, "%s%s", NX_ROOTFS, p);
+    NX_IPC_INC(nx_ipc_probe1);
+    if (stat(host, &st) == 0) { ex = 1; isdir = S_ISDIR(st.st_mode); }         // rootfs hit
+    else {
+        const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
+        char lib[512]; snprintf(lib, sizeof lib, "%s/%s", NX_LIBDIR, b);
+        NX_IPC_INC(nx_ipc_probe2);
+        if (stat(lib, &st) == 0) { ex = 1; isdir = S_ISDIR(st.st_mode); snprintf(host, hostn, "%s", lib); }
+        // else: genuine miss -> rootfs path default (host already = NX_ROOTFS+p; ex stays 0), so an
+        // O_CREAT of a new file still lands somewhere sane under the rootfs.
+    }
+    if (p_exists) *p_exists = ex;
+    if (p_isdir)  *p_isdir  = isdir;
+    if (p_st && ex) *p_st   = st;             // st is only valid on a hit; caller copies out only when ex
+    return 0;
+}
+
 // M2.4 rootfs VFS resolver, Phase-1/2 aware. *exists (nullable) is 0 on entry and set 1 ONLY on a probe
 // hit, when *out_st (nullable) receives that stat; every synthetic/passthrough return leaves *exists=0
 // (its host path is a materialized regular file or an sdmc: passthrough — openat must NOT dir-redirect
@@ -910,22 +938,12 @@ int nx_translate_path_ex(const char* p, char* out, size_t outn, int* exists, str
         NX_IPC_INC(g_pc_miss);
     }
 
-    // ---- miss (or cache disabled): pace the metadata class, then the real 1-2 probes (OUTSIDE the lock).
-    // This is the ONE choke point every real fsdev metadata op funnels through; one yield-decision here
-    // paces the whole class under a storm (ntdll:file/dirstress) so co-scheduled sysmodules survive.
-    { extern void nx_meta_governor(void); nx_meta_governor(); }
+    // ---- miss (or cache disabled): the real fsdev probes (metadata governor + 1-2 stats + host build)
+    // route onto the SD I/O funnel worker (FSOP_RESOLVE, in nx_fs_resolve_direct) so a 12-thread stat
+    // storm stops anti-scaling onto the serial device. The cache lookup above and the insert below stay
+    // on THIS thread — they are g_pc_mx memory ops and must never be dragged onto the worker.
     struct stat st; int ex = 0, isdir = 0; char host[512];
-    snprintf(host, sizeof host, "%s%s", NX_ROOTFS, p);
-    NX_IPC_INC(nx_ipc_probe1);
-    if (stat(host, &st) == 0) { ex = 1; isdir = S_ISDIR(st.st_mode); }         // rootfs hit
-    else {
-        const char* b = strrchr(p, '/'); b = b ? b + 1 : p;
-        char lib[512]; snprintf(lib, sizeof lib, "%s/%s", NX_LIBDIR, b);
-        NX_IPC_INC(nx_ipc_probe2);
-        if (stat(lib, &st) == 0) { ex = 1; isdir = S_ISDIR(st.st_mode); snprintf(host, sizeof host, "%s", lib); }
-        // else: genuine miss -> rootfs path default (host already = NX_ROOTFS+p; ex stays 0), so an
-        // O_CREAT of a new file still lands somewhere sane under the rootfs.
-    }
+    nx_fs_resolve(p, host, sizeof host, &ex, &isdir, &st);
     snprintf(out, outn, "%s", host);
     if (exists) *exists = ex;
     if (out_st && ex) *out_st = st;
@@ -1228,7 +1246,7 @@ long syscall(long number, ...) {
             if (a2 & O_DIRECTORY) { errno = ENOTDIR; return -1; }        // O_DIRECTORY on a non-dir
 #endif
             NX_IPC_INC(nx_ipc_open);
-            int fd = open(hp, (int)a2, (mode_t)a3);
+            int fd = nx_fs_open(hp, (int)a2, (mode_t)a3);   // SD I/O funnel (real host path)
             // Phase 2: a successful O_CREAT of a previously-missing path flips its cached exists 0->1
             // (and it is always a REGULAR file, never a dir), so drop the stale negative entry. Flags
             // here are host-converted (see the note above), so O_CREAT is the newlib macro. (t_exists==1
@@ -1266,7 +1284,7 @@ long syscall(long number, ...) {
             if (nx_vfd_is((int)a0)) return nx_vfd_close((int)a0);
             { extern void nx_tee_forget(int fd); nx_tee_forget((int)a0); }  // drop stale stdout/err dup flag
             { extern void nx_regtmp_forget(int fd); nx_regtmp_forget((int)a0); }  // drop reg*.tmp sink flag
-            return close((int)a0);
+            return nx_fs_close((int)a0);                     // SD I/O funnel (real fd; vfd handled above)
         case 63:                                                 // read
             if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
             return read((int)a0, (void*)a1, (size_t)a2);
@@ -1278,7 +1296,7 @@ long syscall(long number, ...) {
         case 61: return nx_vfd_getdents64((int)a0, (void*)a1, (size_t)a2);   // getdents64
         case 46:                                                 // ftruncate (wineserver shmem sizing)
             if (nx_vfd_is((int)a0)) return nx_vfd_ftruncate((int)a0, (off_t)a1);
-            return ftruncate((int)a0, (off_t)a1);
+            return nx_fs_ftruncate((int)a0, (off_t)a1);          // SD I/O funnel (real fd)
         case 32:                                                 // flock -> VK_LOCK owner protocol, else accept
             if (nx_vfd_is((int)a0)) return nx_vfd_flock((int)a0, (int)a1);
             return 0;

@@ -751,7 +751,11 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
                 S_RAX = -errno;
             break;
         case 3:  // sys_close
+#ifdef __SWITCH__
+            { extern int nx_fs_close(int); S_RAX = nx_fs_close(S_EDI); }   // SD I/O funnel (raw close on the worker)
+#else
             S_RAX = close(S_EDI);
+#endif
             if(S_RAX==-1)
                 S_RAX = -errno;
             break;
@@ -1280,7 +1284,11 @@ long EXPORT my_syscall(x64emu_t *emu)
         case 2: // sys_open
             return my_open(emu, (char*)R_RSI, of_convert(R_EDX), R_ECX);
         case 3:  // sys_close
+#ifdef __SWITCH__
+            { extern int nx_fs_close(int); return nx_fs_close(R_ESI); }    // SD I/O funnel (raw close on the worker)
+#else
             return close(R_ESI);
+#endif
         case 4: // sys_stat
             return my_stat(emu, (void*)R_RSI, (void*)R_RDX);
         case 5: // sys_fstat
