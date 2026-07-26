@@ -74,7 +74,8 @@ static int nx_vfd_buf_bad(const void* base, size_t len) {
 // in-process wineserver share. fsdev can't open the same file from both instances (2nd open -> EIO)
 // and file-backed mmap copies per instance, so back them with IN-PROCESS shared state keyed by path.
 typedef enum { VK_FREE = 0, VK_DIR, VK_PIPE, VK_SOCK, VK_LISTEN, VK_LOCK, VK_SHMEM,
-               VK_EPOLL, VK_SINK, VK_TAKEN } vkind_t;  // SINK: write-discard sink (reg*.tmp);
+               VK_EPOLL, VK_SINK, VK_TMPFILE, VK_TMPDIR, VK_TAKEN } vkind_t;
+               // SINK: write-discard sink (reg*.tmp); TMPFILE/TMPDIR: RAM-backed /tmp tmpfs node (Phase C);
                // TAKEN: slot_alloc'd, kind not yet set (never escapes g_mx)
 
 typedef struct { int fd; uint64_t at; } fdpass_t;
@@ -131,6 +132,14 @@ static vfd_t g_v[NX_VFD_MAX];
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;   // broadcast on ANY state change
 static unsigned g_ino_next = 0x1000;
+
+// RAM /tmp tmpfs open-fd bodies (Phase C) — defined in the tmpfs section further down, but the vfd
+// dispatch functions above that section (lseek/ftruncate/mmap/stat/getdents) call them, so forward-declare.
+static long  nx_tmpfs_lseek_body(vfd_t* v, off_t off, int whence);
+static int   nx_tmpfs_ftruncate_body(vfd_t* v, off_t len);
+static void* nx_tmpfs_mmap_body(vfd_t* v, size_t length, off_t offset);
+static int   nx_tmpfs_fstat_body(vfd_t* v, struct stat* st);
+static int   nx_tmpfs_fill_dents(vfd_t* v);
 
 // Guest-console tee origin: Wine hands the guest a DUP of unix fd 1/2 (fd 1 is SCM_RIGHTS-passed to
 // the wineserver at startup, dup'd there, dup'd again into every get_handle_fd reply), so the final
@@ -246,7 +255,7 @@ int nx_vfd_fchdir(int fd) {
 long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     vfd_t* v = V(fd);
-    if (v->kind != VK_DIR) { errno = ENOTDIR; return -1; }
+    if (v->kind != VK_DIR && v->kind != VK_TMPDIR) { errno = ENOTDIR; return -1; }
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
       if (on) vlog("nx_vfd: GETDENTS pid=%d fd=%d dir='%s'\n", nx_guest_pid(), fd, v->guest); }
     // Snapshot the directory ONCE on the first getdents (opendir -> readdir all -> closedir), so the
@@ -257,6 +266,9 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
         // burst that does NOT pass through nx_translate_path, so funneling it keeps a readdir storm
         // (dirstress) from anti-scaling onto the serial device. It hands back the malloc'd nx_dent_t[]
         // snapshot + count + capacity; the dosdevices synth below stays on THIS thread (pure memory).
+        if (v->kind == VK_TMPDIR) {
+            if (nx_tmpfs_fill_dents(v) < 0) return -1;   // RAM /tmp: enumerate the node table (no fsdev)
+        } else {
         int cap = 0;
         if (nx_fs_getdents(v->host, &v->dents, &v->dent_n, &cap) < 0) return -1;   // errno set (ENOENT/ENOMEM)
         v->dent_i = 0;
@@ -275,6 +287,7 @@ long nx_vfd_getdents64(int fd, void* ubuf, size_t count) {
                 v->dents[v->dent_n].type = 10;   // DT_LNK
                 v->dent_n++;
             }
+        }
         }
     }
     // Serve buffered entries into the caller's getdents64 buffer (Linux layout: d_ino u64, d_off s64,
@@ -308,6 +321,7 @@ static unsigned long path_ino(const char* hp) {
 int nx_vfd_stat(int fd, struct stat* st) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     vfd_t* v = V(fd);
+    if (v->kind == VK_TMPFILE || v->kind == VK_TMPDIR) return nx_tmpfs_fstat_body(v, st);   // RAM /tmp
     if (v->kind == VK_DIR) {
         int r = stat(v->host, st);
         if (r == 0) {
@@ -397,6 +411,7 @@ static int shmem_ensure(shobj_t* o, size_t need) {   // g_mx held
 
 int nx_vfd_ftruncate(int fd, off_t len) {
     if (nx_vfd_is(fd) && V(fd)->kind == VK_SINK) { (void)len; return 0; }   // discard sink: accept
+    if (nx_vfd_is(fd) && V(fd)->kind == VK_TMPFILE) return nx_tmpfs_ftruncate_body(V(fd), len);  // RAM /tmp
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = EINVAL; return -1; }
     pthread_mutex_lock(&g_mx);
     int r = shmem_ensure(&g_sh[V(fd)->shobj], (size_t)len);
@@ -406,6 +421,7 @@ int nx_vfd_ftruncate(int fd, off_t len) {
 
 // mmap of a VK_SHMEM fd: return the shared buffer + offset (same address for every mapper).
 void* nx_vfd_mmap(int fd, size_t length, off_t offset) {
+    if (nx_vfd_is(fd) && V(fd)->kind == VK_TMPFILE) return nx_tmpfs_mmap_body(V(fd), length, offset);  // RAM /tmp
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = EACCES; return (void*)-1; }
     pthread_mutex_lock(&g_mx);
     shobj_t* o = &g_sh[V(fd)->shobj];
@@ -419,6 +435,7 @@ void* nx_vfd_mmap(int fd, size_t length, off_t offset) {
 
 long nx_vfd_lseek(int fd, off_t off, int whence) {
     if (nx_vfd_is(fd) && V(fd)->kind == VK_SINK) return (whence == 0) ? (long)off : 0;  // sink: accept
+    if (nx_vfd_is(fd) && V(fd)->kind == VK_TMPFILE) return nx_tmpfs_lseek_body(V(fd), off, whence);  // RAM /tmp
     if (!nx_vfd_is(fd) || V(fd)->kind != VK_SHMEM) { errno = ESPIPE; return -1; }
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd); shobj_t* o = &g_sh[v->shobj];
@@ -442,6 +459,295 @@ static long shmem_rw(int fd, void* buf, size_t n, int write) {
     return (long)k;
 }
 
+// ---- RAM-backed /tmp tmpfs (Phase C) -----------------------------------------------------------
+// Guest /tmp is served ENTIRELY from RAM (no fsdev, no SD) so a temp-file storm (floodmeta's
+// /tmp/kx-meta scratch, Wine's TMPDIR=/tmp churn) stops anti-scaling onto the serial SD device. A flat
+// in-RAM node table keyed by absolute normalized path (dirs are nodes too, so getdents/rmdir work);
+// file I/O mirrors the VK_SHMEM RAM-buffer bodies. Reuses the vfd fd-space (VK_TMPFILE/VK_TMPDIR) +
+// dispatch. Gate KX_NO_TMPFS; hard byte cap KX_TMPFS_CAP_MB (ENOSPC on overflow — no SD spill in v1).
+#define NX_TMPFS_MAX 2048
+typedef struct {
+    int           used, is_dir, unlinked, refs, mmapped, next;   // next = hash-bucket chain link (-1 end)
+    unsigned      hash;                    // FNV-1a 32 of path — bucket key
+    unsigned long ino;                     // FNV-1a 64 of path — stat identity (never 0)
+    char          path[256];               // absolute normalized guest path
+    uint8_t*      data; size_t size, cap;  // file contents (NULL/0 until first write); dirs: none
+    long          mtime;
+} tnode_t;
+#define NX_TMPFS_BUCKETS 2048              // power of 2 (& mask); ~1 node/bucket at full occupancy
+static tnode_t g_tn[NX_TMPFS_MAX];
+static int     g_tn_bkt[NX_TMPFS_BUCKETS]; // per-bucket head slot (-1 empty) — O(1) hashed lookup
+static int     g_tn_free[NX_TMPFS_MAX];    // free-slot stack — O(1) alloc (no linear scan under the lock)
+static int     g_tn_free_n = -1;           // -1 until tn_init()
+static pthread_mutex_t g_tmpfs_mx = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_tmpfs_bytes = 0, g_tmpfs_cap = 0;
+static long   g_tmpfs_mtime = 1;
+
+static int nx_tmpfs_enabled(void) { static int on = -1; if (on < 0) on = getenv("KX_NO_TMPFS") ? 0 : 1; return on; }
+static size_t nx_tmpfs_capbytes(void) {
+    if (!g_tmpfs_cap) { const char* c = getenv("KX_TMPFS_CAP_MB"); int mb = c ? atoi(c) : 64;
+                        if (mb < 1) mb = 1; g_tmpfs_cap = (size_t)mb * 1024 * 1024; }
+    return g_tmpfs_cap;
+}
+// Is `p` under the RAM /tmp? Matches "/tmp" and "/tmp/…" only (never /run/user/0/wine/* — those stay
+// VK_SHMEM/VK_LOCK). Off => 0, so /tmp falls back to the SD as before (KX_NO_TMPFS A/B).
+int nx_tmpfs_is_path(const char* p) {
+    return nx_tmpfs_enabled() && p && (!strcmp(p, "/tmp") || !strncmp(p, "/tmp/", 5));
+}
+static unsigned tfnv32(const char* s){ unsigned h=2166136261u; for(;*s;++s){ h^=(unsigned char)*s; h*=16777619u; } return h; }
+static unsigned long tfnv64(const char* s){ unsigned long h=1469598103934665603UL; for(;*s;++s){ h^=(unsigned char)*s; h*=1099511628211UL; } return h?h:1; }
+
+static void tn_init(void) {   // g_tmpfs_mx held; lazy one-time bucket-head + free-list init
+    if (g_tn_free_n >= 0) return;
+    for (int i = 0; i < NX_TMPFS_BUCKETS; i++) g_tn_bkt[i] = -1;
+    for (int i = 0; i < NX_TMPFS_MAX; i++) g_tn_free[i] = NX_TMPFS_MAX - 1 - i;  // pop order 0,1,2,…
+    g_tn_free_n = NX_TMPFS_MAX;
+}
+static int tn_find(const char* p, unsigned h) {   // g_tmpfs_mx held; O(1); skips unlinked-but-open nodes
+    tn_init();
+    for (int i = g_tn_bkt[h & (NX_TMPFS_BUCKETS - 1)]; i >= 0; i = g_tn[i].next)
+        if (!g_tn[i].unlinked && g_tn[i].hash == h && !strcmp(g_tn[i].path, p)) return i;
+    return -1;
+}
+static int tn_new(const char* p, int is_dir) {    // g_tmpfs_mx held; O(1); -1 (ENOSPC) if the table is full
+    tn_init();
+    if (g_tn_free_n == 0) { errno = ENOSPC; return -1; }
+    int i = g_tn_free[--g_tn_free_n];
+    memset(&g_tn[i], 0, sizeof g_tn[i]);
+    g_tn[i].used = 1; g_tn[i].is_dir = is_dir;
+    g_tn[i].hash = tfnv32(p); g_tn[i].ino = tfnv64(p);
+    snprintf(g_tn[i].path, sizeof g_tn[i].path, "%s", p);
+    g_tn[i].mtime = g_tmpfs_mtime++;
+    unsigned b = g_tn[i].hash & (NX_TMPFS_BUCKETS - 1);   // prepend to bucket chain
+    g_tn[i].next = g_tn_bkt[b]; g_tn_bkt[b] = i;
+    return i;
+}
+static void tn_free_data(tnode_t* n){ if (n->data) { g_tmpfs_bytes = (g_tmpfs_bytes>=n->cap)?g_tmpfs_bytes-n->cap:0; free(n->data); n->data=NULL; n->size=n->cap=0; } }
+static void tn_remove(int idx) {   // g_tmpfs_mx held; unlink from its bucket chain + return the slot to the free-list
+    tn_free_data(&g_tn[idx]);
+    unsigned b = g_tn[idx].hash & (NX_TMPFS_BUCKETS - 1);
+    int* pp = &g_tn_bkt[b];
+    while (*pp >= 0 && *pp != idx) pp = &g_tn[*pp].next;
+    if (*pp == idx) *pp = g_tn[idx].next;
+    memset(&g_tn[idx], 0, sizeof g_tn[idx]);
+    g_tn_free[g_tn_free_n++] = idx;
+}
+static void tn_rebucket(int idx, const char* newpath) {   // g_tmpfs_mx held; move a node to a new path/bucket (rename)
+    unsigned ob = g_tn[idx].hash & (NX_TMPFS_BUCKETS - 1);
+    int* pp = &g_tn_bkt[ob];
+    while (*pp >= 0 && *pp != idx) pp = &g_tn[*pp].next;
+    if (*pp == idx) *pp = g_tn[idx].next;
+    snprintf(g_tn[idx].path, sizeof g_tn[idx].path, "%s", newpath);
+    g_tn[idx].hash = tfnv32(newpath); g_tn[idx].ino = tfnv64(newpath);
+    unsigned nb = g_tn[idx].hash & (NX_TMPFS_BUCKETS - 1);
+    g_tn[idx].next = g_tn_bkt[nb]; g_tn_bkt[nb] = idx;
+}
+static int tn_ensure(tnode_t* n, size_t need) {   // g_tmpfs_mx held; grow data to >= need; honors the cap
+    if (n->cap >= need) return 0;
+    if (n->mmapped) { errno = EBUSY; return -1; }        // pinned by an mmap — cannot move
+    size_t ncap = n->cap ? n->cap : 4096;
+    while (ncap < need) ncap *= 2;
+    size_t delta = ncap - n->cap;
+    if (g_tmpfs_bytes + delta > nx_tmpfs_capbytes()) { errno = ENOSPC; return -1; }
+    uint8_t* nd = (uint8_t*)realloc(n->data, ncap);
+    if (!nd) { errno = ENOMEM; return -1; }
+    g_tmpfs_bytes += delta; n->data = nd; n->cap = ncap;
+    return 0;
+}
+static void tn_release(int idx) {   // g_tmpfs_mx held; drop one open ref, free if unlinked + unreferenced
+    if (g_tn[idx].refs > 0) g_tn[idx].refs--;
+    if (g_tn[idx].refs == 0 && g_tn[idx].unlinked) tn_remove(idx);
+}
+
+// ---- tmpfs path ops (extern: called from nx_posix.c openat/fstatat + the mutation helpers) --------
+// openat flags arrive HOST-converted (box64 applies of_convert before dispatch), so O_* are newlib bits.
+int nx_tmpfs_openat(const char* p, int flags, mode_t mode) {
+    (void)mode;
+    pthread_mutex_lock(&g_mx);
+    int vi = slot_alloc();
+    if (vi < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
+    pthread_mutex_lock(&g_tmpfs_mx);
+    unsigned h = tfnv32(p);
+    int idx = tn_find(p, h);
+    int want_dir = (flags & O_DIRECTORY) != 0;
+    int fail = 0;
+    if (idx < 0) {
+        if (!(flags & O_CREAT) || want_dir) { errno = ENOENT; fail = 1; }
+        else { idx = tn_new(p, 0); if (idx < 0) fail = 1; }   // create a regular file (errno=ENOSPC on fail)
+    } else {
+        if ((flags & O_CREAT) && (flags & O_EXCL) && !g_tn[idx].is_dir) { errno = EEXIST; fail = 1; }
+        else if (want_dir && !g_tn[idx].is_dir)                         { errno = ENOTDIR; fail = 1; }
+        else if (!want_dir && g_tn[idx].is_dir && (flags & 3) != 0)     { errno = EISDIR; fail = 1; }
+        else if ((flags & O_TRUNC) && !g_tn[idx].is_dir) { tn_free_data(&g_tn[idx]); g_tn[idx].size = 0; }
+    }
+    if (fail) { g_v[vi].kind = VK_FREE; pthread_mutex_unlock(&g_tmpfs_mx); pthread_mutex_unlock(&g_mx); return -1; }
+    int is_dir = g_tn[idx].is_dir;
+    g_tn[idx].refs++;
+    g_v[vi].kind  = is_dir ? VK_TMPDIR : VK_TMPFILE;
+    g_v[vi].shobj = idx;
+    g_v[vi].fpos  = 0;
+    snprintf(g_v[vi].guest, sizeof g_v[vi].guest, "%s", p);   // dir path for getdents; else diagnostics
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    pthread_mutex_unlock(&g_mx);
+    return NX_VFD_BASE + vi;
+}
+int nx_tmpfs_stat(const char* p, struct stat* st) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    int idx = tn_find(p, tfnv32(p));
+    if (idx < 0) { pthread_mutex_unlock(&g_tmpfs_mx); errno = ENOENT; return -1; }
+    tnode_t* n = &g_tn[idx];
+    memset(st, 0, sizeof *st);
+    st->st_dev = 1; st->st_ino = n->ino; st->st_nlink = 1; st->st_blksize = 4096;
+    st->st_mode = n->is_dir ? (S_IFDIR | 0700) : (S_IFREG | 0600);
+    st->st_size = n->is_dir ? 0 : (off_t)n->size;
+    st->st_blocks = (st->st_size + 511) / 512;
+    st->st_mtime = st->st_ctime = st->st_atime = n->mtime;
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return 0;
+}
+int nx_tmpfs_mkdir(const char* p, mode_t mode) {
+    (void)mode;
+    pthread_mutex_lock(&g_tmpfs_mx);
+    int idx = tn_find(p, tfnv32(p));
+    if (idx >= 0) { pthread_mutex_unlock(&g_tmpfs_mx); errno = EEXIST; return -1; }
+    idx = tn_new(p, 1);
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return idx < 0 ? -1 : 0;
+}
+int nx_tmpfs_unlink(const char* p) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    int idx = tn_find(p, tfnv32(p));
+    if (idx < 0) { pthread_mutex_unlock(&g_tmpfs_mx); errno = ENOENT; return -1; }
+    tnode_t* n = &g_tn[idx];
+    if (n->is_dir) { pthread_mutex_unlock(&g_tmpfs_mx); errno = EISDIR; return -1; }
+    n->unlinked = 1;                                     // hidden from tn_find; freed on last close
+    if (n->refs == 0) tn_remove(idx);
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return 0;
+}
+int nx_tmpfs_rmdir(const char* p) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    int idx = tn_find(p, tfnv32(p));
+    if (idx < 0) { pthread_mutex_unlock(&g_tmpfs_mx); errno = ENOENT; return -1; }
+    if (!g_tn[idx].is_dir) { pthread_mutex_unlock(&g_tmpfs_mx); errno = ENOTDIR; return -1; }
+    size_t pl = strlen(p);
+    for (int i = 0; i < NX_TMPFS_MAX; i++)               // reject if any live child exists
+        if (g_tn[i].used && !g_tn[i].unlinked && i != idx &&
+            !strncmp(g_tn[i].path, p, pl) && g_tn[i].path[pl] == '/') {
+            pthread_mutex_unlock(&g_tmpfs_mx); errno = ENOTEMPTY; return -1; }
+    tn_remove(idx);
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return 0;
+}
+int nx_tmpfs_rename(const char* a, const char* b) {      // both sides already known to be /tmp
+    pthread_mutex_lock(&g_tmpfs_mx);
+    int ia = tn_find(a, tfnv32(a));
+    if (ia < 0) { pthread_mutex_unlock(&g_tmpfs_mx); errno = ENOENT; return -1; }
+    int ib = tn_find(b, tfnv32(b));
+    if (ib >= 0) {                                       // replace an existing target (not a dir)
+        if (g_tn[ib].is_dir) { pthread_mutex_unlock(&g_tmpfs_mx); errno = EISDIR; return -1; }
+        g_tn[ib].unlinked = 1;
+        if (g_tn[ib].refs == 0) tn_remove(ib);
+    }
+    tn_rebucket(ia, b);
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return 0;                                            // NB: renaming a DIR strands its children (v1 limit)
+}
+int nx_tmpfs_access(const char* p, int mode) {
+    (void)mode;
+    pthread_mutex_lock(&g_tmpfs_mx);
+    int idx = tn_find(p, tfnv32(p));
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    if (idx < 0) { errno = ENOENT; return -1; }
+    return 0;
+}
+
+// ---- tmpfs open-fd bodies (called from the vfd dispatch cases; operate on the node via v->shobj) --
+static long nx_tmpfs_read_body(vfd_t* v, void* buf, size_t n) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    tnode_t* nd = &g_tn[v->shobj];
+    size_t avail = (v->fpos < nd->size) ? nd->size - v->fpos : 0;
+    size_t k = n < avail ? n : avail;
+    if (k && nd->data) memcpy(buf, nd->data + v->fpos, k);
+    v->fpos += k;
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return (long)k;
+}
+static long nx_tmpfs_write_body(vfd_t* v, const void* buf, size_t n) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    tnode_t* nd = &g_tn[v->shobj];
+    if (tn_ensure(nd, v->fpos + n) != 0) { int e = errno; pthread_mutex_unlock(&g_tmpfs_mx); errno = e; return -1; }
+    memcpy(nd->data + v->fpos, buf, n);
+    v->fpos += n;
+    if (v->fpos > nd->size) nd->size = v->fpos;
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return (long)n;
+}
+static long nx_tmpfs_lseek_body(vfd_t* v, off_t off, int whence) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    tnode_t* nd = &g_tn[v->shobj];
+    size_t np = (whence == 1) ? v->fpos + off : (whence == 2) ? nd->size + off : (size_t)off;
+    v->fpos = np;
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return (long)np;
+}
+static int nx_tmpfs_ftruncate_body(vfd_t* v, off_t len) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    tnode_t* nd = &g_tn[v->shobj];
+    int r = 0;
+    if ((size_t)len > nd->cap) r = tn_ensure(nd, (size_t)len);
+    if (r == 0) { if ((size_t)len > nd->size && nd->data) memset(nd->data + nd->size, 0, (size_t)len - nd->size);
+                  nd->size = (size_t)len; }
+    int e = errno; pthread_mutex_unlock(&g_tmpfs_mx); errno = e;
+    return r;
+}
+static void* nx_tmpfs_mmap_body(vfd_t* v, size_t length, off_t offset) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    tnode_t* nd = &g_tn[v->shobj];
+    if (tn_ensure(nd, (size_t)offset + length) != 0) { int e=errno; pthread_mutex_unlock(&g_tmpfs_mx); errno=e; return (void*)-1; }
+    if ((size_t)offset + length > nd->size) nd->size = (size_t)offset + length;
+    nd->mmapped = 1;                                    // pin: no realloc-move after a mapping exists
+    void* ret = nd->data + offset;
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return ret;
+}
+static int nx_tmpfs_fstat_body(vfd_t* v, struct stat* st) {
+    pthread_mutex_lock(&g_tmpfs_mx);
+    tnode_t* nd = &g_tn[v->shobj];
+    memset(st, 0, sizeof *st);
+    st->st_dev = 1; st->st_ino = nd->ino; st->st_nlink = 1; st->st_blksize = 4096;
+    st->st_mode = nd->is_dir ? (S_IFDIR | 0700) : (S_IFREG | 0600);
+    st->st_size = nd->is_dir ? 0 : (off_t)nd->size;
+    st->st_blocks = (st->st_size + 511) / 512;
+    st->st_mtime = st->st_ctime = st->st_atime = nd->mtime;
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return 0;
+}
+// Snapshot the DIRECT children of the dir path v->guest into v->dents (name + d_type), so the shared
+// getdents64 serve loop below can stream them. Enumerates the live RAM table (no fsdev).
+static int nx_tmpfs_fill_dents(vfd_t* v) {
+    size_t pl = strlen(v->guest);
+    int cap = 64;
+    v->dents = (nx_dent_t*)malloc((size_t)cap * sizeof(nx_dent_t));
+    if (!v->dents) { errno = ENOMEM; return -1; }
+    v->dent_n = 0; v->dent_i = 0;
+    pthread_mutex_lock(&g_tmpfs_mx);
+    for (int i = 0; i < NX_TMPFS_MAX; i++) {
+        if (!g_tn[i].used || g_tn[i].unlinked) continue;
+        const char* q = g_tn[i].path;
+        if (strncmp(q, v->guest, pl) || q[pl] != '/') continue;   // not under this dir
+        const char* name = q + pl + 1;
+        if (strchr(name, '/')) continue;                          // not a DIRECT child
+        if (v->dent_n == cap) { int nc = cap*2; nx_dent_t* nn = (nx_dent_t*)realloc(v->dents, (size_t)nc*sizeof(nx_dent_t));
+                                if (!nn) break; v->dents = nn; cap = nc; }
+        snprintf(v->dents[v->dent_n].name, sizeof v->dents[0].name, "%s", name);
+        v->dents[v->dent_n].type = g_tn[i].is_dir ? 4 : 8;        // DT_DIR / DT_REG
+        v->dent_n++;
+    }
+    pthread_mutex_unlock(&g_tmpfs_mx);
+    return 0;
+}
+
 // ---- close / read / write ----------------------------------------------------------------------
 
 int nx_vfd_close(int fd) {
@@ -454,7 +760,10 @@ int nx_vfd_close(int fd) {
         if (v->kind == VK_LOCK && o->lock_owner == nx_guest_pid()) o->lock_owner = 0;
         if (o->refs > 0) o->refs--;   // keep mem/lock alive while other fds reference it
     }
-    if (v->kind == VK_DIR) { if (v->d) closedir(v->d); free(v->dents); }
+    if (v->kind == VK_TMPFILE || v->kind == VK_TMPDIR) {   // drop the tmpfs node ref (frees if unlinked)
+        pthread_mutex_lock(&g_tmpfs_mx); tn_release(v->shobj); pthread_mutex_unlock(&g_tmpfs_mx);
+    }
+    if (v->kind == VK_DIR || v->kind == VK_TMPDIR) { if (v->d) closedir(v->d); free(v->dents); }
     if ((v->kind == VK_PIPE || v->kind == VK_SOCK) && v->peer >= 0 && g_v[v->peer].kind != VK_FREE)
         g_v[v->peer].peer = -1;              // peer sees EOF/EPIPE
     if (v->kind == VK_LISTEN)
@@ -475,6 +784,7 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     if (V(fd)->kind == VK_SINK) { (void)buf; (void)n; return 0; }   // discard sink: always EOF
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, buf, n, 0);
+    if (V(fd)->kind == VK_TMPFILE) return nx_tmpfs_read_body(V(fd), buf, n);   // RAM /tmp
     pthread_mutex_lock(&g_mx);
     vfd_t* v = V(fd);
     if (v->kind == VK_DIR) { pthread_mutex_unlock(&g_mx); errno = EISDIR; return -1; }
@@ -510,6 +820,10 @@ long nx_vfd_write(int fd, const void* buf, size_t n) {
     }
     if (V(fd)->kind == VK_SINK) return (long)n;   // discard sink (reg*.tmp): drop the bytes
     if (V(fd)->kind == VK_SHMEM) return shmem_rw(fd, (void*)buf, n, 1);
+    if (V(fd)->kind == VK_TMPFILE) {              // RAM /tmp
+        if (nx_vfd_buf_bad(buf, n)) { errno = EFAULT; return -1; }
+        return nx_tmpfs_write_body(V(fd), buf, n);
+    }
     if (nx_vfd_buf_bad(buf, n)) { errno = EFAULT; return -1; }   // bad guest buffer -> -EFAULT, not a fault
     { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
       if (on) vlog("nx_vfd: VW pid=%d tid=%d fd=%d peer=%d n=%zu\n", nx_guest_pid(), nx_gettid(), fd, V(fd)->peer, n); }
@@ -1130,6 +1444,7 @@ extern unsigned long nx_ipc_unlink, nx_ipc_mkdir, nx_ipc_rmdir, nx_ipc_rename;
 int nx_mkdir_guest(const char* p, unsigned mode) {
     char hp[512];
     if (!p) { errno = EFAULT; return -1; }
+    if (nx_tmpfs_is_path(p)) { int r = nx_tmpfs_mkdir(p, (mode_t)mode); if (r < 0 && errno == EEXIST) r = 0; return r; }
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     __atomic_add_fetch(&nx_ipc_mkdir, 1, __ATOMIC_RELAXED);
     int r = nx_fs_mkdir(hp, (mode_t)mode);       // SD I/O funnel (host path; counter + invalidate stay here)
@@ -1140,6 +1455,7 @@ int nx_mkdir_guest(const char* p, unsigned mode) {
 int nx_unlink_guest(const char* p) {
     char hp[512];
     if (!p) { errno = EFAULT; return -1; }
+    if (nx_tmpfs_is_path(p)) return nx_tmpfs_unlink(p);
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     __atomic_add_fetch(&nx_ipc_unlink, 1, __ATOMIC_RELAXED);
     int r = nx_fs_unlink(hp);                    // SD I/O funnel (host path)
@@ -1149,6 +1465,7 @@ int nx_unlink_guest(const char* p) {
 int nx_rmdir_guest(const char* p) {
     char hp[512];
     if (!p) { errno = EFAULT; return -1; }
+    if (nx_tmpfs_is_path(p)) return nx_tmpfs_rmdir(p);
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     __atomic_add_fetch(&nx_ipc_rmdir, 1, __ATOMIC_RELAXED);
     int r = nx_fs_rmdir(hp);                     // SD I/O funnel (host path)
@@ -1172,6 +1489,7 @@ int nx_unlinkat_guest(int dirfd, const char* p, int flags) {
 int nx_access_guest(const char* p, int mode) {
     char hp[512]; struct stat st;
     if (!p) { errno = EFAULT; return -1; }
+    if (nx_tmpfs_is_path(p)) return nx_tmpfs_access(p, mode);
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
     (void)mode;                                  // fsdev has no perms — existence check suffices
     return nx_fs_stat(hp, &st);                  // SD I/O funnel (host path)
@@ -1198,6 +1516,10 @@ int nx_fs_rename_direct(const char* ha, const char* hb) {
 int nx_rename_guest(const char* a, const char* b) {
     char ha[512], hb[512];
     if (!a || !b) { errno = EFAULT; return -1; }
+    if (nx_tmpfs_is_path(a) || nx_tmpfs_is_path(b)) {   // RAM /tmp: both-in-tmpfs moves; cross-fs -> EXDEV
+        if (nx_tmpfs_is_path(a) && nx_tmpfs_is_path(b)) return nx_tmpfs_rename(a, b);
+        errno = EXDEV; return -1;
+    }
     if (nx_translate_path(a, ha, sizeof ha) != 0) return -1;
     if (nx_translate_path(b, hb, sizeof hb) != 0) return -1;
     // Fast registry save: the reg*.tmp source was written empty (writes discarded, see nx_regtmp_is),

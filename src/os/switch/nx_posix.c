@@ -370,6 +370,8 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
         // M2.5: the wineserver `socket` (a bound vfd) and lock/tmpmap (shared objects) have no fsdev
         // file, but Wine stat()s the socket before connecting — return a synthetic S_IFSOCK/regular
         // stat so it doesn't see ENOENT and give up ("cannot connect").
+        { extern int nx_tmpfs_is_path(const char*); extern int nx_tmpfs_stat(const char*, struct stat*);
+          if (nx_tmpfs_is_path(path)) return nx_tmpfs_stat(path, b); }   // RAM /tmp (self-contained stat)
         { extern int nx_vfd_path_stat(const char* guestpath, struct stat* st);
           if (nx_vfd_path_stat(path, b) == 0) return 0; }
         if (nx_translate_path(path, hp, sizeof hp) != 0) { errno = ENOENT; return -1; }
@@ -1215,7 +1217,10 @@ long syscall(long number, ...) {
             // per-instance cwd) so the wineserver-runtime detection below and the shared-object key are
             // stable across the client and wineserver instances.
             char np[512]; nx_normalize_guest(p, np, sizeof np); p = np;
-            // Diagnostic (KX_SCTRACE, off by default — it floods): arm the per-syscall trace
+            // Phase C: /tmp is a RAM tmpfs (no SD) — intercept BEFORE nx_translate_path so it never
+            // reaches the resolver/pc-cache. Handles its own O_CREAT/O_DIRECTORY/O_TRUNC.
+            { extern int nx_tmpfs_is_path(const char*); extern int nx_tmpfs_openat(const char*, int, mode_t);
+              if (nx_tmpfs_is_path(p)) return nx_tmpfs_openat(p, (int)a2, (mode_t)a3); }
             // (x64syscall.c) at the drive_c/windows DLL-search to see the client's last syscalls.
             { extern volatile int kx_sctrace; if (!kx_sctrace && strstr(p, "drive_c/windows") && getenv("KX_SCTRACE")) kx_sctrace = 1; }
             // M2.5: the wineserver runtime files (its `lock` + `tmpmap-*` shared memory) are shared
