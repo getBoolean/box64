@@ -334,6 +334,7 @@ static void nx_hold_and_exit(void) {
     }
     if (g_have_romfs) romfsExit();
     if (g_nxlink_fd >= 0) close(g_nxlink_fd);
+    { extern void nx_net_exit(void); nx_net_exit(); }   // M2.8: nifm down; socketExit stays below
     if (g_homebrew) socketExit();
     consoleExit(NULL);
 }
@@ -415,6 +416,11 @@ int main(int argc, char **argv) {
     // WINEPREFIX=/root/.wine. Fixes the client AND the in-process wineserver (server/request.c reads HOME).
     setenv("HOME", "/root", 0);
     setenv("USER", "root", 0);
+    // M2.8: bring up bsd:u/nifm:u for guest INET sockets. MUST be after load_env_file() — the KX_NET
+    // gate lives in box64.env, and on an installed title an unconditional socketInitialize() with no
+    // bsd:u in the NPDM hangs the process on a black screen (which is exactly why the homebrew
+    // netloader block above is gated on envHasHeapOverride() instead). Tolerates failure.
+    { extern void nx_net_init(void); nx_net_init(); }
     // Declare supported pads to Horizon ASAP (after load_env_file so KX_PAD_CONFIG can force it on):
     // without a hidSetSupportedNpadStyleSet/IdType call the npad arbiter cannot bind a Bluetooth
     // controller to any slot and powers it off (see the comment above). 8 players so a switch-mcp

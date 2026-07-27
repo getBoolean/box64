@@ -34,6 +34,7 @@
 #include "custommem.h"   // getProtection — validate guest buffers before deref (EFAULT, not a fault)
 #include "nx_fsfunnel.h" // SD I/O funnel: nx_fs_* wrappers + the nx_dent_t snapshot type
 #include "nx_libcache.h" // RAM lib content cache: invalidate on unlink/rename (Part 2)
+#include "nx_net.h"      // M2.8 INET sockets: keep them off the SD funnel + route the socket syscalls
 
 // nx_posix.c
 extern int  nx_translate_path(const char* p, char* out, size_t outn);
@@ -201,8 +202,15 @@ int nx_vfd_is(int fd) { return is_vfd(fd) && g_v[fd - NX_VFD_BASE].kind != VK_FR
 
 // v2 data-op guard (Phase A): true only for a REAL SD-file fd, so the data funnel skips std fds, vfds
 // (>=NX_VFD_BASE), stdout/err tee-dup targets, and reg*.tmp discard fds (all handled on the caller thread).
+//
+// M2.8: a libnx bsd socket is ALSO a plain newlib fd > 2 and passes every other test here, so it must
+// be excluded explicitly. Without this a blocking guest recv() is enqueued onto the single fsdev
+// worker and executed there — the worker then sits in the socket read while its producer parks in
+// svcWaitForAddress(-1), and ALL guest file I/O in the process stops until a packet arrives. That is a
+// deadlock, not a slowdown, so this one predicate is what gates every funnel call site (read/write/
+// pread/pwrite/writev in x64syscall.c + nx_posix.c, and the mmap fill in nx_virtmem.c).
 int nx_fs_real_file(int fd) {
-    return fd > 2 && !nx_vfd_is(fd) && !nx_tee_origin(fd) && !nx_regtmp_is(fd);
+    return fd > 2 && !nx_vfd_is(fd) && !nx_tee_origin(fd) && !nx_regtmp_is(fd) && !nx_net_is_socket(fd);
 }
 
 static int slot_alloc(void) {          // g_mx held
@@ -1562,7 +1570,15 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             r = nx_vfd_write((int)a1, (const void*)a2, (size_t)a3);
             break;
         case 3:   // close
-            if (!nx_vfd_is((int)a1)) { nx_tee_forget((int)a1); return 0; }  // clear stale tee flag, let box64 close
+            if (!nx_vfd_is((int)a1)) {
+                nx_tee_forget((int)a1);                        // clear stale tee flag
+                // A socket close must be taken here: box64's big-switch close hands every real fd to
+                // the SD funnel worker (x64syscall.c cases 3), and a socket has no business on the
+                // fsdev queue. Closing it inline is also what releases the newlib handle that
+                // nx_net_is_socket() keys on.
+                if (nx_net_is_socket((int)a1)) { r = close((int)a1); break; }
+                return 0;                                      // ordinary real fd: let box64 close it
+            }
             r = nx_vfd_close((int)a1);
             break;
         case 7:   // poll

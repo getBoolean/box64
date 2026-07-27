@@ -4,6 +4,7 @@
 #include "nx_posix.h"
 #include "nx_fsfunnel.h"   // SD I/O funnel: real fsdev metadata ops route onto a worker (nx_fs_*)
 #include "nx_libcache.h"   // RAM content cache for read-only libs/DLLs (Part 2 / Phase B)
+#include "nx_net.h"        // M2.8 INET sockets over bsd:u (AF_UNIX stays on the nx_vfd layer)
 
 #include <switch.h>
 #include <stdlib.h>
@@ -1295,6 +1296,7 @@ long syscall(long number, ...) {
         }
         case 57:                                                 // close
             if (nx_vfd_is((int)a0)) return nx_vfd_close((int)a0);
+            if (nx_net_is_socket((int)a0)) return close((int)a0);   // socket: never onto the SD funnel
             { extern void nx_tee_forget(int fd); nx_tee_forget((int)a0); }  // drop stale stdout/err dup flag
             { extern void nx_regtmp_forget(int fd); nx_regtmp_forget((int)a0); }  // drop reg*.tmp sink flag
             nx_libcache_forget((int)a0);                     // Part 2: drop the (pid,fd) lib-cache assoc
