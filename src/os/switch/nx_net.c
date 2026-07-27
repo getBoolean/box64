@@ -852,12 +852,14 @@ int nx_net_resolv_conf(char* buffer, size_t capacity) {
         have_config = 1;
 
     int written = 0;
-    // Horizon reports these as host-order u32; print the octets explicitly rather than going through
-    // inet_ntoa, which would pull in another libnx symbol for no benefit.
-    #define NX_ADDRESS_OCTETS(address) (unsigned)(((address) >> 24) & 0xff), \
-                                       (unsigned)(((address) >> 16) & 0xff), \
+    // nifm hands these back NETWORK-ORDER-in-a-u32: the FIRST dotted octet is the LOW byte, not the
+    // high one. HW-verified 2026-07-27 — reading them the other way printed the router 192.168.8.1 as
+    // "1.8.168.192". Printed octet-wise rather than via inet_ntoa, which would pull in another libnx
+    // symbol for no benefit.
+    #define NX_ADDRESS_OCTETS(address) (unsigned)( (address)        & 0xff), \
                                        (unsigned)(((address) >>  8) & 0xff), \
-                                       (unsigned)( (address)        & 0xff)
+                                       (unsigned)(((address) >> 16) & 0xff), \
+                                       (unsigned)(((address) >> 24) & 0xff)
     if (have_config && primary_nameserver)
         written += snprintf(buffer + written, capacity - (size_t)written,
                             "nameserver %u.%u.%u.%u\n", NX_ADDRESS_OCTETS(primary_nameserver));
