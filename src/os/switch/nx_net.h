@@ -55,6 +55,12 @@ int  nx_net_is_socket(int fd);
 // M2.5 vfd layer, everything else is refused.)
 int  nx_net_family_is_inet(int linux_domain);
 
+// Copy a socket's remembered non-blocking state onto a duplicate fd. dup()/dup2()/SCM_RIGHTS give the
+// copy a NEW fd number that shares the SAME underlying bsd descriptor, but this layer's state is keyed
+// by fd number — so without this the copy reads as blocking, and any synthesized non-blocking
+// behaviour silently stops applying to it. Safe (a no-op) if either fd is not a socket.
+void nx_net_shadow_dup(int from_fd, int to_fd);
+
 // ---- syscall bodies ------------------------------------------------------------------------------
 //
 // Every argument and result below is a LINUX value: Linux AF_*/SOCK_*/SOL_*/SO_*/MSG_*/ioctl numbers,

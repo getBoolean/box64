@@ -790,8 +790,17 @@ int nx_vfd_close(int fd) {
             if (g_v[v->backlog[i]].kind != VK_FREE) { g_v[v->backlog[i]].refs = 0; g_v[v->backlog[i]].kind = VK_FREE; }
     free(v->buf);
     if (v->kind == VK_EPOLL) free(v->epset);
-    for (int i = 0; i < v->fdq_n; i++)       // unclaimed passed fds: drop our reference
-        if (nx_vfd_is(v->fdq[i].fd)) { pthread_mutex_unlock(&g_mx); nx_vfd_close(v->fdq[i].fd); pthread_mutex_lock(&g_mx); }
+    // Unclaimed passed fds: drop our reference. A queued REAL fd is a dup() this layer made in
+    // nx_sendmsg, so it is ours to close — leaving it open leaked a newlib handle slot and, for a
+    // socket, a bsd descriptor too. ws2_32 passes socket fds constantly, and both pools are finite
+    // (1024 handles, FDQ_MAX 256 per vfd), so the leak is reachable rather than theoretical.
+    for (int i = 0; i < v->fdq_n; i++) {
+        int queued_fd = v->fdq[i].fd;
+        pthread_mutex_unlock(&g_mx);
+        if (nx_vfd_is(queued_fd)) nx_vfd_close(queued_fd);
+        else close(queued_fd);
+        pthread_mutex_lock(&g_mx);
+    }
     memset(v, 0, sizeof *v);
     v->kind = VK_FREE;
     pthread_cond_broadcast(&g_cv);
@@ -1125,7 +1134,7 @@ long nx_sendmsg(int fd, const l_msghdr* msg, int flags) {
                     int passfd = fda[i];
                     if (nx_vfd_is(passfd)) g_v[passfd - NX_VFD_BASE].refs++;   // survive sender close
                     else { int d = dup(passfd);
-                           if (d >= 0) { tee_mark(d, passfd); passfd = d; }
+                           if (d >= 0) { tee_mark(d, passfd); nx_net_shadow_dup(passfd, d); passfd = d; }
                            else vlog("nx_vfd: dup(%d) fail e=%d\n", passfd, errno); }
                     p->fdq[p->fdq_n].fd = passfd;
                     p->fdq[p->fdq_n].at = p->wr;   // END of this message (iov already written above)
@@ -1269,6 +1278,7 @@ enum {
     NX_POLL_OUT       = 0x004,
     NX_POLL_ERROR     = 0x008,
     NX_POLL_HANGUP    = 0x010,
+    NX_POLL_INVALID   = 0x020,   // POLLNVAL — the fd is not open
 };
 
 int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
@@ -1297,6 +1307,16 @@ int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
             if (nx_net_is_socket(pollfds[i].fd)) continue;   // already scored above — do not clear it
             pollfds[i].revents = 0;
             if (!nx_vfd_is(pollfds[i].fd)) {
+                // A number in the vfd BAND whose slot is free is a CLOSED vfd, not a real fd. Scoring
+                // it as a plain file below would report it permanently ready, and a caller that polls
+                // a stale fd would then spin at 100% CPU instead of seeing an error. POSIX says
+                // POLLNVAL — and POLLNVAL does not count toward the ready total the way a requested
+                // event does, but it must still wake the call, so it is counted here as Linux does.
+                if (is_vfd(pollfds[i].fd)) {
+                    pollfds[i].revents = NX_POLL_INVALID;
+                    ready_count++;
+                    continue;
+                }
                 // real newlib fd: no host poll on Horizon — report it ready for whatever was
                 // asked (a read on a real file won't block anyway)
                 has_plain_file = 1;
@@ -1492,16 +1512,42 @@ int nx_epoll_ctl(int epfd, int op, int fd, void* uev) {
     return r;
 }
 
+// How many interest entries are snapshotted on the stack before falling back to the heap. Sized for
+// the common case (a handful of fds) — the wineserver's main loop registers far more.
+enum { NX_EPOLL_STACK_MAX = 64 };
+
 int nx_epoll_wait(int epfd, void* uevents, int maxevents, int timeout_ms) {
     if (!nx_vfd_is(epfd) || V(epfd)->kind != VK_EPOLL) { errno = EBADF; return -1; }
     if (maxevents <= 0) { errno = EINVAL; return -1; }
     // Snapshot the interest set under the lock, then poll it via nx_poll (which takes the lock itself).
+    //
+    // The WHOLE set is polled, never a prefix of it. maxevents bounds how many ready events the caller
+    // can RECEIVE; it says nothing about how many fds may be examined. Truncating the interest set to
+    // it (as this did) meant epoll_wait(...,maxevents=1,...) only ever watched the first registered
+    // fd — and a second, fixed 64-entry stack cap silently starved everything past index 63. The
+    // wineserver's main loop is epoll-based over many sockets, so both were real starvation bugs.
     pthread_mutex_lock(&g_mx);
     int n = V(epfd)->ep_n;
-    if (n > maxevents) n = maxevents;
     nx_epitem* set = (nx_epitem*)V(epfd)->epset;
-    l_pollfd pf[64]; nx_epitem snap[64];
-    if (n > 64) n = 64;
+    l_pollfd stack_pf[NX_EPOLL_STACK_MAX];
+    nx_epitem stack_snap[NX_EPOLL_STACK_MAX];
+    l_pollfd* pf = stack_pf;
+    nx_epitem* snap = stack_snap;
+    void* heap_pf = NULL;
+    void* heap_snap = NULL;
+    if (n > NX_EPOLL_STACK_MAX) {
+        // realloc() already runs under g_mx in nx_epoll_ctl, so allocating here breaks no lock order.
+        heap_pf = malloc((size_t)n * sizeof *pf);
+        heap_snap = malloc((size_t)n * sizeof *snap);
+        if (!heap_pf || !heap_snap) {
+            free(heap_pf); free(heap_snap);
+            pthread_mutex_unlock(&g_mx);
+            errno = ENOMEM;
+            return -1;
+        }
+        pf = (l_pollfd*)heap_pf;
+        snap = (nx_epitem*)heap_snap;
+    }
     for (int k = 0; k < n; k++) {
         snap[k] = set[k];
         pf[k].fd = set[k].fd;
@@ -1515,7 +1561,7 @@ int nx_epoll_wait(int epfd, void* uevents, int maxevents, int timeout_ms) {
         return 0;
     }
     int ready = nx_poll(pf, (unsigned long)n, timeout_ms);
-    if (ready <= 0) return ready;
+    if (ready <= 0) { free(heap_pf); free(heap_snap); return ready; }
     l_epoll_event* out = (l_epoll_event*)uevents;
     int o = 0;
     for (int k = 0; k < n && o < maxevents; k++) {
@@ -1524,6 +1570,11 @@ int nx_epoll_wait(int epfd, void* uevents, int maxevents, int timeout_ms) {
         out[o].data = snap[k].data;
         o++;
     }
+    // Truncating the OUTPUT is legal epoll behaviour (the caller comes back for the rest), but it is
+    // worth seeing: a caller that never drains the backlog looks like a stall with no other symptom.
+    if (o < ready)
+        vlog("nx_vfd: epoll_wait ep=%d reported %d of %d ready (maxevents=%d)\n", epfd, o, ready, maxevents);
+    free(heap_pf); free(heap_snap);
     return o;
 }
 
@@ -1800,7 +1851,7 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                 r = (long)a1;
             } else {
                 r = dup((int)a1);
-                if (r >= 0) tee_mark((int)r, (int)a1);
+                if (r >= 0) { tee_mark((int)r, (int)a1); nx_net_shadow_dup((int)a1, (int)r); }
             }
             break;
         case 33:  // dup2 (real fds only; a vfd can't be pinned to an arbitrary number)
@@ -1809,7 +1860,7 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                 errno = EBADF; r = -1; break;
             }
             r = dup2((int)a1, (int)a2);
-            if (r >= 0) tee_mark((int)r, (int)a1);
+            if (r >= 0) { tee_mark((int)r, (int)a1); nx_net_shadow_dup((int)a1, (int)r); }
             break;
         case 77:  // ftruncate (vfd SHMEM only)
             if (!nx_vfd_is((int)a1)) return 0;

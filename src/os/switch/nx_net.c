@@ -52,6 +52,15 @@ extern ssize_t nx_bsd_sendto(int fd, const void* buffer, size_t length, int flag
                              const void* address, unsigned address_length)                  __asm__("sendto");
 extern ssize_t nx_bsd_recvfrom(int fd, void* buffer, size_t length, int flags,
                                void* address, unsigned* address_length)                     __asm__("recvfrom");
+// The ADDRESS-LESS forms. Horizon's bsd:u has distinct Send/Recv commands alongside SendTo/RecvFrom,
+// and libnx's sendto()/recvfrom() wrappers dispatch SendTo/RecvFrom UNCONDITIONALLY — passing a NULL
+// sockaddr does not make them fall back. So an address-less send must be routed here explicitly, or
+// the stack is handed a SendTo naming no destination. HW-relevant, not merely tidy: Ryujinx's HLE
+// bsd:u dereferences the absent sockaddr and dies with a NullReferenceException that takes its whole
+// service thread with it, wedging every later socket call in the process (measured 2026-07-27 —
+// a loopback send() after accept() hung the guest forever).
+extern ssize_t nx_bsd_send(int fd, const void* buffer, size_t length, int flags)             __asm__("send");
+extern ssize_t nx_bsd_recv(int fd, void* buffer, size_t length, int flags)                   __asm__("recv");
 extern int     nx_bsd_shutdown(int fd, int how)                                             __asm__("shutdown");
 extern int     nx_bsd_ioctl(int fd, int request, ...)                                       __asm__("ioctl");
 extern int     nx_bsd_fcntl(int fd, int command, ...)                                       __asm__("fcntl");
@@ -103,7 +112,7 @@ enum {
     LINUX_MSG_WAITALL = 0x100, LINUX_MSG_NOSIGNAL = 0x4000,
 
     LINUX_O_NONBLOCK = 0x800,        // newlib's is 0x4000 — never pass one for the other
-    LINUX_FIONBIO = 0x5421, LINUX_FIONREAD = 0x541B,
+    LINUX_FIONBIO = 0x5421, LINUX_FIONREAD = 0x541B, LINUX_SIOCATMARK = 0x8905,
 
     LINUX_SHUT_READ = 0, LINUX_SHUT_WRITE = 1, LINUX_SHUT_READ_WRITE = 2,   // identical in both ABIs
 };
@@ -111,7 +120,9 @@ enum {
 // BSD values that libnx's usable headers do NOT give us. FIONBIO/FIONREAD live in <sys/filio.h>, which
 // cannot be included here (see the ioctl conflict above), so the _IOW/_IOR encodings are inlined:
 //   FIONBIO = _IOW('f', 126, int) = 0x8004667E,  FIONREAD = _IOR('f', 127, int) = 0x4004667F.
-enum { BSD_FIONBIO = 0x8004667E, BSD_FIONREAD = 0x4004667F };
+// SIOCATMARK is the same story from <sys/sockio.h>, which drags in the same ioccom.h:
+//   SIOCATMARK = _IOR('s', 7, int) = 0x40047307.
+enum { BSD_FIONBIO = 0x8004667E, BSD_FIONREAD = 0x4004667F, BSD_SIOCATMARK = 0x40047307 };
 
 // BSD sockaddr length byte: FreeBSD's `struct sockaddr` leads with {u8 sa_len, u8 sa_family} where
 // Linux has a single {u16 sa_family}. Both sockaddr_in (16 B) and sockaddr_in6 (28 B) are otherwise
@@ -351,17 +362,53 @@ static int bsd_descriptor(int fd) {
     return *(int*)handle->fileStruct;
 }
 
-// Remembered non-blocking state, consulted only when the stack cannot report it (see below). Indexed
-// by newlib fd; entries are reset when a socket is created or accepted, which is the only way an fd
-// number can be reused, so a stale entry cannot outlive its socket.
-enum { NX_NONBLOCK_TRACK_MAX = 256 };
-static uint8_t g_nonblock_shadow[NX_NONBLOCK_TRACK_MAX];
+// Remembered non-blocking state, indexed by newlib fd. Entries are reset when a socket is created or
+// accepted, which is the only way an fd number can be reused, so a stale entry cannot outlive its
+// socket. Sized to the full newlib handle table (nx_posix reports _SC_OPEN_MAX = 1024) — at 256 a
+// socket landing on a higher fd silently fell off the shadow, and the emulation below would then
+// misjudge exactly the sockets a busy ws2_32 run creates last.
+enum { NX_NONBLOCK_TRACK_MAX = 1024 };
+
+// `wanted` = what the GUEST asked for. `emulated` = the stack refused to apply it, so the socket's
+// real state is the OPPOSITE of `wanted` and this layer has to synthesize the difference.
+typedef struct { uint8_t wanted; uint8_t emulated; } nonblock_state_t;
+static nonblock_state_t g_nonblock_shadow[NX_NONBLOCK_TRACK_MAX];
 
 static void nonblock_shadow_set(int fd, int enable) {
-    if (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) g_nonblock_shadow[fd] = enable ? 1 : 0;
+    if (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) {
+        g_nonblock_shadow[fd].wanted = enable ? 1 : 0;
+        g_nonblock_shadow[fd].emulated = 0;
+    }
+}
+static void nonblock_shadow_set_emulated(int fd, int enable) {
+    if (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) {
+        g_nonblock_shadow[fd].wanted = enable ? 1 : 0;
+        g_nonblock_shadow[fd].emulated = 1;
+    }
 }
 static int nonblock_shadow_get(int fd) {
-    return (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) ? g_nonblock_shadow[fd] : 0;
+    return (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) ? g_nonblock_shadow[fd].wanted : 0;
+}
+// 0 = the stack holds the real state; 1 = the stack refused and we are synthesizing it.
+static int nonblock_is_emulated(int fd) {
+    return (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) ? g_nonblock_shadow[fd].emulated : 0;
+}
+
+void nx_net_shadow_dup(int from_fd, int to_fd) {
+    if (from_fd < 0 || from_fd >= NX_NONBLOCK_TRACK_MAX) return;
+    if (to_fd   < 0 || to_fd   >= NX_NONBLOCK_TRACK_MAX) return;
+    g_nonblock_shadow[to_fd] = g_nonblock_shadow[from_fd];
+}
+
+// Synthesized non-blocking semantics, for a stack that cannot apply O_NONBLOCK in one or both
+// directions. Presence of KX_NO_NET_NOBLOCK_EMU DISABLES it (default on), matching the project's
+// KX_NO_* convention — it is an A/B switch for isolating a regression to this path, not a feature
+// flag. (The plan called this KX_NET_NOBLOCK_EMU; renamed so the name cannot be misread as
+// "presence enables", which is the opposite of what it does.)
+static int nonblock_emulation_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("KX_NO_NET_NOBLOCK_EMU") ? 0 : 1;
+    return enabled;
 }
 
 // Two routes, because bsd:u implementations differ in what they support:
@@ -388,6 +435,19 @@ int nx_net_set_nonblock(int fd, int enable) {
     int value = enable ? 1 : 0;
     if (bsdIoctl(descriptor, BSD_FIONBIO, &value) < 0) {
         net_log("nx_net: FIONBIO fd=%d enable=%d failed rc=0x%x\n", fd, enable, socketGetLastResult());
+        // Route 3: neither route reached the stack, so the socket keeps whatever mode it already had —
+        // the OPPOSITE of what the guest just asked for. Record the intent and synthesize the
+        // difference around every later data operation (see nonblock_emu_*). Refusing instead is not
+        // a safe fallback in EITHER direction: a failed SET leaves Wine driving a blocking socket it
+        // believes is non-blocking (one slow peer stalls its whole message loop), and a failed CLEAR
+        // leaves the socket non-blocking while the guest expects blocking, so every read returns a
+        // spurious EAGAIN. Measured on Ryujinx's HLE bsd:u, which applies F_SETFL|O_NONBLOCK but
+        // rejects clearing it and rejects FIONBIO outright (2026-07-27).
+        if (nonblock_emulation_enabled()) {
+            nonblock_shadow_set_emulated(fd, enable);
+            net_log("nx_net: fd=%d non-blocking=%d EMULATED (stack refused both routes)\n", fd, enable);
+            return 0;
+        }
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -396,6 +456,9 @@ int nx_net_set_nonblock(int fd, int enable) {
 }
 
 int nx_net_get_nonblock(int fd) {
+    // While emulating, the shadow is AUTHORITATIVE: the stack would report its own (wrong) state and
+    // Wine's set-then-check pattern would see the setting it just made get rejected.
+    if (nonblock_is_emulated(fd)) return nonblock_shadow_get(fd);
     int flags = 0;
     if (bsd_fcntl_checked(fd, NEWLIB_F_GETFL, 0, &flags) == 0)
         return (flags & NEWLIB_O_NONBLOCK) ? 1 : 0;
@@ -403,6 +466,44 @@ int nx_net_get_nonblock(int fd) {
     // would break the read-back half of Wine's set-then-check pattern on a socket that IS correctly
     // configured.
     return nonblock_shadow_get(fd);
+}
+
+// ---- synthesized non-blocking semantics ----------------------------------------------------------
+//
+// Used ONLY on a socket whose shadow says `emulated` — i.e. the stack's real mode is the opposite of
+// what the guest asked for. Two mirror-image cases, one helper each:
+//
+//   guest wants NON-BLOCKING, socket is blocking  -> nonblock_emu_pre():  poll with a 0 timeout and
+//        report EAGAIN rather than entering an operation that would block.
+//   guest wants BLOCKING, socket is non-blocking  -> nonblock_emu_retry(): an EAGAIN from the stack
+//        is not the guest's answer, so wait for readiness and run the operation again.
+//
+// Declared here because nx_net_poll is defined further down with the rest of the poll translation.
+int nx_net_poll(void* linux_pollfds, unsigned long count, int timeout_ms, int* out_has_socket);
+enum { NX_NB_POLL_IN = 0x001, NX_NB_POLL_OUT = 0x004 };
+
+// One socket, one event mask. Returns 1 ready, 0 timed out, -1 error.
+static int nonblock_poll_one(int fd, short linux_events, int timeout_ms) {
+    struct { int fd; short events; short revents; } one = { fd, linux_events, 0 };
+    return nx_net_poll(&one, 1, timeout_ms, NULL);
+}
+
+// Returns -1 (errno EAGAIN) if the caller must NOT proceed into a blocking operation.
+static int nonblock_emu_pre(int fd, short linux_events) {
+    if (!nonblock_is_emulated(fd) || !nonblock_shadow_get(fd)) return 0;   // not emulating non-blocking
+    if (nonblock_poll_one(fd, linux_events, 0) > 0) return 0;              // ready: it will not block
+    errno = EAGAIN;
+    return -1;
+}
+
+// Returns 1 if the operation should be retried after waiting. `operation_errno` is errno as the stack
+// left it.
+static int nonblock_emu_retry(int fd, short linux_events, int operation_errno) {
+    if (!nonblock_is_emulated(fd) || nonblock_shadow_get(fd)) return 0;    // not emulating blocking
+    if (operation_errno != EAGAIN && operation_errno != EWOULDBLOCK) return 0;
+    // Wait indefinitely — that IS blocking semantics. A poll error (rather than a timeout) must not
+    // spin: fall through and let the caller return the original EAGAIN.
+    return nonblock_poll_one(fd, linux_events, -1) > 0;
 }
 
 int nx_net_socket(int linux_domain, int linux_type, int linux_protocol) {
@@ -467,7 +568,13 @@ int nx_net_accept4(int fd, void* linux_address, unsigned* linux_capacity, int li
     if (linux_capacity && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
     uint8_t bsd_address[NX_SOCKADDR_MAX];
     unsigned bsd_length = sizeof bsd_address;
-    int accepted_fd = nx_bsd_accept(fd, bsd_address, &bsd_length);
+    int accepted_fd;
+    for (;;) {
+        if (nonblock_emu_pre(fd, NX_NB_POLL_IN) < 0) return -1;   // POLLIN on a listener = a pending connection
+        bsd_length = sizeof bsd_address;
+        accepted_fd = nx_bsd_accept(fd, bsd_address, &bsd_length);
+        if (accepted_fd >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_IN, errno)) break;
+    }
     if (accepted_fd < 0) return -1;
     nonblock_shadow_set(accepted_fd, 0);   // accepted sockets start blocking, per POSIX
     if (bsd_length >= 2 &&
@@ -533,8 +640,14 @@ long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
         wire_length = sockaddr_linux_to_bsd(linux_address, linux_address_length, bsd_address);
         if (!wire_length) { errno = EAFNOSUPPORT; return -1; }
     }
-    return (long)nx_bsd_sendto(fd, buffer, length, msg_flags_linux_to_bsd(linux_flags),
-                               wire_length ? bsd_address : NULL, wire_length);
+    int bsd_flags = msg_flags_linux_to_bsd(linux_flags);
+    for (;;) {
+        if (nonblock_emu_pre(fd, NX_NB_POLL_OUT) < 0) return -1;
+        long sent = wire_length
+            ? (long)nx_bsd_sendto(fd, buffer, length, bsd_flags, bsd_address, wire_length)
+            : (long)nx_bsd_send(fd, buffer, length, bsd_flags);
+        if (sent >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_OUT, errno)) return sent;
+    }
 }
 
 long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
@@ -544,9 +657,16 @@ long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
     unsigned bsd_length = sizeof bsd_address;
     int want_address = (linux_address && linux_capacity && *linux_capacity);
     if (want_address && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
-    long received = (long)nx_bsd_recvfrom(fd, buffer, length, msg_flags_linux_to_bsd(linux_flags),
-                                          want_address ? bsd_address : NULL,
-                                          want_address ? &bsd_length : NULL);
+    int bsd_flags = msg_flags_linux_to_bsd(linux_flags);
+    long received;
+    for (;;) {
+        if (nonblock_emu_pre(fd, NX_NB_POLL_IN) < 0) return -1;
+        bsd_length = sizeof bsd_address;   // libnx overwrites this; reset before every attempt
+        received = want_address
+            ? (long)nx_bsd_recvfrom(fd, buffer, length, bsd_flags, bsd_address, &bsd_length)
+            : (long)nx_bsd_recv(fd, buffer, length, bsd_flags);
+        if (received >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_IN, errno)) break;
+    }
     if (received < 0) return -1;
     if (want_address && bsd_length >= 2)
         sockaddr_bsd_to_linux(bsd_address, bsd_length, linux_address, linux_capacity);
@@ -580,7 +700,7 @@ long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
     // Ancillary data over INET has no meaning here: SCM_RIGHTS is an AF_UNIX concept and the vfd layer
     // owns it. Ignore control rather than fail — Linux ignores unknown cmsgs on INET too.
     if (message->iov_count == 0)
-        return (long)nx_bsd_sendto(fd, "", 0, msg_flags_linux_to_bsd(linux_flags), NULL, 0);
+        return nx_net_sendto(fd, "", 0, linux_flags, message->name, message->name_length);
     if (message->iov_count == 1)
         return nx_net_sendto(fd, message->iov[0].base, message->iov[0].length, linux_flags,
                              message->name, message->name_length);
@@ -821,9 +941,15 @@ static int fionread_bytes_available(int fd, int* out_bytes) {
     return -1;
 }
 
-// Only the two ioctls that mean something on a socket are honored. Everything else returns ENOTTY,
+// Only the three ioctls that mean something on a socket are honored. Everything else returns ENOTTY,
 // per the standing rule (nx_vfd.c): Wine PROBES fds with terminal/ext-flag/readdir ioctls and a faked
 // success either livelocks it or makes it misclassify the fd as a console.
+//
+// SIOCATMARK is the third because Wine issues it directly (dlls/ntdll/unix/socket.c, behind
+// IOCTL_AFD_WINE_SIOCATMARK). Unlike FIONREAD it is NOT given a conservative fallback when the stack
+// cannot answer: "no bytes queued" is self-correcting (the caller polls or reads anyway), whereas
+// "the read pointer is not at the out-of-band mark" is not — a caller that believes it consumes OOB
+// data as ordinary data and silently corrupts the stream. An honest ENOTTY is the better failure.
 int nx_net_ioctl(int fd, unsigned long linux_request, void* argument) {
     switch (linux_request) {
         case LINUX_FIONBIO:
@@ -832,6 +958,11 @@ int nx_net_ioctl(int fd, unsigned long linux_request, void* argument) {
         case LINUX_FIONREAD:
             if (nx_guest_buf_bad(argument, sizeof(int))) { errno = EFAULT; return -1; }
             return fionread_bytes_available(fd, (int*)argument);
+        case LINUX_SIOCATMARK:
+            if (nx_guest_buf_bad(argument, sizeof(int))) { errno = EFAULT; return -1; }
+            if (nx_bsd_ioctl(fd, BSD_SIOCATMARK, (int*)argument) == 0) return 0;
+            net_log("nx_net: SIOCATMARK fd=%d e=%d rc=0x%x\n", fd, errno, socketGetLastResult());
+            return -1;
         default:
             errno = ENOTTY;
             return -1;
