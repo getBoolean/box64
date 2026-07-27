@@ -922,6 +922,25 @@ int nx_translate_path_ex(const char* p, char* out, size_t outn, int* exists, str
     }
     if (!strcmp(p, "/dev/null"))
         return nx_materialize("dev-null", "", 0, out, outn);
+    // M2.8 DNS: the guest resolves names with its OWN glibc resolver over raw UDP:53 through the
+    // socket shim, so all Horizon has to supply is the config. That keeps sfdnsres out of the picture
+    // entirely (and box64's host-side nx_resolv_stubs.c untouched). Regenerated per call, like
+    // /dev/urandom above — the nameservers come from nifm and change when the console changes network.
+    if (!strcmp(p, "/etc/resolv.conf")) {
+        char rc[256];
+        int n = nx_net_resolv_conf(rc, sizeof rc);
+        return nx_materialize("etc-resolv", rc, (size_t)n, out, outn);
+    }
+    if (!strcmp(p, "/etc/nsswitch.conf")) {
+        // "files dns" only: no NIS/mDNS/systemd modules exist to dlopen here, and glibc 2.36 has
+        // files+dns built in, so nothing needs loading for this to work.
+        static const char nss[] = "hosts: files dns\nnetworks: files\n";
+        return nx_materialize("etc-nsswitch", nss, sizeof nss - 1, out, outn);
+    }
+    if (!strcmp(p, "/etc/hosts")) {
+        static const char hosts[] = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n";
+        return nx_materialize("etc-hosts", hosts, sizeof hosts - 1, out, outn);
+    }
     // glibc-hwcaps: box64 advertises AVX2 (x86-64-v3) via CPUID/HWCAP, so the guest's ld.so probes
     // .../glibc-hwcaps/x86-64-v3/libc.so.6 FIRST. If our flat-lib fallback answered that with the base
     // libc, ld.so would load libc TWICE under two host paths (base + hwcaps) -> two inodes -> a split

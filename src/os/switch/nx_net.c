@@ -657,6 +657,49 @@ int nx_net_ioctl(int fd, unsigned long l_req, void* arg) {
 // a POSITIVE EOPNOTSUPP (not -1) for those, which a caller checking `< 0` reads as success.
 enum { NX_L_F_GETFD = 1, NX_L_F_SETFD = 2, NX_L_F_GETFL = 3, NX_L_F_SETFL = 4 };
 
+// ---- DNS configuration ---------------------------------------------------------------------------
+
+// Fallback nameserver when nifm has none to offer (no link, or nifm itself unavailable). A wrong
+// answer here is harmless — the resolver simply times out — whereas an EMPTY resolv.conf makes glibc
+// fall back to 127.0.0.1:53, where nothing is listening, and the failure looks like a socket bug.
+#define NX_NET_FALLBACK_DNS "8.8.8.8"
+
+int nx_net_link_up(void) {
+    if (!g_nifm_ok) return 0;
+    NifmInternetConnectionType type = 0;
+    NifmInternetConnectionStatus status = 0;
+    u32 strength = 0;
+    if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) return 0;
+    return status == NifmInternetConnectionStatus_Connected;
+}
+
+// Render /etc/resolv.conf into `buf`; returns the byte count written.
+//
+// `options single-request` matters: without it glibc's resolver sends the A and AAAA queries in
+// PARALLEL on one socket, and modern glibc reaches for sendmmsg(2) to do it — which box64-nx does not
+// route (it is in neither the scwrap table nor nx_x64_precase, so it ENOSYSes). single-request makes
+// the resolver issue them sequentially with ordinary sendto/recvfrom, which is exactly the path this
+// module implements.
+int nx_net_resolv_conf(char* buf, size_t cap) {
+    u32 addr = 0, mask = 0, gw = 0, dns1 = 0, dns2 = 0;
+    int have = 0;
+    if (g_nifm_ok && R_SUCCEEDED(nifmGetCurrentIpConfigInfo(&addr, &mask, &gw, &dns1, &dns2)))
+        have = 1;
+
+    int n = 0;
+    // Horizon reports these as host-order u32; print octets explicitly rather than going through
+    // inet_ntoa, which would pull in another libnx symbol for no benefit.
+    #define NX_DNS_OCTETS(v) (unsigned)(((v) >> 24) & 0xff), (unsigned)(((v) >> 16) & 0xff), \
+                             (unsigned)(((v) >>  8) & 0xff), (unsigned)((v) & 0xff)
+    if (have && dns1) n += snprintf(buf + n, cap - (size_t)n, "nameserver %u.%u.%u.%u\n", NX_DNS_OCTETS(dns1));
+    if (have && dns2) n += snprintf(buf + n, cap - (size_t)n, "nameserver %u.%u.%u.%u\n", NX_DNS_OCTETS(dns2));
+    if (!n)           n += snprintf(buf + n, cap - (size_t)n, "nameserver " NX_NET_FALLBACK_DNS "\n");
+    n += snprintf(buf + n, cap - (size_t)n, "options single-request timeout:5 attempts:2\n");
+    #undef NX_DNS_OCTETS
+    netlog("nx_net: resolv.conf nifm=%d dns1=0x%x dns2=0x%x\n", g_nifm_ok, dns1, dns2);
+    return n;
+}
+
 // ---- poll ----------------------------------------------------------------------------------------
 
 // Poll bits. Eight of the ten are numerically identical in both ABIs (IN/PRI/OUT/ERR/HUP/NVAL/RDNORM/

@@ -51,6 +51,14 @@ int  nx_net_family_is_inet(int l_domain);
 // 1 iff nifm:u came up (the DNS-server source for the synthesized /etc/resolv.conf).
 int  nx_net_nifm_available(void);
 
+// 1 iff nifm reports the console actually has an internet connection. Lets a caller (and the M2.8
+// gate test) tell "offline console" apart from "broken shim".
+int  nx_net_link_up(void);
+
+// Render /etc/resolv.conf from nifm's current DNS servers; returns bytes written. Called per open()
+// from the VFS, so a network change is picked up without a restart.
+int  nx_net_resolv_conf(char* buf, size_t cap);
+
 // ---- syscall bodies ------------------------------------------------------------------------------
 //
 // Every argument and result below is a LINUX value: Linux AF_*/SOCK_*/SOL_*/SO_*/MSG_*/ioctl numbers,
