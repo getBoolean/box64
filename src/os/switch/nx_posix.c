@@ -3,6 +3,7 @@
 
 #include "nx_posix.h"
 #include "nx_fsfunnel.h"   // SD I/O funnel: real fsdev metadata ops route onto a worker (nx_fs_*)
+#include "nx_libcache.h"   // RAM content cache for read-only libs/DLLs (Part 2 / Phase B)
 
 #include <switch.h>
 #include <stdlib.h>
@@ -1000,6 +1001,7 @@ void nx_ipc_stats_dump(void) {
              p1, p2, fs, op, ul, mk, rd, rn, hit, miss, total);
     extern void nx_result_log(const char*);
     nx_result_log(b);
+    { extern void nx_libcache_stats_dump(void); nx_libcache_stats_dump(); }   // Part 2 lib-cache line
 }
 
 // M2.1 libos: the guest's real ld.so/glibc issue raw Linux syscalls; box64 translates the x86-64 number
@@ -1257,6 +1259,12 @@ long syscall(long number, ...) {
             // here are host-converted (see the note above), so O_CREAT is the newlib macro. (t_exists==1
             // means the file already existed — no create happened — so nothing to invalidate.)
             if (!t_exists && (a2 & O_CREAT) && fd >= 0) nx_pc_invalidate(p);
+            // Part 2 lib cache: associate a read-only staged lib/DLL fd (lazy fill on first mmap/pread); a
+            // writable open of an existing eligible path drops any stale cached blob for it.
+            if (fd >= 0 && t_exists) {
+                if ((a2 & O_ACCMODE) == O_RDONLY) nx_libcache_open(fd, hp, &st, (int)a2);
+                else                              nx_libcache_invalidate(hp);
+            }
             // Robust registry save: if a reg<pid>.tmp open FAILS (the raw fsdev open can transiently
             // return ENOSYS under shared-fd-table pressure — e.g. during a big dir enumeration), fall
             // back to a write-discard SINK vfd so the wineserver's periodic flush COMPLETES instead of
@@ -1289,6 +1297,7 @@ long syscall(long number, ...) {
             if (nx_vfd_is((int)a0)) return nx_vfd_close((int)a0);
             { extern void nx_tee_forget(int fd); nx_tee_forget((int)a0); }  // drop stale stdout/err dup flag
             { extern void nx_regtmp_forget(int fd); nx_regtmp_forget((int)a0); }  // drop reg*.tmp sink flag
+            nx_libcache_forget((int)a0);                     // Part 2: drop the (pid,fd) lib-cache assoc
             return nx_fs_close((int)a0);                     // SD I/O funnel (real fd; vfd handled above)
         case 63:                                                 // read
             if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
@@ -1343,6 +1352,7 @@ long syscall(long number, ...) {
             // back to a plain read — on the unexpected ENOSYS it left its buffer unfilled and then
             // dereferenced garbage (InvalidMemoryRegion fault). Map any lseek failure to ESPIPE.
             if (nx_vfd_is((int)a0)) { errno = ESPIPE; return -1; }  // vfd pipes/sockets aren't seekable
+            { long got; if (nx_libcache_pread((int)a0, (void*)a1, (size_t)a2, (off_t)a3, &got)) return got; }  // Part 2 RAM hit
             { extern int nx_fs_real_file(int); extern long nx_fs_pread(int, void*, size_t, off_t);   // SD I/O funnel (v2)
               if (nx_fs_real_file((int)a0)) return nx_fs_pread((int)a0, (void*)a1, (size_t)a2, (off_t)a3); }
             off_t cur = lseek((int)a0, 0, SEEK_CUR);

@@ -713,6 +713,10 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
     if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
         void* p = nx_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return MAP_FAILED;
+        // Part 2 lib cache: a cached read-only lib/DLL fills this section from RAM (memcpy, no SD read, no
+        // bounce) — the big win for concurrent/repeated/shared loads. Miss falls through to the SD read.
+        { extern int nx_libcache_mmap_fill(int, void*, size_t, off_t);
+          if (nx_libcache_mmap_fill(fd, p, length, (off_t)offset)) { nx_kuser_fixup(p, VM_ROUND(length)); return p; } }
         // Read via a HEAP bounce buffer, not directly into the mapped region. The region is
         // CodeMemory (svcControlCodeMemory MapOwner) on Horizon; fsdev's ReadFile IPC receive
         // buffer must be in a Normal/heap memory state. Passing a Code-state buffer makes
@@ -729,7 +733,13 @@ void* nx_mmap(void* addr, unsigned long length, int prot, int flags, int fd, ssi
         off_t save = rf ? (off_t)-1 : lseek(fd, 0, SEEK_CUR);
         if (rf || lseek(fd, (off_t)offset, SEEK_SET) != (off_t)-1) {
             size_t done = 0;
-            size_t bufsz = 256 * 1024; if (bufsz > length) bufsz = length;
+            // Part 1: larger bounce = fewer fsdev ReadFile IPCs per section. Part-0 HW sweep showed the SD
+            // read is bandwidth-bound (~21 MB/s ceiling; 256 KiB already ~92%), so this recovers only the
+            // last ~8% — but it's ~free. KX_MMAP_BOUNCE_KB tunes it (small value reproduces the old 256 KiB).
+            static size_t g_bounce_sz = 0;
+            if (!g_bounce_sz) { const char* e = getenv("KX_MMAP_BOUNCE_KB"); int kb = e ? atoi(e) : 1024;
+                                if (kb < 4) kb = 4; g_bounce_sz = (size_t)kb * 1024; }
+            size_t bufsz = g_bounce_sz; if (bufsz > length) bufsz = length;
             char* bounce = (char*)malloc(bufsz);
             while (done < length) {
                 size_t want = length - done; if (want > bufsz) want = bufsz;

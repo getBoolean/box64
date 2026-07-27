@@ -489,6 +489,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         "${BOX64_ROOT}/src/os/switch/nx_posix.c"
         "${BOX64_ROOT}/src/os/switch/nx_vfd.c"
         "${BOX64_ROOT}/src/os/switch/nx_fsfunnel.c"
+        "${BOX64_ROOT}/src/os/switch/nx_libcache.c"
         "${BOX64_ROOT}/src/os/switch/nx_spawn.c"
         "${BOX64_ROOT}/src/os/switch/nx_signals.c"
         "${BOX64_ROOT}/src/os/switch/nx_main.c"

@@ -762,7 +762,8 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             break;
         case 3:  // sys_close
 #ifdef __SWITCH__
-            { extern int nx_fs_close(int); S_RAX = nx_fs_close(S_EDI); }   // SD I/O funnel (raw close on the worker)
+            { extern void nx_libcache_forget(int); nx_libcache_forget(S_EDI);      // Part 2: drop lib-cache assoc
+              extern int nx_fs_close(int); S_RAX = nx_fs_close(S_EDI); }           // SD I/O funnel (raw close on the worker)
 #else
             S_RAX = close(S_EDI);
 #endif
@@ -1303,7 +1304,8 @@ long EXPORT my_syscall(x64emu_t *emu)
             return my_open(emu, (char*)R_RSI, of_convert(R_EDX), R_ECX);
         case 3:  // sys_close
 #ifdef __SWITCH__
-            { extern int nx_fs_close(int); return nx_fs_close(R_ESI); }    // SD I/O funnel (raw close on the worker)
+            { extern void nx_libcache_forget(int); nx_libcache_forget(R_ESI);      // Part 2: drop lib-cache assoc
+              extern int nx_fs_close(int); return nx_fs_close(R_ESI); }            // SD I/O funnel (raw close on the worker)
 #else
             return close(R_ESI);
 #endif

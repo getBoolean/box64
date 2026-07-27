@@ -33,6 +33,7 @@
 
 #include "custommem.h"   // getProtection — validate guest buffers before deref (EFAULT, not a fault)
 #include "nx_fsfunnel.h" // SD I/O funnel: nx_fs_* wrappers + the nx_dent_t snapshot type
+#include "nx_libcache.h" // RAM lib content cache: invalidate on unlink/rename (Part 2)
 
 // nx_posix.c
 extern int  nx_translate_path(const char* p, char* out, size_t outn);
@@ -1463,6 +1464,7 @@ int nx_unlink_guest(const char* p) {
     if (!p) { errno = EFAULT; return -1; }
     if (nx_tmpfs_is_path(p)) return nx_tmpfs_unlink(p);
     if (nx_translate_path(p, hp, sizeof hp) != 0) return -1;
+    nx_libcache_invalidate(hp);                  // drop any cached blob for the file being removed
     __atomic_add_fetch(&nx_ipc_unlink, 1, __ATOMIC_RELAXED);
     int r = nx_fs_unlink(hp);                    // SD I/O funnel (host path)
     if (r == 0) nx_pc_invalidate(p);             // removed -> flip a cached exists 1->0
@@ -1528,6 +1530,7 @@ int nx_rename_guest(const char* a, const char* b) {
     }
     if (nx_translate_path(a, ha, sizeof ha) != 0) return -1;
     if (nx_translate_path(b, hb, sizeof hb) != 0) return -1;
+    nx_libcache_invalidate(ha); nx_libcache_invalidate(hb);   // both paths' content changes
     // Fast registry save: the reg*.tmp source was written empty (writes discarded, see nx_regtmp_is),
     // so DON'T clobber the real .reg with it — report success and drop the empty temp. The in-memory
     // registry the server already loaded is authoritative for this run; the on-disk .reg stays valid
