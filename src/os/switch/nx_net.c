@@ -677,12 +677,35 @@ static const nx_value_map g_ipv6_option_map[] = {            // IPPROTO_IPV6 (41
     { LINUX_IPV6_V6ONLY,         IPV6_V6ONLY         },
 };
 
-// Resolve a (level, option) pair. Returns 0 on success. An UNKNOWN option is refused with ENOPROTOOPT
-// rather than passed through: the two ABIs reuse each other's numbers for different options, so a
+// Linux-only options with NO FreeBSD equivalent, accepted as no-ops instead of refused.
+//
+// IP_RECVERR/IPV6_RECVERR ask for extended error reporting through MSG_ERRQUEUE — a Linux extension
+// Horizon's stack simply does not have. Refusing them is not the conservative choice it looks like:
+// glibc's resolver sets IP_RECVERR in res_send() before every query and treats the failure as fatal,
+// so ENOPROTOOPT here turned every getaddrinfo() into "Name or service not known" even though the
+// underlying UDP socket worked perfectly (HW-measured 2026-07-27: the raw DNS query on the same
+// resolv.conf succeeded in the very next section of the gate test).
+//
+// Accepting them degrades GRACEFULLY and honestly: the caller asked to be told about ICMP errors, we
+// simply never report any — indistinguishable from a network that produced none, which every caller
+// already handles via its timeout. That is different in kind from faking an ioctl used to CLASSIFY an
+// fd, where a false answer sends the caller down a permanently wrong path.
+static int sockopt_is_accepted_noop(int linux_level, int linux_option) {
+    enum { LINUX_IP_RECVERR = 11, LINUX_IPV6_RECVERR = 25 };
+    return (linux_level == LINUX_IPPROTO_IP   && linux_option == LINUX_IP_RECVERR) ||
+           (linux_level == LINUX_IPPROTO_IPV6 && linux_option == LINUX_IPV6_RECVERR);
+}
+
+// Resolve a (level, option) pair. Returns 0 on success, 1 for an accepted no-op (do not call the
+// stack), -1 with errno for an option we refuse. An UNKNOWN option is refused with ENOPROTOOPT rather
+// than passed through: the two ABIs reuse each other's numbers for different options, so a
 // pass-through would silently configure the wrong one.
+enum { NX_SOCKOPT_NOOP = 1 };
+
 static int sockopt_linux_to_bsd(int linux_level, int linux_option,
                                 int* bsd_level, int* bsd_option) {
-    const nx_value_map* table; int count;
+    if (sockopt_is_accepted_noop(linux_level, linux_option)) return NX_SOCKOPT_NOOP;
+    const nx_value_map* table = NULL; int count = 0;   // NULL => fall through to the refusal below
     switch (linux_level) {
         case LINUX_SOL_SOCKET:
             *bsd_level = SOL_SOCKET;   table = g_socket_option_map; count = NX_ARRAY_LENGTH(g_socket_option_map); break;
@@ -692,13 +715,20 @@ static int sockopt_linux_to_bsd(int linux_level, int linux_option,
             *bsd_level = IPPROTO_IPV6; table = g_ipv6_option_map;   count = NX_ARRAY_LENGTH(g_ipv6_option_map);   break;
         case LINUX_IPPROTO_TCP:
             *bsd_level = IPPROTO_TCP;                             // TCP_NODELAY is 1 either way
-            if (linux_option != LINUX_TCP_NODELAY) { errno = ENOPROTOOPT; return -1; }
+            if (linux_option != LINUX_TCP_NODELAY) break;
             *bsd_option = linux_option;
             return 0;
-        default: errno = ENOPROTOOPT; return -1;
+        default: break;
     }
-    int mapped = map_linux_to_bsd(table, count, linux_option, -1);
-    if (mapped < 0) { errno = ENOPROTOOPT; return -1; }
+    int mapped = table ? map_linux_to_bsd(table, count, linux_option, -1) : -1;
+    if (mapped < 0) {
+        // Name the option we refused. An unmapped sockopt surfaces at the caller as a bare
+        // ENOPROTOOPT, which is indistinguishable from the stack rejecting a KNOWN option — and glibc's
+        // resolver turns it into a plain "host not found", hiding the cause entirely.
+        net_log("nx_net: UNMAPPED sockopt level=%d option=%d -> ENOPROTOOPT\n", linux_level, linux_option);
+        errno = ENOPROTOOPT;
+        return -1;
+    }
     *bsd_option = mapped;
     return 0;
 }
@@ -711,7 +741,16 @@ static int sockopt_linux_to_bsd(int linux_level, int linux_option,
 int nx_net_getsockopt(int fd, int linux_level, int linux_option, void* value, unsigned* value_length) {
     if (value_length && nx_guest_buf_bad(value, *value_length)) { errno = EFAULT; return -1; }
     int bsd_level, bsd_option;
-    if (sockopt_linux_to_bsd(linux_level, linux_option, &bsd_level, &bsd_option) < 0) return -1;
+    int mapping = sockopt_linux_to_bsd(linux_level, linux_option, &bsd_level, &bsd_option);
+    if (mapping < 0) return -1;
+    if (mapping == NX_SOCKOPT_NOOP) {
+        // Report the no-op option as DISABLED, which is the truth: nothing enables it here.
+        if (value && value_length && *value_length >= sizeof(int)) {
+            *(int*)value = 0;
+            *value_length = sizeof(int);
+        }
+        return 0;
+    }
     int result = nx_bsd_getsockopt(fd, bsd_level, bsd_option, value, value_length);
     // SO_TYPE reports a socket type, which IS renumbered between the ABIs for anything but
     // STREAM/DGRAM/RAW (1/2/3 are identical), so the common cases need no fixup.
@@ -723,7 +762,9 @@ int nx_net_getsockopt(int fd, int linux_level, int linux_option, void* value, un
 int nx_net_setsockopt(int fd, int linux_level, int linux_option, const void* value, unsigned value_length) {
     if (nx_guest_buf_bad(value, value_length)) { errno = EFAULT; return -1; }
     int bsd_level, bsd_option;
-    if (sockopt_linux_to_bsd(linux_level, linux_option, &bsd_level, &bsd_option) < 0) return -1;
+    int mapping = sockopt_linux_to_bsd(linux_level, linux_option, &bsd_level, &bsd_option);
+    if (mapping < 0) return -1;
+    if (mapping == NX_SOCKOPT_NOOP) return 0;
     int result = nx_bsd_setsockopt(fd, bsd_level, bsd_option, value, value_length);
     if (result < 0) net_log("nx_net: setsockopt fd=%d level=%d option=%d failed e=%d rc=0x%x\n",
                             fd, linux_level, linux_option, errno, socketGetLastResult());
