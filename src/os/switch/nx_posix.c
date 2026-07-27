@@ -1322,16 +1322,38 @@ long syscall(long number, ...) {
             int ms = ts ? (int)(ts->s * 1000 + ts->ns / 1000000) : -1;
             return nx_poll((void*)a0, (unsigned long)a1, ms);
         }
-        // ---- M2.5 in-process AF_UNIX sockets (aarch64 NRs; box64 scwrap routes here) ----
-        case 198: return nx_socket((int)a0, (int)a1, (int)a2);
+        // ---- sockets (aarch64 NRs; box64 scwrap routes here) ----
+        // Two backends share these NRs: AF_UNIX runs entirely in-process on the M2.5 vfd layer
+        // (nx_vfd.c), AF_INET/AF_INET6 go out through Horizon's bsd:u (M2.8, nx_net.c). socket()
+        // picks by family; every later call picks by whether the fd is a bsd socket.
+        case 198:                                                // socket
+            if (nx_net_available() && nx_net_family_is_inet((int)a0))
+                return nx_net_socket((int)a0, (int)a1, (int)a2);
+            return nx_socket((int)a0, (int)a1, (int)a2);         // AF_UNIX vfd, or EAFNOSUPPORT
         case 199: return nx_socketpair((int)a0, (int)a1, (int)a2, (int*)a3);
-        case 200: return nx_bind((int)a0, (const void*)a1, (unsigned)a2);
-        case 201: return nx_listen((int)a0, (int)a1);
-        case 202: return nx_accept4((int)a0, (void*)a1, (unsigned*)a2, 0);
-        case 242: return nx_accept4((int)a0, (void*)a1, (unsigned*)a2, (int)a3);   // accept4
-        case 203: return nx_connect((int)a0, (const void*)a1, (unsigned)a2);
-        case 204: return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);
-        case 205: return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);        // getpeername
+        case 200:                                                // bind
+            if (nx_net_is_socket((int)a0)) return nx_net_bind((int)a0, (const void*)a1, (unsigned)a2);
+            return nx_bind((int)a0, (const void*)a1, (unsigned)a2);
+        case 201:                                                // listen
+            if (nx_net_is_socket((int)a0)) return nx_net_listen((int)a0, (int)a1);
+            return nx_listen((int)a0, (int)a1);
+        case 202:                                                // accept
+            if (nx_net_is_socket((int)a0)) return nx_net_accept4((int)a0, (void*)a1, (unsigned*)a2, 0);
+            return nx_accept4((int)a0, (void*)a1, (unsigned*)a2, 0);
+        case 242:                                                // accept4
+            if (nx_net_is_socket((int)a0)) return nx_net_accept4((int)a0, (void*)a1, (unsigned*)a2, (int)a3);
+            return nx_accept4((int)a0, (void*)a1, (unsigned*)a2, (int)a3);
+        case 203:                                                // connect
+            if (nx_net_is_socket((int)a0)) return nx_net_connect((int)a0, (const void*)a1, (unsigned)a2);
+            return nx_connect((int)a0, (const void*)a1, (unsigned)a2);
+        case 204:                                                // getsockname
+            if (nx_net_is_socket((int)a0)) return nx_net_getsockname((int)a0, (void*)a1, (unsigned*)a2);
+            return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);
+        case 205:                                                // getpeername — a REAL peer lookup for
+            // INET. The vfd path still aliases getsockname, which is fine only because an AF_UNIX
+            // socketpair has no distinct peer address to report.
+            if (nx_net_is_socket((int)a0)) return nx_net_getpeername((int)a0, (void*)a1, (unsigned*)a2);
+            return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);
         case 206:   // sendto (unix stream: addr ignored)
             if (nx_vfd_is((int)a0)) return nx_vfd_write((int)a0, (const void*)a1, (size_t)a2);
             errno = EBADF; return -1;

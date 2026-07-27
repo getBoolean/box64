@@ -56,7 +56,10 @@ static void vlog(const char* fmt, ...) {
 // delivery core (root-caused 2026-07-19, porting-log + [[box64-signal-delivery-notes]]). Guard the
 // deref: getProtection()==0 means the page is unmapped (rb_get(memprot,·) miss) => bad. Cheap memprot
 // lookup on the buffer endpoints; KX_NO_VFD_FAULTCHECK=1 restores the old raw-deref for A/B.
-static int nx_vfd_buf_bad(const void* base, size_t len) {
+// Exported (as nx_guest_buf_bad) because nx_net.c needs the identical guard: libnx dereferences the
+// guest's sockaddr/data buffers inside the bsd:u IPC marshalling, so a wild guest pointer would fault
+// in exactly the same un-deliverable way there as it does here.
+int nx_guest_buf_bad(const void* base, size_t len) {
     static int chk = -1;
     if (chk < 0) chk = getenv("KX_NO_VFD_FAULTCHECK") ? 0 : 1;
     if (!chk || !base || !len) return 0;
@@ -65,6 +68,7 @@ static int nx_vfd_buf_bad(const void* base, size_t len) {
     if (!getProtection(a + len - 1)) return 1;    // last byte's page unmapped
     return 0;
 }
+static inline int nx_vfd_buf_bad(const void* base, size_t len) { return nx_guest_buf_bad(base, len); }
 
 #define NX_VFD_BASE 0x40000000
 #define NX_VFD_MAX  256

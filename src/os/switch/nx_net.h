@@ -48,6 +48,30 @@ int  nx_net_is_socket(int fd);
 // M2.5 vfd layer, everything else is refused.)
 int  nx_net_family_is_inet(int l_domain);
 
+// 1 iff nifm:u came up (the DNS-server source for the synthesized /etc/resolv.conf).
+int  nx_net_nifm_available(void);
+
+// ---- syscall bodies ------------------------------------------------------------------------------
+//
+// Every argument and result below is a LINUX value: Linux AF_*/SOCK_*/SOL_*/SO_*/MSG_*/ioctl numbers,
+// and Linux-layout sockaddrs ({u16 sa_family} heads, not BSD's {u8 sa_len, u8 sa_family}). errno is
+// left in HOST (newlib) numbering for the x64syscall return seams to translate, exactly as the file
+// syscalls do.
+
+int  nx_net_socket(int l_domain, int l_type, int l_proto);
+int  nx_net_bind(int fd, const void* l_addr, unsigned l_len);
+int  nx_net_connect(int fd, const void* l_addr, unsigned l_len);
+int  nx_net_listen(int fd, int backlog);
+int  nx_net_accept4(int fd, void* l_addr, unsigned* l_len, int l_flags);
+int  nx_net_getsockname(int fd, void* l_addr, unsigned* l_len);
+int  nx_net_getpeername(int fd, void* l_addr, unsigned* l_len);
+
+// O_NONBLOCK is the one fcntl flag Horizon's bsd supports, and it is spelled differently in all three
+// ABIs involved (Linux 0x800, newlib 0x4000, BSD 0x20000000) — so it gets dedicated accessors that
+// every entry point (socket/accept4 type flags, fcntl F_SETFL, ioctl FIONBIO) funnels through.
+int  nx_net_set_nonblock(int fd, int on);
+int  nx_net_get_nonblock(int fd);
+
 #ifdef __cplusplus
 }
 #endif
