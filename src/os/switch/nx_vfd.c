@@ -1591,10 +1591,14 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
         case 48:  // shutdown — half-close a vfd socketpair so the PEER sees EOF. box64's scwrap has no
                   // entry for shutdown, so without this it hit the big-switch default -> ENOSYS, which
                   // failed the wineserver's sock_check_pollhup probe ("ERROR in sock_check_pollhup()").
+            if (nx_net_is_socket((int)a1)) { r = nx_net_shutdown((int)a1, (int)a2); break; }
             r = nx_shutdown((int)a1, (int)a2);
             break;
         case 16:  // ioctl
             if (!nx_vfd_is((int)a1)) {
+                // A socket honors FIONBIO/FIONREAD and refuses everything else with ENOTTY — the same
+                // discipline as below, and the reason Wine's fd probing doesn't livelock on it.
+                if (nx_net_is_socket((int)a1)) { r = nx_net_ioctl((int)a1, (unsigned long)a2, (void*)a3); break; }
                 // Terminal ioctls on a REAL fd (the client's stdin/out/err): report NOT-a-tty. Wine's
                 // get_initial_console() calls isatty(0/1/2) (-> ioctl TCGETS); if it says "tty" Wine
                 // takes CONSOLE_HANDLE_SHELL and tries to spawn a conhost pseudo-console (impossible on
@@ -1620,6 +1624,10 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
         case 72:  // fcntl (vfd; plus the flag ops on real fds — newlib has no fcntl, and glibc
                   // fdopen() requires a working F_GETFL: the wineserver registry save dies on it)
             if (!nx_vfd_is((int)a1)) {
+                // A socket must take a REAL fcntl: the generic "F_SETFL -> return 0" below would
+                // swallow O_NONBLOCK, and a non-blocking connect() is exactly how both Wine's ws2_32
+                // and glibc's resolver drive a socket.
+                if (nx_net_is_socket((int)a1)) { r = nx_net_fcntl((int)a1, (int)a2, (long)a3); break; }
                 if ((int)a2 == 1 || (int)a2 == 2 || (int)a2 == 4) { r = 0; break; }  // F_GETFD/F_SETFD/F_SETFL
                 if ((int)a2 == 3) { r = 2 /*O_RDWR*/; break; }                        // F_GETFL
                 return 0;

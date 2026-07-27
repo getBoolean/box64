@@ -416,4 +416,262 @@ int nx_net_getpeername(int fd, void* l_addr, unsigned* l_len) {
     return addr_b2l(b, blen, l_addr, l_len);
 }
 
+// ---- send / receive ------------------------------------------------------------------------------
+
+// MSG_* differ in nearly every bit position. Anything not listed is dropped rather than passed
+// through: an unrecognized flag reaching FreeBSD as a DIFFERENT flag is worse than not honoring it
+// (MSG_NOSIGNAL in particular has no BSD equivalent and is a no-op here — Horizon raises no SIGPIPE).
+static int msgflags_l2b(int l_flags) {
+    static const nx_map_t tbl[] = {
+        { L_MSG_OOB,       MSG_OOB       },   // 0x01 -> 0x01
+        { L_MSG_PEEK,      MSG_PEEK      },   // 0x02 -> 0x02
+        { L_MSG_DONTROUTE, MSG_DONTROUTE },   // 0x04 -> 0x04
+        { L_MSG_EOR,       MSG_EOR       },   // 0x80 -> 0x08
+        { L_MSG_TRUNC,     MSG_TRUNC     },   // 0x20 -> 0x10
+        { L_MSG_CTRUNC,    MSG_CTRUNC    },   // 0x08 -> 0x20
+        { L_MSG_WAITALL,   MSG_WAITALL   },   // 0x100 -> 0x40
+        { L_MSG_DONTWAIT,  MSG_DONTWAIT  },   // 0x40 -> 0x80
+    };
+    int b = 0;
+    for (int i = 0; i < NX_ARRAY_LEN(tbl); i++) if (l_flags & tbl[i].l) b |= tbl[i].b;
+    return b;
+}
+
+// Returned revents-style flags on recvmsg: only the two Linux cares about.
+static int msgflags_b2l(int b_flags) {
+    int l = 0;
+    if (b_flags & MSG_TRUNC)  l |= L_MSG_TRUNC;
+    if (b_flags & MSG_CTRUNC) l |= L_MSG_CTRUNC;
+    return l;
+}
+
+long nx_net_sendto(int fd, const void* buf, size_t len, int l_flags,
+                   const void* l_addr, unsigned l_alen) {
+    if (nx_guest_buf_bad(buf, len)) { errno = EFAULT; return -1; }
+    uint8_t b[NX_SA_MAX];
+    unsigned wire = 0;
+    if (l_addr && l_alen) {
+        if (nx_guest_buf_bad(l_addr, l_alen)) { errno = EFAULT; return -1; }
+        wire = addr_l2b(l_addr, l_alen, b);
+        if (!wire) { errno = EAFNOSUPPORT; return -1; }
+    }
+    return (long)nx_bsd_sendto(fd, buf, len, msgflags_l2b(l_flags), wire ? b : NULL, wire);
+}
+
+long nx_net_recvfrom(int fd, void* buf, size_t len, int l_flags,
+                     void* l_addr, unsigned* l_alen) {
+    if (nx_guest_buf_bad(buf, len)) { errno = EFAULT; return -1; }
+    uint8_t b[NX_SA_MAX];
+    unsigned blen = sizeof b;
+    int want_addr = (l_addr && l_alen && *l_alen);
+    if (want_addr && nx_guest_buf_bad(l_addr, *l_alen)) { errno = EFAULT; return -1; }
+    long r = (long)nx_bsd_recvfrom(fd, buf, len, msgflags_l2b(l_flags),
+                                   want_addr ? b : NULL, want_addr ? &blen : NULL);
+    if (r < 0) return -1;
+    if (want_addr && blen >= 2) addr_b2l(b, blen, l_addr, l_alen);
+    else if (l_alen) *l_alen = 0;
+    return r;
+}
+
+// Linux x86-64 layouts, mirroring the declarations in nx_vfd.c (the vfd layer owns the AF_UNIX side of
+// these same structs). NOT interchangeable with libnx's: BSD's msghdr is 48 bytes to Linux's 56
+// because msg_iovlen and msg_controllen are 32-bit there. Hence field-by-field, never a cast.
+typedef struct { void* base; size_t len; } l_iovec;
+typedef struct { void* name; unsigned namelen; l_iovec* iov; size_t iovlen;
+                 void* control; size_t controllen; int flags; } l_msghdr;
+
+// libnx exposes no devoptab sendmsg/recvmsg, so scatter/gather is done here around sendto/recvfrom.
+// A single-iovec message (the overwhelmingly common case, and what glibc's resolver emits) passes
+// through with no copy; multi-iovec messages are packed through a bounce buffer, because a datagram
+// MUST leave as one packet — looping sendto() per iovec would fragment one message into several.
+enum { NX_MSG_BOUNCE_MAX = 64 * 1024 };   // datagram ceiling; larger multi-iov sends report EMSGSIZE
+
+long nx_net_sendmsg(int fd, const void* l_msg, int l_flags) {
+    if (nx_guest_buf_bad(l_msg, sizeof(l_msghdr))) { errno = EFAULT; return -1; }
+    const l_msghdr* m = (const l_msghdr*)l_msg;
+    // Ancillary data over INET has no meaning here: SCM_RIGHTS is an AF_UNIX concept and the vfd layer
+    // owns it. Ignore control rather than fail — Linux ignores unknown cmsgs on INET too.
+    if (m->iovlen == 0) return (long)nx_bsd_sendto(fd, "", 0, msgflags_l2b(l_flags), NULL, 0);
+    if (m->iovlen == 1)
+        return nx_net_sendto(fd, m->iov[0].base, m->iov[0].len, l_flags, m->name, m->namelen);
+
+    size_t total = 0;
+    for (size_t i = 0; i < m->iovlen; i++) total += m->iov[i].len;
+    if (total > NX_MSG_BOUNCE_MAX) { errno = EMSGSIZE; return -1; }
+    uint8_t* pack = (uint8_t*)malloc(total ? total : 1);
+    if (!pack) { errno = ENOMEM; return -1; }
+    size_t off = 0;
+    for (size_t i = 0; i < m->iovlen; i++) {
+        if (nx_guest_buf_bad(m->iov[i].base, m->iov[i].len)) { free(pack); errno = EFAULT; return -1; }
+        memcpy(pack + off, m->iov[i].base, m->iov[i].len);
+        off += m->iov[i].len;
+    }
+    long r = nx_net_sendto(fd, pack, total, l_flags, m->name, m->namelen);
+    int e = errno;
+    free(pack);
+    errno = e;
+    return r;
+}
+
+long nx_net_recvmsg(int fd, void* l_msg, int l_flags) {
+    if (nx_guest_buf_bad(l_msg, sizeof(l_msghdr))) { errno = EFAULT; return -1; }
+    l_msghdr* m = (l_msghdr*)l_msg;
+    m->controllen = 0;                       // no ancillary data is ever produced on an INET socket
+    if (m->iovlen == 0) { m->flags = 0; return 0; }
+    if (m->iovlen == 1) {
+        unsigned nlen = m->namelen;
+        long r = nx_net_recvfrom(fd, m->iov[0].base, m->iov[0].len, l_flags,
+                                 m->name, m->name ? &nlen : NULL);
+        if (r >= 0) { m->namelen = m->name ? nlen : 0; m->flags = 0; }
+        return r;
+    }
+    // Multi-iovec: receive the whole datagram once into a bounce buffer, then scatter. Reading per
+    // iovec would consume one datagram per call and drop the remainder of each.
+    size_t total = 0;
+    for (size_t i = 0; i < m->iovlen; i++) total += m->iov[i].len;
+    if (total > NX_MSG_BOUNCE_MAX) total = NX_MSG_BOUNCE_MAX;
+    uint8_t* pack = (uint8_t*)malloc(total ? total : 1);
+    if (!pack) { errno = ENOMEM; return -1; }
+    unsigned nlen = m->namelen;
+    long r = nx_net_recvfrom(fd, pack, total, l_flags, m->name, m->name ? &nlen : NULL);
+    if (r < 0) { int e = errno; free(pack); errno = e; return -1; }
+    size_t off = 0;
+    for (size_t i = 0; i < m->iovlen && off < (size_t)r; i++) {
+        size_t chunk = m->iov[i].len;
+        if (chunk > (size_t)r - off) chunk = (size_t)r - off;
+        if (nx_guest_buf_bad(m->iov[i].base, chunk)) { free(pack); errno = EFAULT; return -1; }
+        memcpy(m->iov[i].base, pack + off, chunk);
+        off += chunk;
+    }
+    free(pack);
+    m->namelen = m->name ? nlen : 0;
+    m->flags   = 0;
+    return r;
+}
+
+// ---- socket options ------------------------------------------------------------------------------
+
+static const nx_map_t g_so_tbl[] = {          // SOL_SOCKET (Linux 1 -> BSD 0xffff)
+    { L_SO_DEBUG,      SO_DEBUG      },   { L_SO_REUSEADDR, SO_REUSEADDR },
+    { L_SO_TYPE,       SO_TYPE       },   { L_SO_ERROR,     SO_ERROR     },
+    { L_SO_DONTROUTE,  SO_DONTROUTE  },   { L_SO_BROADCAST, SO_BROADCAST },
+    { L_SO_SNDBUF,     SO_SNDBUF     },   { L_SO_RCVBUF,    SO_RCVBUF    },
+    { L_SO_KEEPALIVE,  SO_KEEPALIVE  },   { L_SO_OOBINLINE, SO_OOBINLINE },
+    { L_SO_LINGER,     SO_LINGER     },   { L_SO_REUSEPORT, SO_REUSEPORT },
+    { L_SO_RCVLOWAT,   SO_RCVLOWAT   },   { L_SO_SNDLOWAT,  SO_SNDLOWAT  },
+    { L_SO_RCVTIMEO,   SO_RCVTIMEO   },   { L_SO_SNDTIMEO,  SO_SNDTIMEO  },
+    { L_SO_ACCEPTCONN, SO_ACCEPTCONN },
+};
+
+static const nx_map_t g_ip_tbl[] = {          // IPPROTO_IP (0 in both)
+    { L_IP_TOS,              IP_TOS              }, { L_IP_TTL,             IP_TTL             },
+    { L_IP_HDRINCL,          IP_HDRINCL          }, { L_IP_OPTIONS,         IP_OPTIONS         },
+    { L_IP_MULTICAST_IF,     IP_MULTICAST_IF     }, { L_IP_MULTICAST_TTL,   IP_MULTICAST_TTL   },
+    { L_IP_MULTICAST_LOOP,   IP_MULTICAST_LOOP   }, { L_IP_ADD_MEMBERSHIP,  IP_ADD_MEMBERSHIP  },
+    { L_IP_DROP_MEMBERSHIP,  IP_DROP_MEMBERSHIP  },
+};
+
+static const nx_map_t g_ip6_tbl[] = {         // IPPROTO_IPV6 (41 in both)
+    { L_IPV6_UNICAST_HOPS,   IPV6_UNICAST_HOPS   }, { L_IPV6_MULTICAST_IF,   IPV6_MULTICAST_IF   },
+    { L_IPV6_MULTICAST_HOPS, IPV6_MULTICAST_HOPS }, { L_IPV6_MULTICAST_LOOP, IPV6_MULTICAST_LOOP },
+    { L_IPV6_JOIN_GROUP,     IPV6_JOIN_GROUP     }, { L_IPV6_LEAVE_GROUP,    IPV6_LEAVE_GROUP    },
+    { L_IPV6_V6ONLY,         IPV6_V6ONLY         },
+};
+
+// Resolve a (level, optname) pair. Returns 0 on success. An UNKNOWN option is refused with
+// ENOPROTOOPT rather than passed through: the two ABIs reuse each other's numbers for different
+// options, so a pass-through would silently configure the wrong one.
+static int sockopt_l2b(int l_level, int l_opt, int* b_level, int* b_opt) {
+    const nx_map_t* tbl; int n;
+    switch (l_level) {
+        case L_SOL_SOCKET:   *b_level = SOL_SOCKET;    tbl = g_so_tbl;  n = NX_ARRAY_LEN(g_so_tbl);  break;
+        case L_IPPROTO_IP:   *b_level = IPPROTO_IP;    tbl = g_ip_tbl;  n = NX_ARRAY_LEN(g_ip_tbl);  break;
+        case L_IPPROTO_IPV6: *b_level = IPPROTO_IPV6;  tbl = g_ip6_tbl; n = NX_ARRAY_LEN(g_ip6_tbl); break;
+        case L_IPPROTO_TCP:  *b_level = IPPROTO_TCP;                  // TCP_NODELAY is 1 either way
+                             if (l_opt != L_TCP_NODELAY) { errno = ENOPROTOOPT; return -1; }
+                             *b_opt = l_opt; return 0;
+        default: errno = ENOPROTOOPT; return -1;
+    }
+    int b = map_l2b(tbl, n, l_opt, -1);
+    if (b < 0) { errno = ENOPROTOOPT; return -1; }
+    *b_opt = b;
+    return 0;
+}
+
+// Linux struct timeval is {long tv_sec; long tv_usec} — same as BSD's on aarch64/64-bit, so SO_*TIMEO
+// payloads pass through. SO_LINGER is {int l_onoff; int l_linger} in both. The only payload that could
+// need renumbering is SO_ERROR, and it does not: libnx's own source notes that Nintendo built their
+// FreeBSD stack with LINUX errno values, so the errno SO_ERROR reports is already what the guest
+// expects. (Flagged as an open risk — the net.c gate's non-blocking-connect section checks it.)
+int nx_net_getsockopt(int fd, int l_level, int l_opt, void* val, unsigned* len) {
+    if (len && nx_guest_buf_bad(val, *len)) { errno = EFAULT; return -1; }
+    int b_level, b_opt;
+    if (sockopt_l2b(l_level, l_opt, &b_level, &b_opt) < 0) return -1;
+    int r = nx_bsd_getsockopt(fd, b_level, b_opt, val, len);
+    // SO_TYPE reports a socket type, which IS renumbered between the ABIs for anything but
+    // STREAM/DGRAM/RAW (1/2/3 are identical), so the common cases need no fixup.
+    if (r < 0) netlog("nx_net: getsockopt fd=%d lvl=%d opt=%d failed e=%d rc=0x%x\n",
+                      fd, l_level, l_opt, errno, socketGetLastResult());
+    return r;
+}
+
+int nx_net_setsockopt(int fd, int l_level, int l_opt, const void* val, unsigned len) {
+    if (nx_guest_buf_bad(val, len)) { errno = EFAULT; return -1; }
+    int b_level, b_opt;
+    if (sockopt_l2b(l_level, l_opt, &b_level, &b_opt) < 0) return -1;
+    int r = nx_bsd_setsockopt(fd, b_level, b_opt, val, len);
+    if (r < 0) netlog("nx_net: setsockopt fd=%d lvl=%d opt=%d failed e=%d rc=0x%x\n",
+                      fd, l_level, l_opt, errno, socketGetLastResult());
+    return r;
+}
+
+// ---- ioctl / fcntl / shutdown --------------------------------------------------------------------
+
+// SHUT_RD/WR/RDWR are 0/1/2 in both ABIs. This replaces the vfd layer's "return 0 for any real fd",
+// which would have silently no-op'd a TCP half-close.
+int nx_net_shutdown(int fd, int how) {
+    return nx_bsd_shutdown(fd, how);
+}
+
+// Only the two ioctls that mean something on a socket are honored. Everything else returns ENOTTY,
+// per the standing rule (nx_vfd.c): Wine PROBES fds with terminal/ext-flag/readdir ioctls and a faked
+// success either livelocks it or makes it misclassify the fd as a console.
+int nx_net_ioctl(int fd, unsigned long l_req, void* arg) {
+    switch (l_req) {
+        case L_FIONBIO: {
+            if (nx_guest_buf_bad(arg, sizeof(int))) { errno = EFAULT; return -1; }
+            return nx_net_set_nonblock(fd, *(const int*)arg != 0);
+        }
+        case L_FIONREAD: {
+            if (nx_guest_buf_bad(arg, sizeof(int))) { errno = EFAULT; return -1; }
+            return nx_bsd_ioctl(fd, B_FIONREAD, arg);
+        }
+        default:
+            errno = ENOTTY;
+            return -1;
+    }
+}
+
+// fcntl on a socket: Horizon's bsd supports exactly O_NONBLOCK, so the flag word is rebuilt in LINUX
+// numbering rather than forwarded. An unknown cmd must not be forwarded either — libnx's fcntl returns
+// a POSITIVE EOPNOTSUPP (not -1) for those, which a caller checking `< 0` reads as success.
+enum { NX_L_F_GETFD = 1, NX_L_F_SETFD = 2, NX_L_F_GETFL = 3, NX_L_F_SETFL = 4 };
+
+long nx_net_fcntl(int fd, int cmd, long arg) {
+    switch (cmd) {
+        case NX_L_F_GETFD: return 0;
+        case NX_L_F_SETFD: return 0;                      // FD_CLOEXEC — no exec on Horizon
+        case NX_L_F_GETFL: {
+            int nb = nx_net_get_nonblock(fd);
+            if (nb < 0) return -1;
+            return 2 /*O_RDWR*/ | (nb ? L_O_NONBLOCK : 0);
+        }
+        case NX_L_F_SETFL:
+            return nx_net_set_nonblock(fd, (arg & L_O_NONBLOCK) ? 1 : 0);
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
 #endif // __SWITCH__

@@ -66,6 +66,19 @@ int  nx_net_accept4(int fd, void* l_addr, unsigned* l_len, int l_flags);
 int  nx_net_getsockname(int fd, void* l_addr, unsigned* l_len);
 int  nx_net_getpeername(int fd, void* l_addr, unsigned* l_len);
 
+long nx_net_sendto(int fd, const void* buf, size_t len, int l_flags,
+                   const void* l_addr, unsigned l_alen);
+long nx_net_recvfrom(int fd, void* buf, size_t len, int l_flags,
+                     void* l_addr, unsigned* l_alen);
+long nx_net_sendmsg(int fd, const void* l_msghdr, int l_flags);
+long nx_net_recvmsg(int fd, void* l_msghdr, int l_flags);
+
+int  nx_net_getsockopt(int fd, int l_level, int l_opt, void* val, unsigned* len);
+int  nx_net_setsockopt(int fd, int l_level, int l_opt, const void* val, unsigned len);
+int  nx_net_shutdown(int fd, int how);
+int  nx_net_ioctl(int fd, unsigned long l_req, void* arg);
+long nx_net_fcntl(int fd, int cmd, long arg);
+
 // O_NONBLOCK is the one fcntl flag Horizon's bsd supports, and it is spelled differently in all three
 // ABIs involved (Linux 0x800, newlib 0x4000, BSD 0x20000000) — so it gets dedicated accessors that
 // every entry point (socket/accept4 type flags, fcntl F_SETFL, ioctl FIONBIO) funnels through.

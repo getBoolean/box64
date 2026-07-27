@@ -340,6 +340,15 @@ int fstatat(int dirfd, const char *path, struct stat *b, int flags) {
     extern const char* nx_vfd_dir_guest(int fd);
     char hp[512]; int have_hp = 0;
     if ((flags & AT_EMPTY_PATH) || !path || !path[0]) {
+        // M2.8: libnx's "soc" devoptab has NO fstat_r, so fstat() on a bsd socket fails — and the
+        // generic synth below would then call it a REGULAR FILE. Wine's create_file_for_fd branches on
+        // exactly this to pick an fd type, and a socket typed as a file loses every ws2_32 async path,
+        // so report S_IFSOCK explicitly before the fallback can guess wrong.
+        if (nx_net_is_socket(dirfd)) {
+            memset(b, 0, sizeof *b);
+            b->st_mode = S_IFSOCK | 0777; b->st_nlink = 1; b->st_blksize = 4096;
+            r = 0;
+        } else
         r = nx_vfd_is(dirfd) ? nx_vfd_stat(dirfd, b)     // M2.5: dir/socket vfds
                              : fstat(dirfd, b);          // fstat via the open fd
         // std out/err (+ their SCM_RIGHTS-passed dups, which the in-process wineserver fstat's for the
@@ -1354,17 +1363,37 @@ long syscall(long number, ...) {
             // socketpair has no distinct peer address to report.
             if (nx_net_is_socket((int)a0)) return nx_net_getpeername((int)a0, (void*)a1, (unsigned*)a2);
             return nx_getsockname((int)a0, (void*)a1, (unsigned*)a2);
-        case 206:   // sendto (unix stream: addr ignored)
+        case 206:   // sendto — the UDP hook point. The vfd path is a unix STREAM write (addr/flags are
+                    // meaningless there); INET needs the full argument set.
+            if (nx_net_is_socket((int)a0))
+                return nx_net_sendto((int)a0, (const void*)a1, (size_t)a2, (int)a3,
+                                     (const void*)a4, (unsigned)a5);
             if (nx_vfd_is((int)a0)) return nx_vfd_write((int)a0, (const void*)a1, (size_t)a2);
             errno = EBADF; return -1;
         case 207:   // recvfrom
+            if (nx_net_is_socket((int)a0))
+                return nx_net_recvfrom((int)a0, (void*)a1, (size_t)a2, (int)a3,
+                                       (void*)a4, (unsigned*)a5);
             if (nx_vfd_is((int)a0)) return nx_vfd_read((int)a0, (void*)a1, (size_t)a2);
             errno = EBADF; return -1;
-        case 208: return nx_setsockopt((int)a0, (int)a1, (int)a2, (const void*)a3, (unsigned)a4);
-        case 209: return nx_getsockopt((int)a0, (int)a1, (int)a2, (void*)a3, (unsigned*)a4);
-        case 210: return nx_shutdown((int)a0, (int)a1);          // shutdown (SHUT_WR -> peer EOF)
-        case 211: return nx_sendmsg((int)a0, (const void*)a1, (int)a2);
-        case 212: return nx_recvmsg((int)a0, (void*)a1, (int)a2);
+        case 208:
+            if (nx_net_is_socket((int)a0))
+                return nx_net_setsockopt((int)a0, (int)a1, (int)a2, (const void*)a3, (unsigned)a4);
+            return nx_setsockopt((int)a0, (int)a1, (int)a2, (const void*)a3, (unsigned)a4);
+        case 209:
+            if (nx_net_is_socket((int)a0))
+                return nx_net_getsockopt((int)a0, (int)a1, (int)a2, (void*)a3, (unsigned*)a4);
+            return nx_getsockopt((int)a0, (int)a1, (int)a2, (void*)a3, (unsigned*)a4);
+        case 210:   // shutdown — a REAL half-close for INET (the vfd version returns 0 for any real
+                    // fd, which would silently no-op a TCP shutdown); vfd: SHUT_WR -> peer EOF.
+            if (nx_net_is_socket((int)a0)) return nx_net_shutdown((int)a0, (int)a1);
+            return nx_shutdown((int)a0, (int)a1);
+        case 211:
+            if (nx_net_is_socket((int)a0)) return nx_net_sendmsg((int)a0, (const void*)a1, (int)a2);
+            return nx_sendmsg((int)a0, (const void*)a1, (int)a2);
+        case 212:
+            if (nx_net_is_socket((int)a0)) return nx_net_recvmsg((int)a0, (void*)a1, (int)a2);
+            return nx_recvmsg((int)a0, (void*)a1, (int)a2);
         case 62:                                                 // lseek
             if (nx_vfd_is((int)a0)) return nx_vfd_lseek((int)a0, (off_t)a1, (int)a2);
             return (long)lseek((int)a0, (off_t)a1, (int)a2);
