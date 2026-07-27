@@ -19,7 +19,8 @@
     "service_access": [
         "fsp-srv", "appletOE", "appletAE", "apm", "apm:p", "hid", "set", "set:sys",
         "pl:u", "psm", "nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t", "vi:u", "vi:m",
-        "time:u", "time:a", "lm", "spl:", "csrng"
+        "time:u", "time:a", "lm", "spl:", "csrng",
+        "bsd:u", "nifm:u", "sfdnsres", "nsd:u"
     ],
     "service_host": [],
     "kernel_capabilities": [{
