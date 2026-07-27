@@ -33,6 +33,13 @@ void nx_net_exit(void);
 // first, so with KX_NET unset box64 behaves byte-for-byte as it did before M2.8.
 int  nx_net_available(void);
 
+// 1 iff nifm:u came up (the DNS-server source for the synthesized /etc/resolv.conf).
+int  nx_net_nifm_available(void);
+
+// 1 iff nifm reports the console actually has an internet connection. Lets a caller (and the M2.8
+// gate test) tell "offline console" apart from "broken shim".
+int  nx_net_link_up(void);
+
 // ---- identification ------------------------------------------------------------------------------
 
 // 1 iff fd is a live libnx bsd socket. Authoritative (it asks newlib's handle table for the fd's
@@ -46,18 +53,7 @@ int  nx_net_is_socket(int fd);
 
 // Is this Linux address family one we route to bsd:u? (AF_INET / AF_INET6 — AF_UNIX stays on the
 // M2.5 vfd layer, everything else is refused.)
-int  nx_net_family_is_inet(int l_domain);
-
-// 1 iff nifm:u came up (the DNS-server source for the synthesized /etc/resolv.conf).
-int  nx_net_nifm_available(void);
-
-// 1 iff nifm reports the console actually has an internet connection. Lets a caller (and the M2.8
-// gate test) tell "offline console" apart from "broken shim".
-int  nx_net_link_up(void);
-
-// Render /etc/resolv.conf from nifm's current DNS servers; returns bytes written. Called per open()
-// from the VFS, so a network change is picked up without a restart.
-int  nx_net_resolv_conf(char* buf, size_t cap);
+int  nx_net_family_is_inet(int linux_domain);
 
 // ---- syscall bodies ------------------------------------------------------------------------------
 //
@@ -65,38 +61,47 @@ int  nx_net_resolv_conf(char* buf, size_t cap);
 // and Linux-layout sockaddrs ({u16 sa_family} heads, not BSD's {u8 sa_len, u8 sa_family}). errno is
 // left in HOST (newlib) numbering for the x64syscall return seams to translate, exactly as the file
 // syscalls do.
+//
+// `linux_capacity` is in/out wherever it appears: in = the guest's buffer size, out = the FULL address
+// length, which is how Linux reports a truncated result.
 
-int  nx_net_socket(int l_domain, int l_type, int l_proto);
-int  nx_net_bind(int fd, const void* l_addr, unsigned l_len);
-int  nx_net_connect(int fd, const void* l_addr, unsigned l_len);
+int  nx_net_socket(int linux_domain, int linux_type, int linux_protocol);
+int  nx_net_bind(int fd, const void* linux_address, unsigned linux_length);
+int  nx_net_connect(int fd, const void* linux_address, unsigned linux_length);
 int  nx_net_listen(int fd, int backlog);
-int  nx_net_accept4(int fd, void* l_addr, unsigned* l_len, int l_flags);
-int  nx_net_getsockname(int fd, void* l_addr, unsigned* l_len);
-int  nx_net_getpeername(int fd, void* l_addr, unsigned* l_len);
+int  nx_net_accept4(int fd, void* linux_address, unsigned* linux_capacity, int linux_flags);
+int  nx_net_getsockname(int fd, void* linux_address, unsigned* linux_capacity);
+int  nx_net_getpeername(int fd, void* linux_address, unsigned* linux_capacity);
 
-long nx_net_sendto(int fd, const void* buf, size_t len, int l_flags,
-                   const void* l_addr, unsigned l_alen);
-long nx_net_recvfrom(int fd, void* buf, size_t len, int l_flags,
-                     void* l_addr, unsigned* l_alen);
-long nx_net_sendmsg(int fd, const void* l_msghdr, int l_flags);
-long nx_net_recvmsg(int fd, void* l_msghdr, int l_flags);
+long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
+                   const void* linux_address, unsigned linux_address_length);
+long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
+                     void* linux_address, unsigned* linux_capacity);
+long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags);
+long nx_net_recvmsg(int fd, void* linux_message, int linux_flags);
 
-int  nx_net_getsockopt(int fd, int l_level, int l_opt, void* val, unsigned* len);
-int  nx_net_setsockopt(int fd, int l_level, int l_opt, const void* val, unsigned len);
+int  nx_net_getsockopt(int fd, int linux_level, int linux_option, void* value, unsigned* value_length);
+int  nx_net_setsockopt(int fd, int linux_level, int linux_option, const void* value, unsigned value_length);
 int  nx_net_shutdown(int fd, int how);
-int  nx_net_ioctl(int fd, unsigned long l_req, void* arg);
-long nx_net_fcntl(int fd, int cmd, long arg);
-
-// Score ONLY the socket entries of a Linux pollfd array, leaving the rest untouched, and report
-// whether the set contained any. Returns the number of socket entries that came back ready.
-// nx_poll() (nx_vfd.c) calls this for the socket half of a mixed vfd/file/socket set.
-int  nx_net_poll(void* l_pfds, unsigned long n, int timeout_ms, int* out_has_socket);
+int  nx_net_ioctl(int fd, unsigned long linux_request, void* argument);
+long nx_net_fcntl(int fd, int command, long argument);
 
 // O_NONBLOCK is the one fcntl flag Horizon's bsd supports, and it is spelled differently in all three
 // ABIs involved (Linux 0x800, newlib 0x4000, BSD 0x20000000) — so it gets dedicated accessors that
 // every entry point (socket/accept4 type flags, fcntl F_SETFL, ioctl FIONBIO) funnels through.
-int  nx_net_set_nonblock(int fd, int on);
+int  nx_net_set_nonblock(int fd, int enable);
 int  nx_net_get_nonblock(int fd);
+
+// Score ONLY the socket entries of a Linux pollfd array, leaving the rest untouched, and report
+// whether the set contained any. Returns the number of socket entries that came back ready.
+// nx_poll() (nx_vfd.c) calls this for the socket half of a mixed vfd/file/socket set.
+int  nx_net_poll(void* linux_pollfds, unsigned long count, int timeout_ms, int* out_has_socket);
+
+// ---- DNS configuration ---------------------------------------------------------------------------
+
+// Render /etc/resolv.conf from nifm's current DNS servers; returns bytes written. Called per open()
+// from the VFS, so a network change is picked up without a restart.
+int  nx_net_resolv_conf(char* buffer, size_t capacity);
 
 #ifdef __cplusplus
 }

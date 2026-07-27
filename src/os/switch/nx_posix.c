@@ -1345,18 +1345,24 @@ long syscall(long number, ...) {
             if (nx_vfd_is((int)a0)) return nx_vfd_flock((int)a0, (int)a1);
             return 0;
         case 59: return nx_pipe2((int*)a0, (int)a1);             // pipe2
-        case 72: {  // pselect6(nfds, rd, wr, ex, timespec*, sigmask) -> nx_select (sigmask ignored,
-            // as ppoll's is). glibc's select() emits THIS on modern kernels, not legacy select(23).
-            struct kx_ts { long s, ns; } *ts = (struct kx_ts*)a4;
-            struct kx_tv { long s, us; } tv;
+        case 72: {  // pselect6(nfds, read, write, except, timespec*, sigmask) -> nx_select (sigmask
+            // ignored, as ppoll's is). glibc's select() emits THIS on modern kernels, not select(23).
+            struct linux_timespec { long seconds, nanoseconds; };
+            struct linux_timeval  { long seconds, microseconds; };
+            const struct linux_timespec* timeout = (const struct linux_timespec*)a4;
+            struct linux_timeval as_timeval;
             extern int nx_select(int, void*, void*, void*, void*);
-            if (ts) { tv.s = ts->s; tv.us = ts->ns / 1000; }
-            return nx_select((int)a0, (void*)a1, (void*)a2, (void*)a3, ts ? &tv : NULL);
+            if (timeout) {
+                as_timeval.seconds      = timeout->seconds;
+                as_timeval.microseconds = timeout->nanoseconds / 1000;
+            }
+            return nx_select((int)a0, (void*)a1, (void*)a2, (void*)a3, timeout ? &as_timeval : NULL);
         }
-        case 73: {  // ppoll(fds, n, timespec*, sigmask) -> nx_poll
-            struct kx_ts { long s, ns; } *ts = (struct kx_ts*)a2;
-            int ms = ts ? (int)(ts->s * 1000 + ts->ns / 1000000) : -1;
-            return nx_poll((void*)a0, (unsigned long)a1, ms);
+        case 73: {  // ppoll(fds, count, timespec*, sigmask) -> nx_poll
+            struct linux_timespec { long seconds, nanoseconds; };
+            const struct linux_timespec* timeout = (const struct linux_timespec*)a2;
+            int timeout_ms = timeout ? (int)(timeout->seconds * 1000 + timeout->nanoseconds / 1000000) : -1;
+            return nx_poll((void*)a0, (unsigned long)a1, timeout_ms);
         }
         // ---- sockets (aarch64 NRs; box64 scwrap routes here) ----
         // Two backends share these NRs: AF_UNIX runs entirely in-process on the M2.5 vfd layer

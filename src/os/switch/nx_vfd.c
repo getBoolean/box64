@@ -1252,87 +1252,101 @@ static short vfd_ready(vfd_t* v, short events) {
 //  - bsd sockets (M2.8): only libnx can answer, and NOTHING about them touches g_cv.
 //
 // The socket case is why this is not just the old loop with an extra branch. Before M2.8 every
-// non-vfd set has_real, which reports the fd ready for whatever was asked AND forces an immediate
-// return; a socket scored that way would be permanently "ready", turning any Wine select loop into a
-// 100% CPU spin. So has_real is narrowed to plain files only, and a set containing sockets waits in
-// SHORT SLICES instead of indefinitely — a socket becoming readable can never broadcast g_cv, so the
-// only way to notice it is to look again.
+// non-vfd set has_plain_file, which reports the fd ready for whatever was asked AND forces an
+// immediate return; a socket scored that way would be permanently "ready", turning any Wine select
+// loop into a 100% CPU spin. So has_plain_file is narrowed to plain files only, and a set containing
+// sockets waits in SHORT SLICES instead of indefinitely — a socket becoming readable can never
+// broadcast g_cv, so the only way to notice it is to look again.
 //
 // Slicing rather than blocking inside libnx's poll() is deliberate: a blocking bsdPoll would hold the
 // wakeup latency of every OTHER fd in the set hostage to the socket timeout, delaying every wineserver
 // condvar wakeup by up to a full slice and regressing usock/cmd-echo. Sockets pay the added latency
 // (network round-trips dwarf it); vfds keep their immediate condvar wakeup.
-enum { NX_POLL_SLICE_MS = 20 };   // re-scan cadence when the set contains a socket
+enum {
+    NX_POLL_SLICE_MS  = 20,      // re-scan cadence when the set contains a socket
+    NX_POLL_IN        = 0x001,
+    NX_POLL_PRIORITY  = 0x002,
+    NX_POLL_OUT       = 0x004,
+    NX_POLL_ERROR     = 0x008,
+    NX_POLL_HANGUP    = 0x010,
+};
 
-int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
+int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
     // A positive timeout becomes an ABSOLUTE deadline ONCE: the slice loop re-scans many times and
     // must not restart the countdown on each pass (that would make a 50 ms poll never time out).
     struct timespec deadline = {0, 0};
     if (timeout_ms > 0) {
-        struct timeval tv; gettimeofday(&tv, NULL);
-        long usec = tv.tv_usec + (timeout_ms % 1000) * 1000;
-        deadline.tv_sec  = tv.tv_sec + timeout_ms / 1000 + usec / 1000000;
-        deadline.tv_nsec = (usec % 1000000) * 1000;
+        struct timeval now; gettimeofday(&now, NULL);
+        long microseconds = now.tv_usec + (timeout_ms % 1000) * 1000;
+        deadline.tv_sec  = now.tv_sec + timeout_ms / 1000 + microseconds / 1000000;
+        deadline.tv_nsec = (microseconds % 1000000) * 1000;
     }
     for (;;) {
         // Socket pass FIRST and OUTSIDE g_mx: it is a bsd:u IPC round trip, and holding the vfd mutex
         // across it would stall every pipe/socketpair op in the process (the wineserver's included).
         // Doing it before the lock also means the locked section below runs straight into the
         // cond_wait with no window for a vfd state change to be missed.
-        int has_sock = 0;
-        int ready = nx_net_poll(pf, n, 0 /*non-blocking scan*/, &has_sock);
-        if (ready < 0) ready = 0;
+        int has_socket = 0;
+        int ready_count = nx_net_poll(pollfds, count, 0 /*non-blocking scan*/, &has_socket);
+        if (ready_count < 0) ready_count = 0;
 
         pthread_mutex_lock(&g_mx);
-        int has_real = 0;
-        for (unsigned long i = 0; i < n; i++) {
-            if (pf[i].fd < 0) { pf[i].revents = 0; continue; }
-            if (nx_net_is_socket(pf[i].fd)) continue;   // already scored above — do not clear it
-            pf[i].revents = 0;
-            if (!nx_vfd_is(pf[i].fd)) {
+        int has_plain_file = 0;
+        for (unsigned long i = 0; i < count; i++) {
+            if (pollfds[i].fd < 0) { pollfds[i].revents = 0; continue; }
+            if (nx_net_is_socket(pollfds[i].fd)) continue;   // already scored above — do not clear it
+            pollfds[i].revents = 0;
+            if (!nx_vfd_is(pollfds[i].fd)) {
                 // real newlib fd: no host poll on Horizon — report it ready for whatever was
                 // asked (a read on a real file won't block anyway)
-                has_real = 1;
-                pf[i].revents = pf[i].events & (0x001 | 0x004);
-                if (pf[i].revents) ready++;
+                has_plain_file = 1;
+                pollfds[i].revents = pollfds[i].events & (NX_POLL_IN | NX_POLL_OUT);
+                if (pollfds[i].revents) ready_count++;
                 continue;
             }
-            pf[i].revents = vfd_ready(V(pf[i].fd), pf[i].events);
-            if (pf[i].revents) ready++;
+            pollfds[i].revents = vfd_ready(V(pollfds[i].fd), pollfds[i].events);
+            if (pollfds[i].revents) ready_count++;
         }
-        if (ready || timeout_ms == 0 || has_real) { pthread_mutex_unlock(&g_mx); return ready; }
+        if (ready_count || timeout_ms == 0 || has_plain_file) {
+            pthread_mutex_unlock(&g_mx);
+            return ready_count;
+        }
 
-        if (timeout_ms < 0 && !has_sock) {
-            { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
-              if (on) { char b[128]; int m = snprintf(b, sizeof b, "nx_vfd: POLLBLK pid=%d n=%lu fd0=%d fd1=%d\n",
-                  nx_guest_pid(), n, n>0?pf[0].fd:-1, n>1?pf[1].fd:-1); svcOutputDebugString(b, m); } }
+        if (timeout_ms < 0 && !has_socket) {
+            { static int log_enabled = -1; if (log_enabled < 0) log_enabled = getenv("KX_REQLOG") ? 1 : 0;
+              if (log_enabled) { char line[128];
+                  int length = snprintf(line, sizeof line, "nx_vfd: POLLBLK pid=%d n=%lu fd0=%d fd1=%d\n",
+                      nx_guest_pid(), count, count > 0 ? pollfds[0].fd : -1, count > 1 ? pollfds[1].fd : -1);
+                  svcOutputDebugString(line, length); } }
             pthread_cond_wait(&g_cv, &g_mx);
             pthread_mutex_unlock(&g_mx);
         } else {
-            struct timespec ts;
-            int at_deadline;
-            if (has_sock) {
+            struct timespec wake_at;
+            int wake_is_deadline;
+            if (has_socket) {
                 // Wait until the earlier of (the caller's deadline, one slice from now). An infinite
                 // timeout with a socket in the set has no deadline — it just keeps slicing.
-                struct timeval tv; gettimeofday(&tv, NULL);
-                long usec = tv.tv_usec + (NX_POLL_SLICE_MS % 1000) * 1000;
-                ts.tv_sec  = tv.tv_sec + NX_POLL_SLICE_MS / 1000 + usec / 1000000;
-                ts.tv_nsec = (usec % 1000000) * 1000;
-                at_deadline = timeout_ms > 0 && (deadline.tv_sec < ts.tv_sec ||
-                    (deadline.tv_sec == ts.tv_sec && deadline.tv_nsec <= ts.tv_nsec));
-                if (at_deadline) ts = deadline;
+                struct timeval now; gettimeofday(&now, NULL);
+                long microseconds = now.tv_usec + (NX_POLL_SLICE_MS % 1000) * 1000;
+                wake_at.tv_sec  = now.tv_sec + NX_POLL_SLICE_MS / 1000 + microseconds / 1000000;
+                wake_at.tv_nsec = (microseconds % 1000000) * 1000;
+                wake_is_deadline = timeout_ms > 0 && (deadline.tv_sec < wake_at.tv_sec ||
+                    (deadline.tv_sec == wake_at.tv_sec && deadline.tv_nsec <= wake_at.tv_nsec));
+                if (wake_is_deadline) wake_at = deadline;
             } else {
                 // No socket in the set: sleep the WHOLE remaining timeout on the condvar exactly as
                 // before M2.8. Slicing a socket-free poll would add a spurious wakeup every 20 ms to
                 // the wineserver's hot path for nothing.
-                ts = deadline;
-                at_deadline = 1;
+                wake_at = deadline;
+                wake_is_deadline = 1;
             }
-            int w = pthread_cond_timedwait(&g_cv, &g_mx, &ts);
+            int wait_result = pthread_cond_timedwait(&g_cv, &g_mx, &wake_at);
             pthread_mutex_unlock(&g_mx);
             // Only the CALLER's deadline ends the poll; a slice expiry just means "look again".
-            if (w == ETIMEDOUT && at_deadline) timeout_ms = 0;   // one final pass so a race at the
-        }                                                        // deadline isn't lost
+            // Setting timeout_ms to 0 gives one final scoreboard pass, so a readiness change racing
+            // the deadline is not lost.
+            if (wait_result == ETIMEDOUT && wake_is_deadline) timeout_ms = 0;
+        }
     }
 }
 
@@ -1347,60 +1361,78 @@ int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
 // precisely why M2.8 gives sockets real newlib fds instead of vfd numbers: FD_SET() on a vfd
 // (>=0x40000000) would write ~128 MB past the end of the set. A vfd reaching here is already a guest
 // bug, but it is scored anyway since nx_poll can.
-enum { NX_FD_SETSIZE = 1024, NX_FD_BITS_PER_WORD = 64, NX_SELECT_MAX_FDS = 128 };
+enum {
+    NX_FD_SET_SIZE      = 1024,   // Linux FD_SETSIZE — the bitmap's capacity in fds
+    NX_FD_BITS_PER_WORD = 64,
+    NX_SELECT_MAX_FDS   = 128,    // how many SELECTED fds one call can carry (see the cap note below)
+};
 
-typedef struct { unsigned long w[NX_FD_SETSIZE / NX_FD_BITS_PER_WORD]; } l_fd_set;
+typedef struct { unsigned long words[NX_FD_SET_SIZE / NX_FD_BITS_PER_WORD]; } linux_fd_set;
 
-static int fdset_test(const l_fd_set* s, int fd) {
-    return s && (s->w[fd / NX_FD_BITS_PER_WORD] >> (fd % NX_FD_BITS_PER_WORD)) & 1UL;
+static int fd_set_test(const linux_fd_set* set, int fd) {
+    return set && (set->words[fd / NX_FD_BITS_PER_WORD] >> (fd % NX_FD_BITS_PER_WORD)) & 1UL;
 }
-static void fdset_set(l_fd_set* s, int fd) {
-    if (s) s->w[fd / NX_FD_BITS_PER_WORD] |= 1UL << (fd % NX_FD_BITS_PER_WORD);
+static void fd_set_add(linux_fd_set* set, int fd) {
+    if (set) set->words[fd / NX_FD_BITS_PER_WORD] |= 1UL << (fd % NX_FD_BITS_PER_WORD);
 }
 
-int nx_select(int nfds, void* rd, void* wr, void* ex, void* timeout) {
-    struct kx_timeval { long sec, usec; };
-    const struct kx_timeval* tv = (const struct kx_timeval*)timeout;
-    int timeout_ms = tv ? (int)(tv->sec * 1000 + tv->usec / 1000) : -1;
-    if (nfds < 0 || nfds > NX_FD_SETSIZE) { errno = EINVAL; return -1; }
+int nx_select(int highest_fd_plus_one, void* read_set, void* write_set, void* except_set, void* timeout) {
+    struct linux_timeval { long seconds, microseconds; };
+    const struct linux_timeval* deadline = (const struct linux_timeval*)timeout;
+    int timeout_ms = deadline ? (int)(deadline->seconds * 1000 + deadline->microseconds / 1000) : -1;
+    if (highest_fd_plus_one < 0 || highest_fd_plus_one > NX_FD_SET_SIZE) { errno = EINVAL; return -1; }
 
-    l_pollfd pf[NX_SELECT_MAX_FDS];
-    int map[NX_SELECT_MAX_FDS];
-    int n = 0;
-    for (int fd = 0; fd < nfds && n < NX_SELECT_MAX_FDS; fd++) {
-        short ev = 0;
-        if (fdset_test((const l_fd_set*)rd, fd)) ev |= 0x001;            // POLLIN
-        if (fdset_test((const l_fd_set*)wr, fd)) ev |= 0x004;            // POLLOUT
-        if (fdset_test((const l_fd_set*)ex, fd)) ev |= 0x002;            // POLLPRI
-        if (!ev) continue;
-        pf[n].fd = fd; pf[n].events = ev; pf[n].revents = 0;
-        map[n] = fd; n++;
+    l_pollfd pollfds[NX_SELECT_MAX_FDS];
+    int      selected_fd[NX_SELECT_MAX_FDS];
+    int      selected_count = 0;
+    for (int fd = 0; fd < highest_fd_plus_one && selected_count < NX_SELECT_MAX_FDS; fd++) {
+        short events = 0;
+        if (fd_set_test((const linux_fd_set*)read_set,   fd)) events |= NX_POLL_IN;
+        if (fd_set_test((const linux_fd_set*)write_set,  fd)) events |= NX_POLL_OUT;
+        if (fd_set_test((const linux_fd_set*)except_set, fd)) events |= NX_POLL_PRIORITY;
+        if (!events) continue;
+        pollfds[selected_count].fd      = fd;
+        pollfds[selected_count].events  = events;
+        pollfds[selected_count].revents = 0;
+        selected_fd[selected_count]     = fd;
+        selected_count++;
     }
-    if (!n) {   // no fds selected: select() degenerates to a sleep
+    if (selected_count == NX_SELECT_MAX_FDS)
+        // Never truncate silently: a caller watching more than NX_SELECT_MAX_FDS fds would get a
+        // correct-looking answer computed from a subset. Leave a breadcrumb so a mysterious missed
+        // wakeup is traceable to this cap rather than to the poll logic.
+        vlog("nx_vfd: select truncated at %d fds (nfds=%d) pid=%d\n",
+             NX_SELECT_MAX_FDS, highest_fd_plus_one, nx_guest_pid());
+    if (!selected_count) {   // no fds selected: select() degenerates to a sleep
         if (timeout_ms > 0) svcSleepThread((u64)timeout_ms * 1000000ULL);
         return 0;
     }
-    int r = nx_poll(pf, (unsigned long)n, timeout_ms);
-    if (r < 0) return -1;
+    int ready_count = nx_poll(pollfds, (unsigned long)selected_count, timeout_ms);
+    if (ready_count < 0) return -1;
 
     // Rebuild the sets from revents. POLLERR/POLLHUP make an fd both readable and writable in select's
     // model (that is how a caller learns about them at all — select has no error bit of its own).
-    l_fd_set out_rd, out_wr, out_ex;
-    memset(&out_rd, 0, sizeof out_rd); memset(&out_wr, 0, sizeof out_wr); memset(&out_ex, 0, sizeof out_ex);
-    int count = 0;
-    for (int i = 0; i < n; i++) {
-        short re = pf[i].revents;
-        if (!re) continue;
-        int hit = 0;
-        if (rd && (re & (0x001 | 0x010 | 0x008))) { fdset_set(&out_rd, map[i]); hit = 1; }   // IN|HUP|ERR
-        if (wr && (re & (0x004 | 0x008)))         { fdset_set(&out_wr, map[i]); hit = 1; }   // OUT|ERR
-        if (ex && (re & 0x002))                   { fdset_set(&out_ex, map[i]); hit = 1; }   // PRI
-        count += hit;
+    linux_fd_set ready_read, ready_write, ready_except;
+    memset(&ready_read,   0, sizeof ready_read);
+    memset(&ready_write,  0, sizeof ready_write);
+    memset(&ready_except, 0, sizeof ready_except);
+    int result_count = 0;
+    for (int i = 0; i < selected_count; i++) {
+        short revents = pollfds[i].revents;
+        if (!revents) continue;
+        int counted = 0;
+        if (read_set   && (revents & (NX_POLL_IN | NX_POLL_HANGUP | NX_POLL_ERROR)))
+            { fd_set_add(&ready_read,   selected_fd[i]); counted = 1; }
+        if (write_set  && (revents & (NX_POLL_OUT | NX_POLL_ERROR)))
+            { fd_set_add(&ready_write,  selected_fd[i]); counted = 1; }
+        if (except_set && (revents & NX_POLL_PRIORITY))
+            { fd_set_add(&ready_except, selected_fd[i]); counted = 1; }
+        result_count += counted;
     }
-    if (rd) memcpy(rd, &out_rd, sizeof out_rd);
-    if (wr) memcpy(wr, &out_wr, sizeof out_wr);
-    if (ex) memcpy(ex, &out_ex, sizeof out_ex);
-    return count;
+    if (read_set)   memcpy(read_set,   &ready_read,   sizeof ready_read);
+    if (write_set)  memcpy(write_set,  &ready_write,  sizeof ready_write);
+    if (except_set) memcpy(except_set, &ready_except, sizeof ready_except);
+    return result_count;
 }
 
 // ---- epoll (vfd) ---------------------------------------------------------------------------------

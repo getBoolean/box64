@@ -27,81 +27,91 @@ extern int  nx_guest_buf_bad(const void*, size_t);   // nx_vfd.c — memprot che
 
 // libnx's socket entry points, declared by hand instead of via its headers.
 //
-// This is not paranoia: box64-nx force-includes shim/static_compat.h into every TU, and its shim
-// headers SHADOW libnx's. <poll.h> resolves to shim/poll.h, where nfds_t is `unsigned long` (libnx:
-// `unsigned int`) and POLLWRNORM is 0x100 (libnx: 0x004 == POLLOUT) — so calling poll() normally would
-// bind libnx's symbol through a mismatched declaration and silently mean a different thing by
-// POLLWRNORM. <sys/filio.h> is worse: it drags in ioccom.h, whose `int ioctl(int, int, ...)` is a HARD
-// conflict with the shim's `int ioctl(int, unsigned long, ...)` and will not compile at all.
+// This is not paranoia: box64-nx force-includes shim/static_compat.h into every translation unit, and
+// its shim headers SHADOW libnx's. <poll.h> resolves to shim/poll.h, where nfds_t is `unsigned long`
+// (libnx: `unsigned int`) and POLLWRNORM is 0x100 (libnx: 0x004 == POLLOUT) — so calling poll()
+// normally would bind libnx's symbol through a mismatched declaration and silently mean a different
+// thing by POLLWRNORM. <sys/filio.h> is worse: it drags in ioccom.h, whose `int ioctl(int, int, ...)`
+// is a HARD conflict with the shim's `int ioctl(int, unsigned long, ...)` and will not compile at all.
 //
 // So: bind the symbols by asm name with libnx's true prototypes, and never include the headers that
 // would fight the shim. The `nx_bsd_` prefix also makes every call site read as "this crosses into
 // Horizon's stack", which is the whole point of this file.
-extern int     nx_bsd_socket(int domain, int type, int protocol)                       __asm__("socket");
-extern int     nx_bsd_bind(int fd, const void* addr, unsigned addrlen)                 __asm__("bind");
-extern int     nx_bsd_connect(int fd, const void* addr, unsigned addrlen)              __asm__("connect");
-extern int     nx_bsd_listen(int fd, int backlog)                                      __asm__("listen");
-extern int     nx_bsd_accept(int fd, void* addr, unsigned* addrlen)                    __asm__("accept");
-extern int     nx_bsd_getsockname(int fd, void* addr, unsigned* addrlen)               __asm__("getsockname");
-extern int     nx_bsd_getpeername(int fd, void* addr, unsigned* addrlen)               __asm__("getpeername");
-extern int     nx_bsd_getsockopt(int fd, int lvl, int opt, void* val, unsigned* len)   __asm__("getsockopt");
-extern int     nx_bsd_setsockopt(int fd, int lvl, int opt, const void* val, unsigned l)__asm__("setsockopt");
-extern ssize_t nx_bsd_sendto(int fd, const void* buf, size_t n, int flags,
-                             const void* addr, unsigned addrlen)                       __asm__("sendto");
-extern ssize_t nx_bsd_recvfrom(int fd, void* buf, size_t n, int flags,
-                               void* addr, unsigned* addrlen)                          __asm__("recvfrom");
-extern int     nx_bsd_shutdown(int fd, int how)                                        __asm__("shutdown");
-extern int     nx_bsd_ioctl(int fd, int request, ...)                                  __asm__("ioctl");
-extern int     nx_bsd_fcntl(int fd, int cmd, ...)                                      __asm__("fcntl");
+extern int     nx_bsd_socket(int domain, int type, int protocol)                            __asm__("socket");
+extern int     nx_bsd_bind(int fd, const void* address, unsigned address_length)            __asm__("bind");
+extern int     nx_bsd_connect(int fd, const void* address, unsigned address_length)         __asm__("connect");
+extern int     nx_bsd_listen(int fd, int backlog)                                           __asm__("listen");
+extern int     nx_bsd_accept(int fd, void* address, unsigned* address_length)               __asm__("accept");
+extern int     nx_bsd_getsockname(int fd, void* address, unsigned* address_length)          __asm__("getsockname");
+extern int     nx_bsd_getpeername(int fd, void* address, unsigned* address_length)          __asm__("getpeername");
+extern int     nx_bsd_getsockopt(int fd, int level, int option, void* value,
+                                 unsigned* value_length)                                    __asm__("getsockopt");
+extern int     nx_bsd_setsockopt(int fd, int level, int option, const void* value,
+                                 unsigned value_length)                                     __asm__("setsockopt");
+extern ssize_t nx_bsd_sendto(int fd, const void* buffer, size_t length, int flags,
+                             const void* address, unsigned address_length)                  __asm__("sendto");
+extern ssize_t nx_bsd_recvfrom(int fd, void* buffer, size_t length, int flags,
+                               void* address, unsigned* address_length)                     __asm__("recvfrom");
+extern int     nx_bsd_shutdown(int fd, int how)                                             __asm__("shutdown");
+extern int     nx_bsd_ioctl(int fd, int request, ...)                                       __asm__("ioctl");
+extern int     nx_bsd_fcntl(int fd, int command, ...)                                       __asm__("fcntl");
 // libnx's poll(), with ITS nfds_t (unsigned int) and ITS pollfd bit values. Only ever called on an
 // array of socket fds — see nx_net_poll().
-extern int     nx_bsd_poll(void* fds, unsigned int nfds, int timeout)                  __asm__("poll");
+extern int     nx_bsd_poll(void* pollfds, unsigned int count, int timeout_ms)                __asm__("poll");
+// The RAW service call, below the devoptab layer — it takes a bsd descriptor, not a newlib fd. Its
+// header (switch/services/bsd.h) is not includable here: it pulls <poll.h>, which the shim owns.
+// Needed because libnx's public ioctl() implements FIONBIO by delegating to its fcntl(), leaving no
+// way to set non-blocking on a stack that has no fcntl. See nx_net_set_nonblock().
+extern int     bsdIoctl(int descriptor, int request, void* data);
 
 // ---- the two ABIs --------------------------------------------------------------------------------
 //
 // LINUX side (the guest's values — no header here defines them, so they are spelled out).
 enum {
-    L_AF_UNIX = 1, L_AF_INET = 2, L_AF_INET6 = 10, L_AF_NETLINK = 16,
+    LINUX_AF_UNIX = 1, LINUX_AF_INET = 2, LINUX_AF_INET6 = 10, LINUX_AF_NETLINK = 16,
 
-    L_SOCK_STREAM = 1, L_SOCK_DGRAM = 2, L_SOCK_RAW = 3,
-    L_SOCK_NONBLOCK = 0x800, L_SOCK_CLOEXEC = 0x80000,   // type-word flag bits (BSD numbers them differently)
+    LINUX_SOCK_STREAM = 1, LINUX_SOCK_DGRAM = 2, LINUX_SOCK_RAW = 3,
+    // type-word flag bits (BSD numbers these differently: 0x20000000 / 0x10000000)
+    LINUX_SOCK_NONBLOCK = 0x800, LINUX_SOCK_CLOEXEC = 0x80000,
 
-    L_SOL_SOCKET = 1,                                    // BSD: 0xffff — the single most dangerous delta
-    L_IPPROTO_IP = 0, L_IPPROTO_TCP = 6, L_IPPROTO_UDP = 17, L_IPPROTO_IPV6 = 41,
+    LINUX_SOL_SOCKET = 1,                             // BSD: 0xffff — the single most dangerous delta
+    LINUX_IPPROTO_IP = 0, LINUX_IPPROTO_TCP = 6, LINUX_IPPROTO_UDP = 17, LINUX_IPPROTO_IPV6 = 41,
 
     // SOL_SOCKET options
-    L_SO_DEBUG = 1, L_SO_REUSEADDR = 2, L_SO_TYPE = 3, L_SO_ERROR = 4, L_SO_DONTROUTE = 5,
-    L_SO_BROADCAST = 6, L_SO_SNDBUF = 7, L_SO_RCVBUF = 8, L_SO_KEEPALIVE = 9, L_SO_OOBINLINE = 10,
-    L_SO_LINGER = 13, L_SO_REUSEPORT = 15, L_SO_RCVLOWAT = 18, L_SO_SNDLOWAT = 19,
-    L_SO_RCVTIMEO = 20, L_SO_SNDTIMEO = 21, L_SO_ACCEPTCONN = 30,
+    LINUX_SO_DEBUG = 1, LINUX_SO_REUSEADDR = 2, LINUX_SO_TYPE = 3, LINUX_SO_ERROR = 4,
+    LINUX_SO_DONTROUTE = 5, LINUX_SO_BROADCAST = 6, LINUX_SO_SNDBUF = 7, LINUX_SO_RCVBUF = 8,
+    LINUX_SO_KEEPALIVE = 9, LINUX_SO_OOBINLINE = 10, LINUX_SO_LINGER = 13, LINUX_SO_REUSEPORT = 15,
+    LINUX_SO_RCVLOWAT = 18, LINUX_SO_SNDLOWAT = 19, LINUX_SO_RCVTIMEO = 20, LINUX_SO_SNDTIMEO = 21,
+    LINUX_SO_ACCEPTCONN = 30,
 
     // IPPROTO_IP options
-    L_IP_TOS = 1, L_IP_TTL = 2, L_IP_HDRINCL = 3, L_IP_OPTIONS = 4,
-    L_IP_MULTICAST_IF = 32, L_IP_MULTICAST_TTL = 33, L_IP_MULTICAST_LOOP = 34,
-    L_IP_ADD_MEMBERSHIP = 35, L_IP_DROP_MEMBERSHIP = 36,
+    LINUX_IP_TOS = 1, LINUX_IP_TTL = 2, LINUX_IP_HDRINCL = 3, LINUX_IP_OPTIONS = 4,
+    LINUX_IP_MULTICAST_IF = 32, LINUX_IP_MULTICAST_TTL = 33, LINUX_IP_MULTICAST_LOOP = 34,
+    LINUX_IP_ADD_MEMBERSHIP = 35, LINUX_IP_DROP_MEMBERSHIP = 36,
 
     // IPPROTO_IPV6 options
-    L_IPV6_UNICAST_HOPS = 16, L_IPV6_MULTICAST_IF = 17, L_IPV6_MULTICAST_HOPS = 18,
-    L_IPV6_MULTICAST_LOOP = 19, L_IPV6_JOIN_GROUP = 20, L_IPV6_LEAVE_GROUP = 21, L_IPV6_V6ONLY = 26,
+    LINUX_IPV6_UNICAST_HOPS = 16, LINUX_IPV6_MULTICAST_IF = 17, LINUX_IPV6_MULTICAST_HOPS = 18,
+    LINUX_IPV6_MULTICAST_LOOP = 19, LINUX_IPV6_JOIN_GROUP = 20, LINUX_IPV6_LEAVE_GROUP = 21,
+    LINUX_IPV6_V6ONLY = 26,
 
     // IPPROTO_TCP options — TCP_NODELAY is 1 in both ABIs (verified against netinet/tcp.h).
-    L_TCP_NODELAY = 1,
+    LINUX_TCP_NODELAY = 1,
 
-    // send/recv flags
-    L_MSG_OOB = 0x01, L_MSG_PEEK = 0x02, L_MSG_DONTROUTE = 0x04, L_MSG_CTRUNC = 0x08,
-    L_MSG_TRUNC = 0x20, L_MSG_DONTWAIT = 0x40, L_MSG_EOR = 0x80, L_MSG_WAITALL = 0x100,
-    L_MSG_NOSIGNAL = 0x4000,
+    // send/receive flags
+    LINUX_MSG_OOB = 0x01, LINUX_MSG_PEEK = 0x02, LINUX_MSG_DONTROUTE = 0x04, LINUX_MSG_CTRUNC = 0x08,
+    LINUX_MSG_TRUNC = 0x20, LINUX_MSG_DONTWAIT = 0x40, LINUX_MSG_EOR = 0x80,
+    LINUX_MSG_WAITALL = 0x100, LINUX_MSG_NOSIGNAL = 0x4000,
 
-    L_O_NONBLOCK = 0x800,        // newlib's is 0x4000 (_FNONBLOCK) — never pass one for the other
-    L_FIONBIO = 0x5421, L_FIONREAD = 0x541B,
+    LINUX_O_NONBLOCK = 0x800,        // newlib's is 0x4000 — never pass one for the other
+    LINUX_FIONBIO = 0x5421, LINUX_FIONREAD = 0x541B,
 
-    L_SHUT_RD = 0, L_SHUT_WR = 1, L_SHUT_RDWR = 2,   // identical in both ABIs
+    LINUX_SHUT_READ = 0, LINUX_SHUT_WRITE = 1, LINUX_SHUT_READ_WRITE = 2,   // identical in both ABIs
 };
 
 // BSD values that libnx's usable headers do NOT give us. FIONBIO/FIONREAD live in <sys/filio.h>, which
 // cannot be included here (see the ioctl conflict above), so the _IOW/_IOR encodings are inlined:
 //   FIONBIO = _IOW('f', 126, int) = 0x8004667E,  FIONREAD = _IOR('f', 127, int) = 0x4004667F.
-enum { B_FIONBIO = 0x8004667E, B_FIONREAD = 0x4004667F };
+enum { BSD_FIONBIO = 0x8004667E, BSD_FIONREAD = 0x4004667F };
 
 // BSD sockaddr length byte: FreeBSD's `struct sockaddr` leads with {u8 sa_len, u8 sa_family} where
 // Linux has a single {u16 sa_family}. Both sockaddr_in (16 B) and sockaddr_in6 (28 B) are otherwise
@@ -112,17 +122,17 @@ enum { B_FIONBIO = 0x8004667E, B_FIONREAD = 0x4004667F };
 // would put the family in byte 0 and garbage in byte 1, which FreeBSD reads as a length. We therefore
 // build the BSD sockaddr as bytes ourselves, per the documented FreeBSD ABI, and never lay libnx's
 // sockaddr_in6 over the wire buffer.
-enum { NX_SA_MAX = 128 };   // sockaddr_storage-sized scratch; larger than any family we route
+enum { NX_SOCKADDR_MAX = 128 };   // sockaddr_storage-sized scratch; larger than any family we route
 
-#define NX_ARRAY_LEN(a) ((int)(sizeof(a) / sizeof((a)[0])))
+#define NX_ARRAY_LENGTH(array) ((int)(sizeof(array) / sizeof((array)[0])))
 
-typedef struct { int l, b; } nx_map_t;
+typedef struct { int linux_value; int bsd_value; } nx_value_map;
 
-// Look a Linux value up in a table; returns `miss` when absent (callers turn that into ENOPROTOOPT
+// Look a Linux value up in a table; returns `on_miss` when absent (callers turn that into ENOPROTOOPT
 // rather than guessing, because a wrong option number silently configures the WRONG option).
-static int map_l2b(const nx_map_t* t, int n, int l, int miss) {
-    for (int i = 0; i < n; i++) if (t[i].l == l) return t[i].b;
-    return miss;
+static int map_linux_to_bsd(const nx_value_map* table, int count, int linux_value, int on_miss) {
+    for (int i = 0; i < count; i++) if (table[i].linux_value == linux_value) return table[i].bsd_value;
+    return on_miss;
 }
 
 // ---- diagnostics ---------------------------------------------------------------------------------
@@ -131,36 +141,36 @@ static int map_l2b(const nx_map_t* t, int n, int l, int miss) {
 // switch has three cases and an EPIPE default), so a service-level failure is indistinguishable from
 // a real broken pipe. When KX_NET_LOG is set, print the raw Result alongside each failure so that
 // ambiguity is resolvable without a rebuild.
-static int net_log_on(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("KX_NET_LOG") ? 1 : 0;
-    return on;
+static int net_log_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("KX_NET_LOG") ? 1 : 0;
+    return enabled;
 }
 
-static void netlog(const char* fmt, ...) {
-    if (!net_log_on()) return;
-    char b[192]; va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
-    if (n > 0) svcOutputDebugString(b, (size_t)n);
+static void net_log(const char* format, ...) {
+    if (!net_log_enabled()) return;
+    char line[192]; va_list args; va_start(args, format);
+    int length = vsnprintf(line, sizeof line, format, args); va_end(args);
+    if (length > 0) svcOutputDebugString(line, (size_t)length);
 }
 
 // ---- availability --------------------------------------------------------------------------------
 
-enum { NX_SOC_DEV_NONE = -1 };   // no "soc" devoptab registered => no sockets exist
+enum { NX_SOCKET_DEVICE_NONE = -1 };   // no "soc" devoptab registered => no sockets exist
 
-// KX_NET_SMALLBUF profile — enough for DNS and a few modest TCP streams, ~8x below libnx's default.
+// KX_NET_SMALLBUF profile — enough for DNS and a few modest TCP streams, well below libnx's default.
 enum {
-    NX_NET_SMALL_TCP_BUF       = 0x8000,   // 32 KiB initial send/recv window per socket
-    NX_NET_SMALL_TCP_BUF_MAX   = 0x20000,  // 128 KiB ceiling when the stack grows the window
-    NX_NET_SMALL_SB_EFFICIENCY = 1,        // one buffer per socket (default is 4)
+    NX_NET_SMALL_TCP_BUFFER       = 0x8000,    // 32 KiB initial send/receive window per socket
+    NX_NET_SMALL_TCP_BUFFER_MAX   = 0x20000,   // 128 KiB ceiling when the stack grows the window
+    NX_NET_SMALL_BUFFER_COUNT     = 1,         // buffers per socket (libnx's default is higher)
 };
 
-static int g_net_ok      = 0;                 // bsd:u usable
-static int g_nifm_ok     = 0;                 // nifm:u usable (DNS server + link status)
-static int g_soc_dev     = NX_SOC_DEV_NONE;   // devoptab_list index of libnx's "soc" device
+static int g_socket_ready        = 0;                       // bsd:u usable
+static int g_network_info_ready  = 0;                       // nifm:u usable (DNS servers + link status)
+static int g_socket_device_index = NX_SOCKET_DEVICE_NONE;   // devoptab_list index of libnx's "soc"
 
-int nx_net_available(void) { return g_net_ok; }
-int nx_net_nifm_available(void) { return g_nifm_ok; }
+int nx_net_available(void)       { return g_socket_ready; }
+int nx_net_nifm_available(void)  { return g_network_info_ready; }
 
 // A socket fd is any live newlib handle whose devoptab is libnx's "soc". Asking the handle table is
 // exact where a shadow table is only as good as its bookkeeping: newlib releases the handle itself on
@@ -168,13 +178,13 @@ int nx_net_nifm_available(void) { return g_nifm_ok; }
 // fd-number ceiling to overflow. __get_handle() already returns NULL for out-of-range and for
 // refcount==0, which is the whole validity check.
 int nx_net_is_socket(int fd) {
-    if (g_soc_dev == NX_SOC_DEV_NONE || fd < 0) return 0;   // fast out when M2.8 is off entirely
-    __handle* h = __get_handle(fd);
-    return h && (int)h->device == g_soc_dev;
+    if (g_socket_device_index == NX_SOCKET_DEVICE_NONE || fd < 0) return 0;   // fast out when M2.8 is off
+    __handle* handle = __get_handle(fd);
+    return handle && (int)handle->device == g_socket_device_index;
 }
 
-int nx_net_family_is_inet(int l_domain) {
-    return l_domain == 2 /*AF_INET*/ || l_domain == 10 /*AF_INET6*/;
+int nx_net_family_is_inet(int linux_domain) {
+    return linux_domain == LINUX_AF_INET || linux_domain == LINUX_AF_INET6;
 }
 
 // ---- init / teardown -----------------------------------------------------------------------------
@@ -190,230 +200,305 @@ void nx_net_init(void) {
 
     // The NRO already has sockets up from nx_main's netloader block; a second socketInitialize would
     // fail. Detect that by asking for the devoptab rather than re-deriving "am I homebrew".
-    int dev = FindDevice("soc:");
-    if (dev < 0) {
+    int device_index = FindDevice("soc:");
+    if (device_index < 0) {
         // libnx's default socket buffers are backed by a transfer memory block carved out of the SAME
-        // heap the guest address space comes from — and on real HW the Wine low-VA path (KX_FORCE_HEAP)
-        // is sensitive to what that heap looks like. KX_NET_SMALLBUF trims the buffers to a DNS +
-        // modest-TCP profile so the cost of enabling networking can be A/B'd against a Wine run
-        // without a rebuild.
-        const SocketInitConfig* cfg = socketGetDefaultInitConfig();
-        SocketInitConfig small;
+        // heap the guest address space comes from — and on real HW the Wine low-VA path
+        // (KX_FORCE_HEAP) is sensitive to what that heap looks like. KX_NET_SMALLBUF trims the buffers
+        // to a DNS + modest-TCP profile so the cost of enabling networking can be A/B'd against a Wine
+        // run without a rebuild.
+        const SocketInitConfig* config = socketGetDefaultInitConfig();
+        SocketInitConfig small_config;
         if (getenv("KX_NET_SMALLBUF")) {
-            small = *cfg;
-            small.tcp_tx_buf_size = small.tcp_rx_buf_size = NX_NET_SMALL_TCP_BUF;
-            small.tcp_tx_buf_max_size = small.tcp_rx_buf_max_size = NX_NET_SMALL_TCP_BUF_MAX;
-            small.sb_efficiency = NX_NET_SMALL_SB_EFFICIENCY;
-            cfg = &small;
+            small_config = *config;
+            small_config.tcp_tx_buf_size     = small_config.tcp_rx_buf_size     = NX_NET_SMALL_TCP_BUFFER;
+            small_config.tcp_tx_buf_max_size = small_config.tcp_rx_buf_max_size = NX_NET_SMALL_TCP_BUFFER_MAX;
+            small_config.sb_efficiency       = NX_NET_SMALL_BUFFER_COUNT;
+            config = &small_config;
         }
-        Result rc = socketInitialize(cfg);
-        if (R_FAILED(rc)) {
-            char b[96]; int n = snprintf(b, sizeof b, "nx_net: socketInitialize FAILED rc=0x%x (no bsd:u in NPDM?)", rc);
-            if (n > 0) nx_result_log(b);
+        Result socket_result = socketInitialize(config);
+        if (R_FAILED(socket_result)) {
+            char line[96];
+            int length = snprintf(line, sizeof line,
+                                  "nx_net: socketInitialize FAILED rc=0x%x (no bsd:u in NPDM?)", socket_result);
+            if (length > 0) nx_result_log(line);
             return;
         }
-        dev = FindDevice("soc:");
+        device_index = FindDevice("soc:");
     }
-    if (dev < 0) { nx_result_log("nx_net: no 'soc' devoptab after init"); return; }
+    if (device_index < 0) { nx_result_log("nx_net: no 'soc' devoptab after init"); return; }
 
-    g_soc_dev = dev;
-    g_net_ok  = 1;
+    g_socket_device_index = device_index;
+    g_socket_ready        = 1;
 
     // nifm supplies the DNS servers for the synthesized /etc/resolv.conf and the link-status
     // pre-flight. Its absence is not fatal — resolv.conf falls back to a public resolver.
-    Result rc = nifmInitialize(NifmServiceType_User);
-    g_nifm_ok = R_SUCCEEDED(rc);
+    Result nifm_result  = nifmInitialize(NifmServiceType_User);
+    g_network_info_ready = R_SUCCEEDED(nifm_result);
 
-    char b[128];
-    int n = snprintf(b, sizeof b, "nx_net: ready bsd:u dev=%d nifm=%d", g_soc_dev, g_nifm_ok);
-    if (n > 0) nx_result_log(b);
-    netlog("nx_net: init nifm rc=0x%x\n", rc);
+    char line[128];
+    int length = snprintf(line, sizeof line, "nx_net: ready bsd:u dev=%d nifm=%d",
+                          g_socket_device_index, g_network_info_ready);
+    if (length > 0) nx_result_log(line);
+    net_log("nx_net: init nifm rc=0x%x\n", nifm_result);
 }
 
 void nx_net_exit(void) {
-    if (g_nifm_ok) { nifmExit(); g_nifm_ok = 0; }
+    if (g_network_info_ready) { nifmExit(); g_network_info_ready = 0; }
     // socketExit() stays with nx_main's teardown: on the NRO it owns the socket stack (netloader),
     // and calling it here would tear down nxlink's stdio channel out from under it.
-    g_net_ok  = 0;
-    g_soc_dev = NX_SOC_DEV_NONE;
+    g_socket_ready        = 0;
+    g_socket_device_index = NX_SOCKET_DEVICE_NONE;
 }
 
 // ---- address translation -------------------------------------------------------------------------
 
-static int family_l2b(int l_af) {
-    switch (l_af) {
-        case L_AF_INET:  return AF_INET;    // 2 -> 2
-        case L_AF_INET6: return AF_INET6;   // 10 -> 28
-        default:         return -1;
+static int family_linux_to_bsd(int linux_family) {
+    switch (linux_family) {
+        case LINUX_AF_INET:  return AF_INET;    // 2 -> 2
+        case LINUX_AF_INET6: return AF_INET6;   // 10 -> 28
+        default:             return -1;
     }
 }
 
-static int family_b2l(int b_af) {
-    switch (b_af) {
-        case AF_INET:  return L_AF_INET;
-        case AF_INET6: return L_AF_INET6;
+static int family_bsd_to_linux(int bsd_family) {
+    switch (bsd_family) {
+        case AF_INET:  return LINUX_AF_INET;
+        case AF_INET6: return LINUX_AF_INET6;
         default:       return -1;
     }
 }
 
 // The wire length Horizon expects for a family. FreeBSD validates sa_len, and a Linux guest routinely
-// passes sizeof(struct sockaddr_storage) (128) as addrlen rather than the exact family size, so derive
-// the length from the FAMILY instead of trusting the guest's count.
-static unsigned addr_wire_len(int b_af) {
-    switch (b_af) {
+// passes sizeof(struct sockaddr_storage) (128) as the address length rather than the exact family
+// size, so derive the length from the FAMILY instead of trusting the guest's count.
+static unsigned sockaddr_wire_length(int bsd_family) {
+    switch (bsd_family) {
         case AF_INET:  return sizeof(struct sockaddr_in);    // 16
         case AF_INET6: return sizeof(struct sockaddr_in6);   // 28
         default:       return 0;
     }
 }
 
-// Linux sockaddr -> BSD, into `out` (NX_SA_MAX bytes). Returns the BSD wire length, or 0 if the family
-// is not one we route. Only bytes 0..1 change: Linux's u16 sa_family becomes BSD's {u8 sa_len,
-// u8 sa_family}; every later byte (port, address, scope) is identical in both ABIs.
-static unsigned addr_l2b(const void* l_addr, unsigned l_len, uint8_t* out) {
-    if (!l_addr || l_len < 2) return 0;
-    int b_af = family_l2b(((const uint8_t*)l_addr)[0] | (((const uint8_t*)l_addr)[1] << 8));
-    if (b_af < 0) return 0;
-    unsigned wire = addr_wire_len(b_af);
-    if (!wire) return 0;
-    unsigned copy = l_len < wire ? l_len : wire;
-    memset(out, 0, wire);
-    if (copy > 2) memcpy(out + 2, (const uint8_t*)l_addr + 2, copy - 2);
-    out[0] = (uint8_t)wire;     // sa_len
-    out[1] = (uint8_t)b_af;     // sa_family
-    return wire;
+// Linux sockaddr -> BSD, into `bsd_out` (NX_SOCKADDR_MAX bytes). Returns the BSD wire length, or 0 if
+// the family is not one we route. Only bytes 0..1 change: Linux's u16 sa_family becomes BSD's
+// {u8 sa_len, u8 sa_family}; every later byte (port, address, scope) is identical in both ABIs.
+static unsigned sockaddr_linux_to_bsd(const void* linux_address, unsigned linux_length, uint8_t* bsd_out) {
+    if (!linux_address || linux_length < 2) return 0;
+    const uint8_t* linux_bytes = (const uint8_t*)linux_address;
+    int bsd_family = family_linux_to_bsd(linux_bytes[0] | (linux_bytes[1] << 8));
+    if (bsd_family < 0) return 0;
+    unsigned wire_length = sockaddr_wire_length(bsd_family);
+    if (!wire_length) return 0;
+    unsigned copy_length = linux_length < wire_length ? linux_length : wire_length;
+    memset(bsd_out, 0, wire_length);
+    if (copy_length > 2) memcpy(bsd_out + 2, linux_bytes + 2, copy_length - 2);
+    bsd_out[0] = (uint8_t)wire_length;   // sa_len
+    bsd_out[1] = (uint8_t)bsd_family;    // sa_family
+    return wire_length;
 }
 
-// BSD sockaddr -> Linux, in place semantics: writes at most *l_cap bytes into l_addr and reports the
-// FULL length in *l_cap, which is what Linux getsockname/accept do (a short buffer is truncated, and
-// the caller learns the real size). Returns 0 on success, -1 with errno set on an unroutable family.
-static int addr_b2l(const uint8_t* b_addr, unsigned b_len, void* l_addr, unsigned* l_cap) {
-    int l_af = family_b2l(b_addr[1]);
-    if (l_af < 0) { errno = EAFNOSUPPORT; return -1; }
-    unsigned full = b_len;
-    if (l_addr && l_cap && *l_cap) {
-        uint8_t tmp[NX_SA_MAX];
-        unsigned n = full < sizeof tmp ? full : (unsigned)sizeof tmp;
-        memcpy(tmp, b_addr, n);
-        tmp[0] = (uint8_t)(l_af & 0xff);   // Linux u16 sa_family, little-endian
-        tmp[1] = (uint8_t)(l_af >> 8);
-        unsigned copy = *l_cap < n ? *l_cap : n;
-        memcpy(l_addr, tmp, copy);
+// BSD sockaddr -> Linux: writes at most *linux_capacity bytes into linux_address and reports the FULL
+// length back in *linux_capacity, which is what Linux getsockname/accept do (a short buffer is
+// truncated, and the caller still learns the real size). Returns 0, or -1 with errno on an unroutable
+// family.
+static int sockaddr_bsd_to_linux(const uint8_t* bsd_address, unsigned bsd_length,
+                                 void* linux_address, unsigned* linux_capacity) {
+    int linux_family = family_bsd_to_linux(bsd_address[1]);
+    if (linux_family < 0) { errno = EAFNOSUPPORT; return -1; }
+    if (linux_address && linux_capacity && *linux_capacity) {
+        uint8_t converted[NX_SOCKADDR_MAX];
+        unsigned length = bsd_length < sizeof converted ? bsd_length : (unsigned)sizeof converted;
+        memcpy(converted, bsd_address, length);
+        converted[0] = (uint8_t)(linux_family & 0xff);   // Linux u16 sa_family, little-endian
+        converted[1] = (uint8_t)(linux_family >> 8);
+        unsigned copy_length = *linux_capacity < length ? *linux_capacity : length;
+        memcpy(linux_address, converted, copy_length);
     }
-    if (l_cap) *l_cap = full;
+    if (linux_capacity) *linux_capacity = bsd_length;
     return 0;
 }
 
 // ---- socket creation and connection setup --------------------------------------------------------
 
-int nx_net_socket(int l_domain, int l_type, int l_proto) {
-    if (!g_net_ok) { errno = EAFNOSUPPORT; return -1; }
-    int b_af = family_l2b(l_domain);
-    if (b_af < 0) { errno = EAFNOSUPPORT; return -1; }
+// Non-blocking is set through libnx's fcntl, which speaks NEWLIB O_NONBLOCK and rejects any other bit
+// with EINVAL — passing the guest's Linux 0x800 straight through would fail. Shared by
+// socket(SOCK_NONBLOCK), accept4(SOCK_NONBLOCK), fcntl(F_SETFL) and ioctl(FIONBIO).
+enum { NEWLIB_O_NONBLOCK = 0x4000, NEWLIB_F_GETFL = 3, NEWLIB_F_SETFL = 4 };
 
-    int base = l_type & 0xff;
-    int b_type;
-    switch (base) {
-        case L_SOCK_STREAM: b_type = SOCK_STREAM; break;   // 1 -> 1
-        case L_SOCK_DGRAM:  b_type = SOCK_DGRAM;  break;   // 2 -> 2
-        case L_SOCK_RAW:    b_type = SOCK_RAW;    break;   // 3 -> 3 (bsd:u will likely refuse it)
+// libnx's fcntl() cannot be error-checked by its return value. On failure it still runs the -1
+// through from_nx(), which tests one bit and yields a POSITIVE O_NONBLOCK — so `result < 0` never
+// fires, a failed F_GETFL reads as "non-blocking is set", and a failed F_SETFL reads as success. Its
+// success value is not Linux's either: F_SETFL must return 0, but libnx returns whatever the bsd
+// F_SETFL returned, mapped through from_nx.
+//
+// So both accessors clear errno, call, and judge by errno — then normalize the result themselves.
+static int bsd_fcntl_checked(int fd, int command, int flags, int* out_result) {
+    errno = 0;
+    int result = nx_bsd_fcntl(fd, command, flags);
+    if (errno) return -1;
+    if (out_result) *out_result = result;
+    return 0;
+}
+
+// The raw bsd descriptor behind a newlib socket fd, obtained the same way libnx's own private
+// _socketGetFd() does. Needed to reach bsdIoctl DIRECTLY: libnx's public ioctl() implements FIONBIO by
+// delegating to its fcntl(), so when a stack has no fcntl there is no way to set non-blocking through
+// the public API at all. Returns -1 if fd is not a socket.
+static int bsd_descriptor(int fd) {
+    __handle* handle = __get_handle(fd);
+    if (!handle || (int)handle->device != g_socket_device_index) return -1;
+    return *(int*)handle->fileStruct;
+}
+
+// Remembered non-blocking state, consulted only when the stack cannot report it (see below). Indexed
+// by newlib fd; entries are reset when a socket is created or accepted, which is the only way an fd
+// number can be reused, so a stale entry cannot outlive its socket.
+enum { NX_NONBLOCK_TRACK_MAX = 256 };
+static uint8_t g_nonblock_shadow[NX_NONBLOCK_TRACK_MAX];
+
+static void nonblock_shadow_set(int fd, int enable) {
+    if (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) g_nonblock_shadow[fd] = enable ? 1 : 0;
+}
+static int nonblock_shadow_get(int fd) {
+    return (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) ? g_nonblock_shadow[fd] : 0;
+}
+
+// Two routes, because bsd:u implementations differ in what they support:
+//   1. libnx's fcntl(F_GETFL/F_SETFL) — the documented path, and what real Horizon answers;
+//   2. bsdIoctl(FIONBIO) on the raw descriptor — reaches the stack directly when it has no fcntl.
+//      Ryujinx's HLE bsd is exactly this case: no Fcntl handler at all, so every fcntl fails, and
+//      libnx's from_nx(-1) artifact made those failures look like SUCCESS until this was checked
+//      properly. Non-blocking is not optional — a non-blocking connect is how both Wine's ws2_32 and
+//      glibc's resolver work — so it gets a second route rather than a graceful degradation.
+int nx_net_set_nonblock(int fd, int enable) {
+    int flags = 0;
+    if (bsd_fcntl_checked(fd, NEWLIB_F_GETFL, 0, &flags) == 0) {
+        flags = enable ? (flags | NEWLIB_O_NONBLOCK) : (flags & ~NEWLIB_O_NONBLOCK);
+        if (bsd_fcntl_checked(fd, NEWLIB_F_SETFL, flags, NULL) == 0) {
+            nonblock_shadow_set(fd, enable);
+            return 0;   // Linux F_SETFL returns 0, not the flag word
+        }
+    }
+    net_log("nx_net: F_SETFL fd=%d enable=%d failed e=%d rc=0x%x -> FIONBIO fallback\n",
+            fd, enable, errno, socketGetLastResult());
+
+    int descriptor = bsd_descriptor(fd);
+    if (descriptor < 0) { errno = ENOTSOCK; return -1; }
+    int value = enable ? 1 : 0;
+    if (bsdIoctl(descriptor, BSD_FIONBIO, &value) < 0) {
+        net_log("nx_net: FIONBIO fd=%d enable=%d failed rc=0x%x\n", fd, enable, socketGetLastResult());
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    nonblock_shadow_set(fd, enable);
+    return 0;
+}
+
+int nx_net_get_nonblock(int fd) {
+    int flags = 0;
+    if (bsd_fcntl_checked(fd, NEWLIB_F_GETFL, 0, &flags) == 0)
+        return (flags & NEWLIB_O_NONBLOCK) ? 1 : 0;
+    // The stack cannot tell us, so report what we last successfully set. Reporting an error instead
+    // would break the read-back half of Wine's set-then-check pattern on a socket that IS correctly
+    // configured.
+    return nonblock_shadow_get(fd);
+}
+
+int nx_net_socket(int linux_domain, int linux_type, int linux_protocol) {
+    if (!g_socket_ready) { errno = EAFNOSUPPORT; return -1; }
+    int bsd_family = family_linux_to_bsd(linux_domain);
+    if (bsd_family < 0) { errno = EAFNOSUPPORT; return -1; }
+
+    int bsd_type;
+    switch (linux_type & 0xff) {
+        case LINUX_SOCK_STREAM: bsd_type = SOCK_STREAM; break;   // 1 -> 1
+        case LINUX_SOCK_DGRAM:  bsd_type = SOCK_DGRAM;  break;   // 2 -> 2
+        case LINUX_SOCK_RAW:    bsd_type = SOCK_RAW;    break;   // 3 -> 3 (bsd:u will likely refuse it)
         default: errno = EPROTONOSUPPORT; return -1;
     }
     // IPPROTO_* are identical in both ABIs (0/6/17/41 — verified against netinet/in.h), so the
     // protocol passes through.
-    int fd = nx_bsd_socket(b_af, b_type, l_proto);
+    int fd = nx_bsd_socket(bsd_family, bsd_type, linux_protocol);
     if (fd < 0) {
-        netlog("nx_net: socket(af=%d type=%d proto=%d) failed e=%d rc=0x%x\n",
-               l_domain, l_type, l_proto, errno, socketGetLastResult());
+        net_log("nx_net: socket(af=%d type=%d proto=%d) failed e=%d rc=0x%x\n",
+                linux_domain, linux_type, linux_protocol, errno, socketGetLastResult());
         return -1;
     }
-    // SOCK_NONBLOCK/SOCK_CLOEXEC are encoded in the type word on Linux (0x800/0x80000) and differently
-    // on BSD (0x20000000/0x10000000). Rather than depend on Horizon's bsd honoring the type-word
-    // encoding at all, apply non-blocking afterwards through the fcntl path that is known to work.
-    // CLOEXEC is meaningless here — Horizon has no exec.
-    if ((l_type & L_SOCK_NONBLOCK) && nx_net_set_nonblock(fd, 1) < 0) {
-        int e = errno; close(fd); errno = e; return -1;
+    nonblock_shadow_set(fd, 0);   // fresh socket: blocking, and clears any stale entry for this fd
+    // SOCK_NONBLOCK/SOCK_CLOEXEC are encoded in the type word on Linux (0x800/0x80000) and
+    // differently on BSD (0x20000000/0x10000000). Rather than depend on Horizon's bsd honoring the
+    // type-word encoding at all, apply non-blocking afterwards through the fcntl path that is known to
+    // work. CLOEXEC is meaningless here — Horizon has no exec.
+    if ((linux_type & LINUX_SOCK_NONBLOCK) && nx_net_set_nonblock(fd, 1) < 0) {
+        int saved_errno = errno; close(fd); errno = saved_errno; return -1;
     }
     return fd;
 }
 
-// Non-blocking is set through libnx's fcntl, which speaks NEWLIB O_NONBLOCK (0x4000) and rejects any
-// other bit with EINVAL — passing the guest's Linux 0x800 straight through would fail. Shared by
-// socket(SOCK_NONBLOCK), accept4(SOCK_NONBLOCK), fcntl(F_SETFL) and ioctl(FIONBIO).
-enum { NX_NEWLIB_O_NONBLOCK = 0x4000, NX_F_GETFL = 3, NX_F_SETFL = 4 };
-
-int nx_net_set_nonblock(int fd, int on) {
-    int fl = nx_bsd_fcntl(fd, NX_F_GETFL);
-    if (fl < 0) return -1;
-    fl = on ? (fl | NX_NEWLIB_O_NONBLOCK) : (fl & ~NX_NEWLIB_O_NONBLOCK);
-    return nx_bsd_fcntl(fd, NX_F_SETFL, fl);
+int nx_net_bind(int fd, const void* linux_address, unsigned linux_length) {
+    if (nx_guest_buf_bad(linux_address, linux_length)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned wire_length = sockaddr_linux_to_bsd(linux_address, linux_length, bsd_address);
+    if (!wire_length) { errno = EAFNOSUPPORT; return -1; }
+    int result = nx_bsd_bind(fd, bsd_address, wire_length);
+    if (result < 0) net_log("nx_net: bind fd=%d failed e=%d rc=0x%x\n", fd, errno, socketGetLastResult());
+    return result;
 }
 
-int nx_net_get_nonblock(int fd) {
-    int fl = nx_bsd_fcntl(fd, NX_F_GETFL);
-    if (fl < 0) return -1;
-    return (fl & NX_NEWLIB_O_NONBLOCK) ? 1 : 0;
-}
-
-int nx_net_bind(int fd, const void* l_addr, unsigned l_len) {
-    if (nx_guest_buf_bad(l_addr, l_len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned wire = addr_l2b(l_addr, l_len, b);
-    if (!wire) { errno = EAFNOSUPPORT; return -1; }
-    int r = nx_bsd_bind(fd, b, wire);
-    if (r < 0) netlog("nx_net: bind fd=%d failed e=%d rc=0x%x\n", fd, errno, socketGetLastResult());
-    return r;
-}
-
-int nx_net_connect(int fd, const void* l_addr, unsigned l_len) {
-    if (nx_guest_buf_bad(l_addr, l_len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned wire = addr_l2b(l_addr, l_len, b);
-    if (!wire) { errno = EAFNOSUPPORT; return -1; }
-    int r = nx_bsd_connect(fd, b, wire);
+int nx_net_connect(int fd, const void* linux_address, unsigned linux_length) {
+    if (nx_guest_buf_bad(linux_address, linux_length)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned wire_length = sockaddr_linux_to_bsd(linux_address, linux_length, bsd_address);
+    if (!wire_length) { errno = EAFNOSUPPORT; return -1; }
+    int result = nx_bsd_connect(fd, bsd_address, wire_length);
     // EINPROGRESS on a non-blocking connect is the NORMAL path (it is how both Wine's ws2_32 and
     // glibc's resolver connect), so do not log it as a failure.
-    if (r < 0 && errno != EINPROGRESS)
-        netlog("nx_net: connect fd=%d failed e=%d rc=0x%x\n", fd, errno, socketGetLastResult());
-    return r;
+    if (result < 0 && errno != EINPROGRESS)
+        net_log("nx_net: connect fd=%d failed e=%d rc=0x%x\n", fd, errno, socketGetLastResult());
+    return result;
 }
 
 int nx_net_listen(int fd, int backlog) {
     return nx_bsd_listen(fd, backlog);
 }
 
-int nx_net_accept4(int fd, void* l_addr, unsigned* l_len, int l_flags) {
-    if (l_len && nx_guest_buf_bad(l_addr, *l_len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned blen = sizeof b;
-    int nfd = nx_bsd_accept(fd, b, &blen);
-    if (nfd < 0) return -1;
-    if (blen >= 2 && addr_b2l(b, blen, l_addr, l_len) < 0) { close(nfd); return -1; }
-    if ((l_flags & L_SOCK_NONBLOCK) && nx_net_set_nonblock(nfd, 1) < 0) {
-        int e = errno; close(nfd); errno = e; return -1;
+int nx_net_accept4(int fd, void* linux_address, unsigned* linux_capacity, int linux_flags) {
+    if (linux_capacity && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned bsd_length = sizeof bsd_address;
+    int accepted_fd = nx_bsd_accept(fd, bsd_address, &bsd_length);
+    if (accepted_fd < 0) return -1;
+    nonblock_shadow_set(accepted_fd, 0);   // accepted sockets start blocking, per POSIX
+    if (bsd_length >= 2 &&
+        sockaddr_bsd_to_linux(bsd_address, bsd_length, linux_address, linux_capacity) < 0) {
+        close(accepted_fd); return -1;
     }
-    return nfd;
+    if ((linux_flags & LINUX_SOCK_NONBLOCK) && nx_net_set_nonblock(accepted_fd, 1) < 0) {
+        int saved_errno = errno; close(accepted_fd); errno = saved_errno; return -1;
+    }
+    return accepted_fd;
 }
 
-int nx_net_getsockname(int fd, void* l_addr, unsigned* l_len) {
-    if (l_len && nx_guest_buf_bad(l_addr, *l_len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned blen = sizeof b;
-    if (nx_bsd_getsockname(fd, b, &blen) < 0) return -1;
-    if (blen < 2) { errno = EINVAL; return -1; }
-    return addr_b2l(b, blen, l_addr, l_len);
+int nx_net_getsockname(int fd, void* linux_address, unsigned* linux_capacity) {
+    if (linux_capacity && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned bsd_length = sizeof bsd_address;
+    if (nx_bsd_getsockname(fd, bsd_address, &bsd_length) < 0) return -1;
+    if (bsd_length < 2) { errno = EINVAL; return -1; }
+    return sockaddr_bsd_to_linux(bsd_address, bsd_length, linux_address, linux_capacity);
 }
 
 // Distinct from getsockname: the M2.5 vfd layer aliased the two (harmless for AF_UNIX, where neither
 // end has a meaningful peer address), but for TCP the peer address is the whole point — Wine's
 // ws2_32 getpeername and glibc both rely on it.
-int nx_net_getpeername(int fd, void* l_addr, unsigned* l_len) {
-    if (l_len && nx_guest_buf_bad(l_addr, *l_len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned blen = sizeof b;
-    if (nx_bsd_getpeername(fd, b, &blen) < 0) return -1;
-    if (blen < 2) { errno = ENOTCONN; return -1; }
-    return addr_b2l(b, blen, l_addr, l_len);
+int nx_net_getpeername(int fd, void* linux_address, unsigned* linux_capacity) {
+    if (linux_capacity && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned bsd_length = sizeof bsd_address;
+    if (nx_bsd_getpeername(fd, bsd_address, &bsd_length) < 0) return -1;
+    if (bsd_length < 2) { errno = ENOTCONN; return -1; }
+    return sockaddr_bsd_to_linux(bsd_address, bsd_length, linux_address, linux_capacity);
 }
 
 // ---- send / receive ------------------------------------------------------------------------------
@@ -421,64 +506,67 @@ int nx_net_getpeername(int fd, void* l_addr, unsigned* l_len) {
 // MSG_* differ in nearly every bit position. Anything not listed is dropped rather than passed
 // through: an unrecognized flag reaching FreeBSD as a DIFFERENT flag is worse than not honoring it
 // (MSG_NOSIGNAL in particular has no BSD equivalent and is a no-op here — Horizon raises no SIGPIPE).
-static int msgflags_l2b(int l_flags) {
-    static const nx_map_t tbl[] = {
-        { L_MSG_OOB,       MSG_OOB       },   // 0x01 -> 0x01
-        { L_MSG_PEEK,      MSG_PEEK      },   // 0x02 -> 0x02
-        { L_MSG_DONTROUTE, MSG_DONTROUTE },   // 0x04 -> 0x04
-        { L_MSG_EOR,       MSG_EOR       },   // 0x80 -> 0x08
-        { L_MSG_TRUNC,     MSG_TRUNC     },   // 0x20 -> 0x10
-        { L_MSG_CTRUNC,    MSG_CTRUNC    },   // 0x08 -> 0x20
-        { L_MSG_WAITALL,   MSG_WAITALL   },   // 0x100 -> 0x40
-        { L_MSG_DONTWAIT,  MSG_DONTWAIT  },   // 0x40 -> 0x80
+static int msg_flags_linux_to_bsd(int linux_flags) {
+    static const nx_value_map table[] = {
+        { LINUX_MSG_OOB,       MSG_OOB       },   // 0x01 -> 0x01
+        { LINUX_MSG_PEEK,      MSG_PEEK      },   // 0x02 -> 0x02
+        { LINUX_MSG_DONTROUTE, MSG_DONTROUTE },   // 0x04 -> 0x04
+        { LINUX_MSG_EOR,       MSG_EOR       },   // 0x80 -> 0x08
+        { LINUX_MSG_TRUNC,     MSG_TRUNC     },   // 0x20 -> 0x10
+        { LINUX_MSG_CTRUNC,    MSG_CTRUNC    },   // 0x08 -> 0x20
+        { LINUX_MSG_WAITALL,   MSG_WAITALL   },   // 0x100 -> 0x40
+        { LINUX_MSG_DONTWAIT,  MSG_DONTWAIT  },   // 0x40 -> 0x80
     };
-    int b = 0;
-    for (int i = 0; i < NX_ARRAY_LEN(tbl); i++) if (l_flags & tbl[i].l) b |= tbl[i].b;
-    return b;
+    int bsd_flags = 0;
+    for (int i = 0; i < NX_ARRAY_LENGTH(table); i++)
+        if (linux_flags & table[i].linux_value) bsd_flags |= table[i].bsd_value;
+    return bsd_flags;
 }
 
-// Returned revents-style flags on recvmsg: only the two Linux cares about.
-static int msgflags_b2l(int b_flags) {
-    int l = 0;
-    if (b_flags & MSG_TRUNC)  l |= L_MSG_TRUNC;
-    if (b_flags & MSG_CTRUNC) l |= L_MSG_CTRUNC;
-    return l;
-}
-
-long nx_net_sendto(int fd, const void* buf, size_t len, int l_flags,
-                   const void* l_addr, unsigned l_alen) {
-    if (nx_guest_buf_bad(buf, len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned wire = 0;
-    if (l_addr && l_alen) {
-        if (nx_guest_buf_bad(l_addr, l_alen)) { errno = EFAULT; return -1; }
-        wire = addr_l2b(l_addr, l_alen, b);
-        if (!wire) { errno = EAFNOSUPPORT; return -1; }
+long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
+                   const void* linux_address, unsigned linux_address_length) {
+    if (nx_guest_buf_bad(buffer, length)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned wire_length = 0;
+    if (linux_address && linux_address_length) {
+        if (nx_guest_buf_bad(linux_address, linux_address_length)) { errno = EFAULT; return -1; }
+        wire_length = sockaddr_linux_to_bsd(linux_address, linux_address_length, bsd_address);
+        if (!wire_length) { errno = EAFNOSUPPORT; return -1; }
     }
-    return (long)nx_bsd_sendto(fd, buf, len, msgflags_l2b(l_flags), wire ? b : NULL, wire);
+    return (long)nx_bsd_sendto(fd, buffer, length, msg_flags_linux_to_bsd(linux_flags),
+                               wire_length ? bsd_address : NULL, wire_length);
 }
 
-long nx_net_recvfrom(int fd, void* buf, size_t len, int l_flags,
-                     void* l_addr, unsigned* l_alen) {
-    if (nx_guest_buf_bad(buf, len)) { errno = EFAULT; return -1; }
-    uint8_t b[NX_SA_MAX];
-    unsigned blen = sizeof b;
-    int want_addr = (l_addr && l_alen && *l_alen);
-    if (want_addr && nx_guest_buf_bad(l_addr, *l_alen)) { errno = EFAULT; return -1; }
-    long r = (long)nx_bsd_recvfrom(fd, buf, len, msgflags_l2b(l_flags),
-                                   want_addr ? b : NULL, want_addr ? &blen : NULL);
-    if (r < 0) return -1;
-    if (want_addr && blen >= 2) addr_b2l(b, blen, l_addr, l_alen);
-    else if (l_alen) *l_alen = 0;
-    return r;
+long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
+                     void* linux_address, unsigned* linux_capacity) {
+    if (nx_guest_buf_bad(buffer, length)) { errno = EFAULT; return -1; }
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned bsd_length = sizeof bsd_address;
+    int want_address = (linux_address && linux_capacity && *linux_capacity);
+    if (want_address && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
+    long received = (long)nx_bsd_recvfrom(fd, buffer, length, msg_flags_linux_to_bsd(linux_flags),
+                                          want_address ? bsd_address : NULL,
+                                          want_address ? &bsd_length : NULL);
+    if (received < 0) return -1;
+    if (want_address && bsd_length >= 2)
+        sockaddr_bsd_to_linux(bsd_address, bsd_length, linux_address, linux_capacity);
+    else if (linux_capacity) *linux_capacity = 0;
+    return received;
 }
 
 // Linux x86-64 layouts, mirroring the declarations in nx_vfd.c (the vfd layer owns the AF_UNIX side of
 // these same structs). NOT interchangeable with libnx's: BSD's msghdr is 48 bytes to Linux's 56
 // because msg_iovlen and msg_controllen are 32-bit there. Hence field-by-field, never a cast.
-typedef struct { void* base; size_t len; } l_iovec;
-typedef struct { void* name; unsigned namelen; l_iovec* iov; size_t iovlen;
-                 void* control; size_t controllen; int flags; } l_msghdr;
+typedef struct { void* base; size_t length; } linux_iovec;
+typedef struct {
+    void*        name;
+    unsigned     name_length;
+    linux_iovec* iov;
+    size_t       iov_count;
+    void*        control;
+    size_t       control_length;
+    int          flags;
+} linux_msghdr;
 
 // libnx exposes no devoptab sendmsg/recvmsg, so scatter/gather is done here around sendto/recvfrom.
 // A single-iovec message (the overwhelmingly common case, and what glibc's resolver emits) passes
@@ -486,143 +574,160 @@ typedef struct { void* name; unsigned namelen; l_iovec* iov; size_t iovlen;
 // MUST leave as one packet — looping sendto() per iovec would fragment one message into several.
 enum { NX_MSG_BOUNCE_MAX = 64 * 1024 };   // datagram ceiling; larger multi-iov sends report EMSGSIZE
 
-long nx_net_sendmsg(int fd, const void* l_msg, int l_flags) {
-    if (nx_guest_buf_bad(l_msg, sizeof(l_msghdr))) { errno = EFAULT; return -1; }
-    const l_msghdr* m = (const l_msghdr*)l_msg;
+long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
+    if (nx_guest_buf_bad(linux_message, sizeof(linux_msghdr))) { errno = EFAULT; return -1; }
+    const linux_msghdr* message = (const linux_msghdr*)linux_message;
     // Ancillary data over INET has no meaning here: SCM_RIGHTS is an AF_UNIX concept and the vfd layer
     // owns it. Ignore control rather than fail — Linux ignores unknown cmsgs on INET too.
-    if (m->iovlen == 0) return (long)nx_bsd_sendto(fd, "", 0, msgflags_l2b(l_flags), NULL, 0);
-    if (m->iovlen == 1)
-        return nx_net_sendto(fd, m->iov[0].base, m->iov[0].len, l_flags, m->name, m->namelen);
+    if (message->iov_count == 0)
+        return (long)nx_bsd_sendto(fd, "", 0, msg_flags_linux_to_bsd(linux_flags), NULL, 0);
+    if (message->iov_count == 1)
+        return nx_net_sendto(fd, message->iov[0].base, message->iov[0].length, linux_flags,
+                             message->name, message->name_length);
 
     size_t total = 0;
-    for (size_t i = 0; i < m->iovlen; i++) total += m->iov[i].len;
+    for (size_t i = 0; i < message->iov_count; i++) total += message->iov[i].length;
     if (total > NX_MSG_BOUNCE_MAX) { errno = EMSGSIZE; return -1; }
-    uint8_t* pack = (uint8_t*)malloc(total ? total : 1);
-    if (!pack) { errno = ENOMEM; return -1; }
-    size_t off = 0;
-    for (size_t i = 0; i < m->iovlen; i++) {
-        if (nx_guest_buf_bad(m->iov[i].base, m->iov[i].len)) { free(pack); errno = EFAULT; return -1; }
-        memcpy(pack + off, m->iov[i].base, m->iov[i].len);
-        off += m->iov[i].len;
+    uint8_t* packed = (uint8_t*)malloc(total ? total : 1);
+    if (!packed) { errno = ENOMEM; return -1; }
+    size_t offset = 0;
+    for (size_t i = 0; i < message->iov_count; i++) {
+        if (nx_guest_buf_bad(message->iov[i].base, message->iov[i].length)) {
+            free(packed); errno = EFAULT; return -1;
+        }
+        memcpy(packed + offset, message->iov[i].base, message->iov[i].length);
+        offset += message->iov[i].length;
     }
-    long r = nx_net_sendto(fd, pack, total, l_flags, m->name, m->namelen);
-    int e = errno;
-    free(pack);
-    errno = e;
-    return r;
+    long sent = nx_net_sendto(fd, packed, total, linux_flags, message->name, message->name_length);
+    int saved_errno = errno;
+    free(packed);
+    errno = saved_errno;
+    return sent;
 }
 
-long nx_net_recvmsg(int fd, void* l_msg, int l_flags) {
-    if (nx_guest_buf_bad(l_msg, sizeof(l_msghdr))) { errno = EFAULT; return -1; }
-    l_msghdr* m = (l_msghdr*)l_msg;
-    m->controllen = 0;                       // no ancillary data is ever produced on an INET socket
-    if (m->iovlen == 0) { m->flags = 0; return 0; }
-    if (m->iovlen == 1) {
-        unsigned nlen = m->namelen;
-        long r = nx_net_recvfrom(fd, m->iov[0].base, m->iov[0].len, l_flags,
-                                 m->name, m->name ? &nlen : NULL);
-        if (r >= 0) { m->namelen = m->name ? nlen : 0; m->flags = 0; }
-        return r;
+long nx_net_recvmsg(int fd, void* linux_message, int linux_flags) {
+    if (nx_guest_buf_bad(linux_message, sizeof(linux_msghdr))) { errno = EFAULT; return -1; }
+    linux_msghdr* message = (linux_msghdr*)linux_message;
+    message->control_length = 0;   // no ancillary data is ever produced on an INET socket
+    if (message->iov_count == 0) { message->flags = 0; return 0; }
+    if (message->iov_count == 1) {
+        unsigned name_capacity = message->name_length;
+        long received = nx_net_recvfrom(fd, message->iov[0].base, message->iov[0].length, linux_flags,
+                                        message->name, message->name ? &name_capacity : NULL);
+        if (received >= 0) {
+            message->name_length = message->name ? name_capacity : 0;
+            message->flags = 0;
+        }
+        return received;
     }
     // Multi-iovec: receive the whole datagram once into a bounce buffer, then scatter. Reading per
     // iovec would consume one datagram per call and drop the remainder of each.
     size_t total = 0;
-    for (size_t i = 0; i < m->iovlen; i++) total += m->iov[i].len;
+    for (size_t i = 0; i < message->iov_count; i++) total += message->iov[i].length;
     if (total > NX_MSG_BOUNCE_MAX) total = NX_MSG_BOUNCE_MAX;
-    uint8_t* pack = (uint8_t*)malloc(total ? total : 1);
-    if (!pack) { errno = ENOMEM; return -1; }
-    unsigned nlen = m->namelen;
-    long r = nx_net_recvfrom(fd, pack, total, l_flags, m->name, m->name ? &nlen : NULL);
-    if (r < 0) { int e = errno; free(pack); errno = e; return -1; }
-    size_t off = 0;
-    for (size_t i = 0; i < m->iovlen && off < (size_t)r; i++) {
-        size_t chunk = m->iov[i].len;
-        if (chunk > (size_t)r - off) chunk = (size_t)r - off;
-        if (nx_guest_buf_bad(m->iov[i].base, chunk)) { free(pack); errno = EFAULT; return -1; }
-        memcpy(m->iov[i].base, pack + off, chunk);
-        off += chunk;
+    uint8_t* packed = (uint8_t*)malloc(total ? total : 1);
+    if (!packed) { errno = ENOMEM; return -1; }
+    unsigned name_capacity = message->name_length;
+    long received = nx_net_recvfrom(fd, packed, total, linux_flags,
+                                    message->name, message->name ? &name_capacity : NULL);
+    if (received < 0) { int saved_errno = errno; free(packed); errno = saved_errno; return -1; }
+    size_t offset = 0;
+    for (size_t i = 0; i < message->iov_count && offset < (size_t)received; i++) {
+        size_t chunk = message->iov[i].length;
+        if (chunk > (size_t)received - offset) chunk = (size_t)received - offset;
+        if (nx_guest_buf_bad(message->iov[i].base, chunk)) { free(packed); errno = EFAULT; return -1; }
+        memcpy(message->iov[i].base, packed + offset, chunk);
+        offset += chunk;
     }
-    free(pack);
-    m->namelen = m->name ? nlen : 0;
-    m->flags   = 0;
-    return r;
+    free(packed);
+    message->name_length = message->name ? name_capacity : 0;
+    message->flags       = 0;
+    return received;
 }
 
 // ---- socket options ------------------------------------------------------------------------------
 
-static const nx_map_t g_so_tbl[] = {          // SOL_SOCKET (Linux 1 -> BSD 0xffff)
-    { L_SO_DEBUG,      SO_DEBUG      },   { L_SO_REUSEADDR, SO_REUSEADDR },
-    { L_SO_TYPE,       SO_TYPE       },   { L_SO_ERROR,     SO_ERROR     },
-    { L_SO_DONTROUTE,  SO_DONTROUTE  },   { L_SO_BROADCAST, SO_BROADCAST },
-    { L_SO_SNDBUF,     SO_SNDBUF     },   { L_SO_RCVBUF,    SO_RCVBUF    },
-    { L_SO_KEEPALIVE,  SO_KEEPALIVE  },   { L_SO_OOBINLINE, SO_OOBINLINE },
-    { L_SO_LINGER,     SO_LINGER     },   { L_SO_REUSEPORT, SO_REUSEPORT },
-    { L_SO_RCVLOWAT,   SO_RCVLOWAT   },   { L_SO_SNDLOWAT,  SO_SNDLOWAT  },
-    { L_SO_RCVTIMEO,   SO_RCVTIMEO   },   { L_SO_SNDTIMEO,  SO_SNDTIMEO  },
-    { L_SO_ACCEPTCONN, SO_ACCEPTCONN },
+static const nx_value_map g_socket_option_map[] = {          // SOL_SOCKET (Linux 1 -> BSD 0xffff)
+    { LINUX_SO_DEBUG,      SO_DEBUG      },   { LINUX_SO_REUSEADDR, SO_REUSEADDR },
+    { LINUX_SO_TYPE,       SO_TYPE       },   { LINUX_SO_ERROR,     SO_ERROR     },
+    { LINUX_SO_DONTROUTE,  SO_DONTROUTE  },   { LINUX_SO_BROADCAST, SO_BROADCAST },
+    { LINUX_SO_SNDBUF,     SO_SNDBUF     },   { LINUX_SO_RCVBUF,    SO_RCVBUF    },
+    { LINUX_SO_KEEPALIVE,  SO_KEEPALIVE  },   { LINUX_SO_OOBINLINE, SO_OOBINLINE },
+    { LINUX_SO_LINGER,     SO_LINGER     },   { LINUX_SO_REUSEPORT, SO_REUSEPORT },
+    { LINUX_SO_RCVLOWAT,   SO_RCVLOWAT   },   { LINUX_SO_SNDLOWAT,  SO_SNDLOWAT  },
+    { LINUX_SO_RCVTIMEO,   SO_RCVTIMEO   },   { LINUX_SO_SNDTIMEO,  SO_SNDTIMEO  },
+    { LINUX_SO_ACCEPTCONN, SO_ACCEPTCONN },
 };
 
-static const nx_map_t g_ip_tbl[] = {          // IPPROTO_IP (0 in both)
-    { L_IP_TOS,              IP_TOS              }, { L_IP_TTL,             IP_TTL             },
-    { L_IP_HDRINCL,          IP_HDRINCL          }, { L_IP_OPTIONS,         IP_OPTIONS         },
-    { L_IP_MULTICAST_IF,     IP_MULTICAST_IF     }, { L_IP_MULTICAST_TTL,   IP_MULTICAST_TTL   },
-    { L_IP_MULTICAST_LOOP,   IP_MULTICAST_LOOP   }, { L_IP_ADD_MEMBERSHIP,  IP_ADD_MEMBERSHIP  },
-    { L_IP_DROP_MEMBERSHIP,  IP_DROP_MEMBERSHIP  },
+static const nx_value_map g_ip_option_map[] = {              // IPPROTO_IP (0 in both)
+    { LINUX_IP_TOS,             IP_TOS             }, { LINUX_IP_TTL,            IP_TTL            },
+    { LINUX_IP_HDRINCL,         IP_HDRINCL         }, { LINUX_IP_OPTIONS,        IP_OPTIONS        },
+    { LINUX_IP_MULTICAST_IF,    IP_MULTICAST_IF    }, { LINUX_IP_MULTICAST_TTL,  IP_MULTICAST_TTL  },
+    { LINUX_IP_MULTICAST_LOOP,  IP_MULTICAST_LOOP  }, { LINUX_IP_ADD_MEMBERSHIP, IP_ADD_MEMBERSHIP },
+    { LINUX_IP_DROP_MEMBERSHIP, IP_DROP_MEMBERSHIP },
 };
 
-static const nx_map_t g_ip6_tbl[] = {         // IPPROTO_IPV6 (41 in both)
-    { L_IPV6_UNICAST_HOPS,   IPV6_UNICAST_HOPS   }, { L_IPV6_MULTICAST_IF,   IPV6_MULTICAST_IF   },
-    { L_IPV6_MULTICAST_HOPS, IPV6_MULTICAST_HOPS }, { L_IPV6_MULTICAST_LOOP, IPV6_MULTICAST_LOOP },
-    { L_IPV6_JOIN_GROUP,     IPV6_JOIN_GROUP     }, { L_IPV6_LEAVE_GROUP,    IPV6_LEAVE_GROUP    },
-    { L_IPV6_V6ONLY,         IPV6_V6ONLY         },
+static const nx_value_map g_ipv6_option_map[] = {            // IPPROTO_IPV6 (41 in both)
+    { LINUX_IPV6_UNICAST_HOPS,   IPV6_UNICAST_HOPS   },
+    { LINUX_IPV6_MULTICAST_IF,   IPV6_MULTICAST_IF   },
+    { LINUX_IPV6_MULTICAST_HOPS, IPV6_MULTICAST_HOPS },
+    { LINUX_IPV6_MULTICAST_LOOP, IPV6_MULTICAST_LOOP },
+    { LINUX_IPV6_JOIN_GROUP,     IPV6_JOIN_GROUP     },
+    { LINUX_IPV6_LEAVE_GROUP,    IPV6_LEAVE_GROUP    },
+    { LINUX_IPV6_V6ONLY,         IPV6_V6ONLY         },
 };
 
-// Resolve a (level, optname) pair. Returns 0 on success. An UNKNOWN option is refused with
-// ENOPROTOOPT rather than passed through: the two ABIs reuse each other's numbers for different
-// options, so a pass-through would silently configure the wrong one.
-static int sockopt_l2b(int l_level, int l_opt, int* b_level, int* b_opt) {
-    const nx_map_t* tbl; int n;
-    switch (l_level) {
-        case L_SOL_SOCKET:   *b_level = SOL_SOCKET;    tbl = g_so_tbl;  n = NX_ARRAY_LEN(g_so_tbl);  break;
-        case L_IPPROTO_IP:   *b_level = IPPROTO_IP;    tbl = g_ip_tbl;  n = NX_ARRAY_LEN(g_ip_tbl);  break;
-        case L_IPPROTO_IPV6: *b_level = IPPROTO_IPV6;  tbl = g_ip6_tbl; n = NX_ARRAY_LEN(g_ip6_tbl); break;
-        case L_IPPROTO_TCP:  *b_level = IPPROTO_TCP;                  // TCP_NODELAY is 1 either way
-                             if (l_opt != L_TCP_NODELAY) { errno = ENOPROTOOPT; return -1; }
-                             *b_opt = l_opt; return 0;
+// Resolve a (level, option) pair. Returns 0 on success. An UNKNOWN option is refused with ENOPROTOOPT
+// rather than passed through: the two ABIs reuse each other's numbers for different options, so a
+// pass-through would silently configure the wrong one.
+static int sockopt_linux_to_bsd(int linux_level, int linux_option,
+                                int* bsd_level, int* bsd_option) {
+    const nx_value_map* table; int count;
+    switch (linux_level) {
+        case LINUX_SOL_SOCKET:
+            *bsd_level = SOL_SOCKET;   table = g_socket_option_map; count = NX_ARRAY_LENGTH(g_socket_option_map); break;
+        case LINUX_IPPROTO_IP:
+            *bsd_level = IPPROTO_IP;   table = g_ip_option_map;     count = NX_ARRAY_LENGTH(g_ip_option_map);     break;
+        case LINUX_IPPROTO_IPV6:
+            *bsd_level = IPPROTO_IPV6; table = g_ipv6_option_map;   count = NX_ARRAY_LENGTH(g_ipv6_option_map);   break;
+        case LINUX_IPPROTO_TCP:
+            *bsd_level = IPPROTO_TCP;                             // TCP_NODELAY is 1 either way
+            if (linux_option != LINUX_TCP_NODELAY) { errno = ENOPROTOOPT; return -1; }
+            *bsd_option = linux_option;
+            return 0;
         default: errno = ENOPROTOOPT; return -1;
     }
-    int b = map_l2b(tbl, n, l_opt, -1);
-    if (b < 0) { errno = ENOPROTOOPT; return -1; }
-    *b_opt = b;
+    int mapped = map_linux_to_bsd(table, count, linux_option, -1);
+    if (mapped < 0) { errno = ENOPROTOOPT; return -1; }
+    *bsd_option = mapped;
     return 0;
 }
 
-// Linux struct timeval is {long tv_sec; long tv_usec} — same as BSD's on aarch64/64-bit, so SO_*TIMEO
-// payloads pass through. SO_LINGER is {int l_onoff; int l_linger} in both. The only payload that could
-// need renumbering is SO_ERROR, and it does not: libnx's own source notes that Nintendo built their
-// FreeBSD stack with LINUX errno values, so the errno SO_ERROR reports is already what the guest
-// expects. (Flagged as an open risk — the net.c gate's non-blocking-connect section checks it.)
-int nx_net_getsockopt(int fd, int l_level, int l_opt, void* val, unsigned* len) {
-    if (len && nx_guest_buf_bad(val, *len)) { errno = EFAULT; return -1; }
-    int b_level, b_opt;
-    if (sockopt_l2b(l_level, l_opt, &b_level, &b_opt) < 0) return -1;
-    int r = nx_bsd_getsockopt(fd, b_level, b_opt, val, len);
+// Linux struct timeval is {long tv_sec; long tv_usec} — same as BSD's on 64-bit, so SO_*TIMEO payloads
+// pass through. SO_LINGER is {int l_onoff; int l_linger} in both. The only payload that could need
+// renumbering is SO_ERROR, and it does not: libnx's own source notes that Nintendo built their FreeBSD
+// stack with LINUX errno values, so the errno SO_ERROR reports is already what the guest expects.
+// (Flagged as an open risk — the net.c gate's non-blocking-connect section checks it.)
+int nx_net_getsockopt(int fd, int linux_level, int linux_option, void* value, unsigned* value_length) {
+    if (value_length && nx_guest_buf_bad(value, *value_length)) { errno = EFAULT; return -1; }
+    int bsd_level, bsd_option;
+    if (sockopt_linux_to_bsd(linux_level, linux_option, &bsd_level, &bsd_option) < 0) return -1;
+    int result = nx_bsd_getsockopt(fd, bsd_level, bsd_option, value, value_length);
     // SO_TYPE reports a socket type, which IS renumbered between the ABIs for anything but
     // STREAM/DGRAM/RAW (1/2/3 are identical), so the common cases need no fixup.
-    if (r < 0) netlog("nx_net: getsockopt fd=%d lvl=%d opt=%d failed e=%d rc=0x%x\n",
-                      fd, l_level, l_opt, errno, socketGetLastResult());
-    return r;
+    if (result < 0) net_log("nx_net: getsockopt fd=%d level=%d option=%d failed e=%d rc=0x%x\n",
+                            fd, linux_level, linux_option, errno, socketGetLastResult());
+    return result;
 }
 
-int nx_net_setsockopt(int fd, int l_level, int l_opt, const void* val, unsigned len) {
-    if (nx_guest_buf_bad(val, len)) { errno = EFAULT; return -1; }
-    int b_level, b_opt;
-    if (sockopt_l2b(l_level, l_opt, &b_level, &b_opt) < 0) return -1;
-    int r = nx_bsd_setsockopt(fd, b_level, b_opt, val, len);
-    if (r < 0) netlog("nx_net: setsockopt fd=%d lvl=%d opt=%d failed e=%d rc=0x%x\n",
-                      fd, l_level, l_opt, errno, socketGetLastResult());
-    return r;
+int nx_net_setsockopt(int fd, int linux_level, int linux_option, const void* value, unsigned value_length) {
+    if (nx_guest_buf_bad(value, value_length)) { errno = EFAULT; return -1; }
+    int bsd_level, bsd_option;
+    if (sockopt_linux_to_bsd(linux_level, linux_option, &bsd_level, &bsd_option) < 0) return -1;
+    int result = nx_bsd_setsockopt(fd, bsd_level, bsd_option, value, value_length);
+    if (result < 0) net_log("nx_net: setsockopt fd=%d level=%d option=%d failed e=%d rc=0x%x\n",
+                            fd, linux_level, linux_option, errno, socketGetLastResult());
+    return result;
 }
 
 // ---- ioctl / fcntl / shutdown --------------------------------------------------------------------
@@ -633,19 +738,59 @@ int nx_net_shutdown(int fd, int how) {
     return nx_bsd_shutdown(fd, how);
 }
 
+// Scratch size for the MSG_PEEK fallback when bsd:u has no FIONREAD ioctl. Thread-local rather than
+// stack-allocated: FIONREAD can be called from any guest thread and 64 KiB is far too much stack.
+enum { NX_FIONREAD_PEEK_MAX = 64 * 1024 };
+
+// How many bytes can be read right now. Three routes, in decreasing order of fidelity, because bsd:u
+// implementations differ in what they support:
+//   1. the FIONREAD ioctl — exact, and what a real FreeBSD stack answers;
+//   2. a non-blocking MSG_PEEK — the same question asked a different way. Semantics stay close to
+//      Linux: on UDP a peek reports the first datagram's size, which is what Linux FIONREAD returns
+//      too; on TCP the answer is capped at the scratch buffer, so a caller sizing a read gets a valid
+//      if conservative number;
+//   3. report ZERO. Reached only when the stack supports NEITHER (Ryujinx's HLE bsd rejects the ioctl
+//      with "Unsupported Ioctl Cmd" AND has no MSG_PEEK). Zero is the conservative truth — "no bytes
+//      are known to be queued" — and a caller then polls or reads as it would anyway. This does NOT
+//      violate the never-fake-an-ioctl rule from nx_vfd.c: that rule is about UNKNOWN ioctls used by
+//      Wine to CLASSIFY an fd, where a faked success causes misclassification. FIONREAD is a known,
+//      supported operation on a socket and is a data-availability query, so failing it outright is
+//      the worse answer.
+static int fionread_bytes_available(int fd, int* out_bytes) {
+    if (nx_bsd_ioctl(fd, BSD_FIONREAD, out_bytes) == 0) return 0;
+    net_log("nx_net: FIONREAD ioctl fd=%d e=%d rc=0x%x -> MSG_PEEK fallback\n",
+            fd, errno, socketGetLastResult());
+    if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) return -1;
+
+    static __thread uint8_t peek_buffer[NX_FIONREAD_PEEK_MAX];
+    uint8_t bsd_address[NX_SOCKADDR_MAX];
+    unsigned bsd_length = sizeof bsd_address;
+    // recvfrom, NOT recv: an UNCONNECTED socket (a fresh TCP fd, or a UDP fd that was only bound)
+    // rejects recv() with ENOTCONN on any POSIX stack. recvfrom works on both.
+    ssize_t peeked = nx_bsd_recvfrom(fd, peek_buffer, sizeof peek_buffer,
+                                     MSG_PEEK | MSG_DONTWAIT, bsd_address, &bsd_length);
+    if (peeked >= 0) { *out_bytes = (int)peeked; return 0; }
+
+    net_log("nx_net: FIONREAD peek fd=%d e=%d rc=0x%x\n", fd, errno, socketGetLastResult());
+    // Nothing queued (EAGAIN) and not-yet-connected (ENOTCONN) both mean zero readable bytes, which is
+    // exactly what Linux FIONREAD reports for those states. EOPNOTSUPP means the stack has no
+    // MSG_PEEK either — route 3.
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN ||
+        errno == EOPNOTSUPP || errno == ENOSYS) { *out_bytes = 0; return 0; }
+    return -1;
+}
+
 // Only the two ioctls that mean something on a socket are honored. Everything else returns ENOTTY,
 // per the standing rule (nx_vfd.c): Wine PROBES fds with terminal/ext-flag/readdir ioctls and a faked
 // success either livelocks it or makes it misclassify the fd as a console.
-int nx_net_ioctl(int fd, unsigned long l_req, void* arg) {
-    switch (l_req) {
-        case L_FIONBIO: {
-            if (nx_guest_buf_bad(arg, sizeof(int))) { errno = EFAULT; return -1; }
-            return nx_net_set_nonblock(fd, *(const int*)arg != 0);
-        }
-        case L_FIONREAD: {
-            if (nx_guest_buf_bad(arg, sizeof(int))) { errno = EFAULT; return -1; }
-            return nx_bsd_ioctl(fd, B_FIONREAD, arg);
-        }
+int nx_net_ioctl(int fd, unsigned long linux_request, void* argument) {
+    switch (linux_request) {
+        case LINUX_FIONBIO:
+            if (nx_guest_buf_bad(argument, sizeof(int))) { errno = EFAULT; return -1; }
+            return nx_net_set_nonblock(fd, *(const int*)argument != 0);
+        case LINUX_FIONREAD:
+            if (nx_guest_buf_bad(argument, sizeof(int))) { errno = EFAULT; return -1; }
+            return fionread_bytes_available(fd, (int*)argument);
         default:
             errno = ENOTTY;
             return -1;
@@ -653,51 +798,81 @@ int nx_net_ioctl(int fd, unsigned long l_req, void* arg) {
 }
 
 // fcntl on a socket: Horizon's bsd supports exactly O_NONBLOCK, so the flag word is rebuilt in LINUX
-// numbering rather than forwarded. An unknown cmd must not be forwarded either — libnx's fcntl returns
-// a POSITIVE EOPNOTSUPP (not -1) for those, which a caller checking `< 0` reads as success.
-enum { NX_L_F_GETFD = 1, NX_L_F_SETFD = 2, NX_L_F_GETFL = 3, NX_L_F_SETFL = 4 };
+// numbering rather than forwarded. An unknown command must not be forwarded either — libnx's fcntl
+// returns a POSITIVE EOPNOTSUPP (not -1) for those, which a caller checking `< 0` reads as success.
+enum { LINUX_F_GETFD = 1, LINUX_F_SETFD = 2, LINUX_F_GETFL = 3, LINUX_F_SETFL = 4 };
+
+long nx_net_fcntl(int fd, int command, long argument) {
+    switch (command) {
+        case LINUX_F_GETFD: return 0;
+        case LINUX_F_SETFD: return 0;                      // FD_CLOEXEC — no exec on Horizon
+        case LINUX_F_GETFL: {
+            int nonblocking = nx_net_get_nonblock(fd);
+            if (nonblocking < 0) return -1;
+            return 2 /*O_RDWR*/ | (nonblocking ? LINUX_O_NONBLOCK : 0);
+        }
+        case LINUX_F_SETFL:
+            return nx_net_set_nonblock(fd, (argument & LINUX_O_NONBLOCK) ? 1 : 0);
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
 
 // ---- DNS configuration ---------------------------------------------------------------------------
 
 // Fallback nameserver when nifm has none to offer (no link, or nifm itself unavailable). A wrong
 // answer here is harmless — the resolver simply times out — whereas an EMPTY resolv.conf makes glibc
 // fall back to 127.0.0.1:53, where nothing is listening, and the failure looks like a socket bug.
-#define NX_NET_FALLBACK_DNS "8.8.8.8"
+#define NX_NET_FALLBACK_NAMESERVER "8.8.8.8"
 
 int nx_net_link_up(void) {
-    if (!g_nifm_ok) return 0;
-    NifmInternetConnectionType type = 0;
-    NifmInternetConnectionStatus status = 0;
-    u32 strength = 0;
-    if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) return 0;
-    return status == NifmInternetConnectionStatus_Connected;
+    if (!g_network_info_ready) return 0;
+    NifmInternetConnectionType connection_type = 0;
+    NifmInternetConnectionStatus connection_status = 0;
+    u32 wifi_strength = 0;
+    if (R_FAILED(nifmGetInternetConnectionStatus(&connection_type, &wifi_strength, &connection_status)))
+        return 0;
+    return connection_status == NifmInternetConnectionStatus_Connected;
 }
 
-// Render /etc/resolv.conf into `buf`; returns the byte count written.
+// Render /etc/resolv.conf into `buffer`; returns the byte count written.
 //
 // `options single-request` matters: without it glibc's resolver sends the A and AAAA queries in
 // PARALLEL on one socket, and modern glibc reaches for sendmmsg(2) to do it — which box64-nx does not
 // route (it is in neither the scwrap table nor nx_x64_precase, so it ENOSYSes). single-request makes
 // the resolver issue them sequentially with ordinary sendto/recvfrom, which is exactly the path this
 // module implements.
-int nx_net_resolv_conf(char* buf, size_t cap) {
-    u32 addr = 0, mask = 0, gw = 0, dns1 = 0, dns2 = 0;
-    int have = 0;
-    if (g_nifm_ok && R_SUCCEEDED(nifmGetCurrentIpConfigInfo(&addr, &mask, &gw, &dns1, &dns2)))
-        have = 1;
+int nx_net_resolv_conf(char* buffer, size_t capacity) {
+    u32 host_address = 0, subnet_mask = 0, gateway = 0, primary_nameserver = 0, secondary_nameserver = 0;
+    int have_config = 0;
+    if (g_network_info_ready &&
+        R_SUCCEEDED(nifmGetCurrentIpConfigInfo(&host_address, &subnet_mask, &gateway,
+                                               &primary_nameserver, &secondary_nameserver)))
+        have_config = 1;
 
-    int n = 0;
-    // Horizon reports these as host-order u32; print octets explicitly rather than going through
+    int written = 0;
+    // Horizon reports these as host-order u32; print the octets explicitly rather than going through
     // inet_ntoa, which would pull in another libnx symbol for no benefit.
-    #define NX_DNS_OCTETS(v) (unsigned)(((v) >> 24) & 0xff), (unsigned)(((v) >> 16) & 0xff), \
-                             (unsigned)(((v) >>  8) & 0xff), (unsigned)((v) & 0xff)
-    if (have && dns1) n += snprintf(buf + n, cap - (size_t)n, "nameserver %u.%u.%u.%u\n", NX_DNS_OCTETS(dns1));
-    if (have && dns2) n += snprintf(buf + n, cap - (size_t)n, "nameserver %u.%u.%u.%u\n", NX_DNS_OCTETS(dns2));
-    if (!n)           n += snprintf(buf + n, cap - (size_t)n, "nameserver " NX_NET_FALLBACK_DNS "\n");
-    n += snprintf(buf + n, cap - (size_t)n, "options single-request timeout:5 attempts:2\n");
-    #undef NX_DNS_OCTETS
-    netlog("nx_net: resolv.conf nifm=%d dns1=0x%x dns2=0x%x\n", g_nifm_ok, dns1, dns2);
-    return n;
+    #define NX_ADDRESS_OCTETS(address) (unsigned)(((address) >> 24) & 0xff), \
+                                       (unsigned)(((address) >> 16) & 0xff), \
+                                       (unsigned)(((address) >>  8) & 0xff), \
+                                       (unsigned)( (address)        & 0xff)
+    if (have_config && primary_nameserver)
+        written += snprintf(buffer + written, capacity - (size_t)written,
+                            "nameserver %u.%u.%u.%u\n", NX_ADDRESS_OCTETS(primary_nameserver));
+    if (have_config && secondary_nameserver)
+        written += snprintf(buffer + written, capacity - (size_t)written,
+                            "nameserver %u.%u.%u.%u\n", NX_ADDRESS_OCTETS(secondary_nameserver));
+    if (!written)
+        written += snprintf(buffer + written, capacity - (size_t)written,
+                            "nameserver " NX_NET_FALLBACK_NAMESERVER "\n");
+    written += snprintf(buffer + written, capacity - (size_t)written,
+                        "options single-request timeout:5 attempts:2\n");
+    #undef NX_ADDRESS_OCTETS
+    net_log("nx_net: resolv.conf nifm=%d dns1=0x%x dns2=0x%x\n",
+            g_network_info_ready, primary_nameserver, secondary_nameserver);
+    return written;
 }
 
 // ---- poll ----------------------------------------------------------------------------------------
@@ -708,31 +883,32 @@ int nx_net_resolv_conf(char* buf, size_t cap) {
 //   Linux POLLWRBAND 0x200 == nothing in BSD
 // BSD has no separate POLLWRNORM at all — it is an alias of POLLOUT.
 enum {
-    NX_POLL_SHARED     = 0x0FF,   // IN|PRI|OUT|ERR|HUP|NVAL|RDNORM|RDBAND — same value both sides
-    L_POLLOUT          = 0x004,
-    L_POLLNVAL         = 0x020,
-    L_POLLWRNORM       = 0x100,
-    L_POLLWRBAND       = 0x200,
-    B_POLLOUT          = 0x004,
-    B_POLLWRBAND       = 0x100,
+    NX_POLL_SHARED_BITS = 0x0FF,   // IN|PRI|OUT|ERR|HUP|NVAL|RDNORM|RDBAND — same value both sides
+    LINUX_POLLOUT       = 0x004,
+    LINUX_POLLNVAL      = 0x020,
+    LINUX_POLLWRNORM    = 0x100,
+    LINUX_POLLWRBAND    = 0x200,
+    BSD_POLLOUT         = 0x004,
+    BSD_POLLWRBAND      = 0x100,
 };
 
 typedef struct { int fd; short events; short revents; } nx_pollfd;   // identical layout in both ABIs
 
-static short pollev_l2b(short l) {
-    short b = (short)(l & NX_POLL_SHARED);
-    if (l & L_POLLWRNORM) b |= B_POLLOUT;       // NOT a pass-through: 0x100 means WRBAND to BSD
-    if (l & L_POLLWRBAND) b |= B_POLLWRBAND;
-    return b;
+static short poll_events_linux_to_bsd(short linux_events) {
+    short bsd_events = (short)(linux_events & NX_POLL_SHARED_BITS);
+    if (linux_events & LINUX_POLLWRNORM) bsd_events |= BSD_POLLOUT;   // NOT a pass-through: 0x100
+    if (linux_events & LINUX_POLLWRBAND) bsd_events |= BSD_POLLWRBAND;   //  means WRBAND to BSD
+    return bsd_events;
 }
 
-static short pollev_b2l(short b, short l_events) {
-    short l = (short)(b & NX_POLL_SHARED);
-    if (b & B_POLLWRBAND) l |= L_POLLWRBAND;
+static short poll_revents_bsd_to_linux(short bsd_revents, short linux_events) {
+    short linux_revents = (short)(bsd_revents & NX_POLL_SHARED_BITS);
+    if (bsd_revents & BSD_POLLWRBAND) linux_revents |= LINUX_POLLWRBAND;
     // Linux reports POLLWRNORM alongside POLLOUT on a writable socket; mirror it only when the caller
     // asked, so revents stays a subset of events (plus the always-reported ERR/HUP/NVAL).
-    if ((b & B_POLLOUT) && (l_events & L_POLLWRNORM)) l |= L_POLLWRNORM;
-    return l;
+    if ((bsd_revents & BSD_POLLOUT) && (linux_events & LINUX_POLLWRNORM))
+        linux_revents |= LINUX_POLLWRNORM;
+    return linux_revents;
 }
 
 enum { NX_POLL_STACK_FDS = 64 };   // sockets polled without a heap allocation; beyond this, malloc
@@ -744,70 +920,60 @@ enum { NX_POLL_STACK_FDS = 64 };   // sockets polled without a heap allocation; 
 // call with ENOTSOCK on the first non-socket fd it sees (so a mixed set must be compacted to sockets
 // only), and its pollfd bit values differ from the guest's (above). A compact sub-array plus an index
 // map solves both.
-int nx_net_poll(void* l_pfds, unsigned long n, int timeout_ms, int* out_has_socket) {
-    nx_pollfd* pf = (nx_pollfd*)l_pfds;
+int nx_net_poll(void* linux_pollfds, unsigned long count, int timeout_ms, int* out_has_socket) {
+    nx_pollfd* guest_fds = (nx_pollfd*)linux_pollfds;
     if (out_has_socket) *out_has_socket = 0;
-    if (!g_net_ok || !pf || !n) return 0;
+    if (!g_socket_ready || !guest_fds || !count) return 0;
 
-    int stack_idx[NX_POLL_STACK_FDS];
-    nx_pollfd stack_sub[NX_POLL_STACK_FDS];
-    int* idx = stack_idx;
-    nx_pollfd* sub = stack_sub;
-    int* heap_idx = NULL;
-    nx_pollfd* heap_sub = NULL;
-    if (n > NX_POLL_STACK_FDS) {
-        heap_idx = (int*)malloc(n * sizeof *heap_idx);
-        heap_sub = (nx_pollfd*)malloc(n * sizeof *heap_sub);
-        if (!heap_idx || !heap_sub) { free(heap_idx); free(heap_sub); errno = ENOMEM; return -1; }
-        idx = heap_idx; sub = heap_sub;
+    int        stack_index_map[NX_POLL_STACK_FDS];
+    nx_pollfd  stack_socket_fds[NX_POLL_STACK_FDS];
+    int*       index_map      = stack_index_map;
+    nx_pollfd* socket_fds     = stack_socket_fds;
+    int*       heap_index_map = NULL;
+    nx_pollfd* heap_socket_fds = NULL;
+    if (count > NX_POLL_STACK_FDS) {
+        heap_index_map  = (int*)malloc(count * sizeof *heap_index_map);
+        heap_socket_fds = (nx_pollfd*)malloc(count * sizeof *heap_socket_fds);
+        if (!heap_index_map || !heap_socket_fds) {
+            free(heap_index_map); free(heap_socket_fds); errno = ENOMEM; return -1;
+        }
+        index_map = heap_index_map; socket_fds = heap_socket_fds;
     }
 
-    unsigned nsub = 0;
-    for (unsigned long i = 0; i < n; i++) {
-        if (pf[i].fd < 0 || !nx_net_is_socket(pf[i].fd)) continue;
-        idx[nsub] = (int)i;
-        sub[nsub].fd      = pf[i].fd;
-        sub[nsub].events  = pollev_l2b(pf[i].events);
-        sub[nsub].revents = 0;
-        nsub++;
+    unsigned socket_count = 0;
+    for (unsigned long i = 0; i < count; i++) {
+        if (guest_fds[i].fd < 0 || !nx_net_is_socket(guest_fds[i].fd)) continue;
+        index_map[socket_count]           = (int)i;
+        socket_fds[socket_count].fd       = guest_fds[i].fd;
+        socket_fds[socket_count].events   = poll_events_linux_to_bsd(guest_fds[i].events);
+        socket_fds[socket_count].revents  = 0;
+        socket_count++;
     }
-    if (out_has_socket) *out_has_socket = nsub != 0;
+    if (out_has_socket) *out_has_socket = socket_count != 0;
 
-    int ready = 0;
-    if (nsub) {
-        int r = nx_bsd_poll(sub, nsub, timeout_ms);
-        if (r < 0) {
+    int ready_count = 0;
+    if (socket_count) {
+        int result = nx_bsd_poll(socket_fds, socket_count, timeout_ms);
+        if (result < 0) {
             // A failed poll must not look like "nothing ready forever" — mark the sockets POLLNVAL so
             // the caller's loop terminates instead of spinning on a set it can never satisfy.
-            netlog("nx_net: poll(n=%u) failed e=%d rc=0x%x\n", nsub, errno, socketGetLastResult());
-            for (unsigned k = 0; k < nsub; k++) { pf[idx[k]].revents = L_POLLNVAL; ready++; }
+            net_log("nx_net: poll(count=%u) failed e=%d rc=0x%x\n",
+                    socket_count, errno, socketGetLastResult());
+            for (unsigned k = 0; k < socket_count; k++) {
+                guest_fds[index_map[k]].revents = LINUX_POLLNVAL;
+                ready_count++;
+            }
         } else {
-            for (unsigned k = 0; k < nsub; k++) {
-                short l = pollev_b2l(sub[k].revents, pf[idx[k]].events);
-                pf[idx[k]].revents = l;
-                if (l) ready++;
+            for (unsigned k = 0; k < socket_count; k++) {
+                short linux_revents = poll_revents_bsd_to_linux(socket_fds[k].revents,
+                                                                guest_fds[index_map[k]].events);
+                guest_fds[index_map[k]].revents = linux_revents;
+                if (linux_revents) ready_count++;
             }
         }
     }
-    free(heap_idx); free(heap_sub);
-    return ready;
-}
-
-long nx_net_fcntl(int fd, int cmd, long arg) {
-    switch (cmd) {
-        case NX_L_F_GETFD: return 0;
-        case NX_L_F_SETFD: return 0;                      // FD_CLOEXEC — no exec on Horizon
-        case NX_L_F_GETFL: {
-            int nb = nx_net_get_nonblock(fd);
-            if (nb < 0) return -1;
-            return 2 /*O_RDWR*/ | (nb ? L_O_NONBLOCK : 0);
-        }
-        case NX_L_F_SETFL:
-            return nx_net_set_nonblock(fd, (arg & L_O_NONBLOCK) ? 1 : 0);
-        default:
-            errno = EINVAL;
-            return -1;
-    }
+    free(heap_index_map); free(heap_socket_fds);
+    return ready_count;
 }
 
 #endif // __SWITCH__
