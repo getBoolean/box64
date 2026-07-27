@@ -606,6 +606,7 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             // path fires for BOTH the simple test guests AND the wine cmd run (which exits from inside
             // emulate() and never reaches nx_main's "guest exited" line). One-shot + KX_REQLOG-gated inside.
             { extern void nx_ipc_stats_dump(void); nx_ipc_stats_dump(); }
+            { extern void nx_bench_dump(void); nx_bench_dump(); }   // phase breakdown (one-shot; nx_main also calls it)
         }
         emu->quit = 1;
         emu->exit = 1;   // box64-nx (M2.2c2): mark a REAL guest exit, not just a loop-unwind. Needed when

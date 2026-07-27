@@ -361,7 +361,10 @@ int nx_fs_close(int fd) {
 long nx_fs_read(int fd, void* buf, size_t n) {
     fsreq_t r; memset(&r, 0, sizeof r);
     r.op = FSOP_READ; r.fd = fd; r.buf = buf; r.len = n;
-    return fsreq_dispatch(&r);
+    extern uint64_t nx_bench_tick(void); extern uint64_t g_t_sdread, g_n_sdread_bytes, g_n_sdread_ops;
+    uint64_t _t = nx_bench_tick(); long rc = fsreq_dispatch(&r);
+    g_t_sdread += nx_bench_tick() - _t; g_n_sdread_ops++; if (rc > 0) g_n_sdread_bytes += (uint64_t)rc;
+    return rc;
 }
 long nx_fs_write(int fd, const void* buf, size_t n) {
     fsreq_t r; memset(&r, 0, sizeof r);
@@ -371,7 +374,10 @@ long nx_fs_write(int fd, const void* buf, size_t n) {
 long nx_fs_pread(int fd, void* buf, size_t n, off_t off) {
     fsreq_t r; memset(&r, 0, sizeof r);
     r.op = FSOP_PREAD; r.fd = fd; r.buf = buf; r.len = n; r.off = off;
-    return fsreq_dispatch(&r);
+    extern uint64_t nx_bench_tick(void); extern uint64_t g_t_sdread, g_n_sdread_bytes, g_n_sdread_ops;
+    uint64_t _t = nx_bench_tick(); long rc = fsreq_dispatch(&r);
+    g_t_sdread += nx_bench_tick() - _t; g_n_sdread_ops++; if (rc > 0) g_n_sdread_bytes += (uint64_t)rc;
+    return rc;
 }
 long nx_fs_pwrite(int fd, const void* buf, size_t n, off_t off) {
     fsreq_t r; memset(&r, 0, sizeof r);

@@ -259,7 +259,14 @@ dynablock_t* CreateDBnoAlt(x64emu_t* emu, uintptr_t addr, int is32bits)
     }
 
     dynarec_log(LOG_DEBUG, "Will call Fillblock64 for Alt %p\n", (void*)addr);
+#ifdef __SWITCH__
+    extern uint64_t nx_bench_tick(void); extern uint64_t g_t_dynarec, g_n_blocks;
+    uint64_t _bt_alt = nx_bench_tick();
+#endif
     dynablock_t* block = FillBlock64(addr, is32bits, MAX_INSTS, 0, 1);
+#ifdef __SWITCH__
+    g_t_dynarec += nx_bench_tick() - _bt_alt; g_n_blocks++;
+#endif
     if(block && block->block) block->done = 1;  // validate the alt block
 
     mutex_unlock(&my_context->mutex_dyndump);
@@ -330,7 +337,13 @@ dynablock_t* internalDBGetBlock(x64emu_t* emu, uintptr_t addr, int create, int n
             return block;
         }
     }
+#ifdef __SWITCH__
+    { extern uint64_t nx_bench_tick(void); extern uint64_t g_t_dynarec, g_n_blocks; uint64_t _bt = nx_bench_tick();
+#endif
     block = FillBlock64(addr, is32bits, MAX_INSTS, is_new, 0);
+#ifdef __SWITCH__
+    g_t_dynarec += nx_bench_tick() - _bt; g_n_blocks++; }
+#endif
     if(!block) {
         dynarec_log(LOG_DEBUG, "Fillblock of block %p for %p returned an error\n", block, (void*)addr);
     }

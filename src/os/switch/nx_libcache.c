@@ -133,8 +133,11 @@ static void lc_init(void) {
 static int lc_fill_blob(const char* host, uint8_t* blob, size_t sz) {   // lock NOT held
     int fd = open(host, O_RDONLY);
     if (fd < 0) return 0;
+    extern uint64_t nx_bench_tick(void); extern uint64_t g_t_sdread, g_n_sdread_bytes, g_n_sdread_ops;
+    uint64_t _t = nx_bench_tick();
     size_t done = 0;
     while (done < sz) { ssize_t r = read(fd, blob + done, sz - done); if (r <= 0) break; done += (size_t)r; }
+    g_t_sdread += nx_bench_tick() - _t; g_n_sdread_ops++; g_n_sdread_bytes += (uint64_t)done;
     close(fd);
     return done == sz;
 }

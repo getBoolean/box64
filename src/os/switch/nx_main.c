@@ -141,6 +141,31 @@ void nx_guest_log_flush(void) {
 // Benchmark timer (set right before emulate()): the guest's FIRST fd-1 output = "time to first output",
 // i.e. Wine startup (load all DLLs) + cmd -> echo. One-shot rlog to box64-result.txt (survives on real HW).
 u64 g_bench_tick = 0;
+// Startup phase attribution — reported at exit as "nx_bench: breakdown". Thread-aggregate ticks spent in
+// SD file reads (nx_fs_read/pread caller-side round-trip + the libcache one-shot fill) and in dynarec block
+// compile (FillBlock64). armGetSystemTick() is a single mrs, so per-read/per-block accounting is ~free;
+// nx_bench_tick() lets generic box64 code (dynablock.c, no libnx headers) sample the same counter.
+u64 g_t_sdread = 0, g_n_sdread_bytes = 0, g_n_sdread_ops = 0;
+u64 g_t_dynarec = 0, g_n_blocks = 0;
+u64 nx_bench_tick(void) { return armGetSystemTick(); }
+// Emit the phase breakdown ONCE, from whichever exit path fires first — the exit_group(231) handler (the
+// wine cmd run exits from inside emulate() and never returns to nx_main) or nx_main's post-emulate fallback.
+// total/other include any KX_WAIT_EXIT hold (measured at exit); sdread/dynarec do NOT — use the separate
+// "first fd1 output" marker as the clean startup wall and sdread/dynarec as the phase costs.
+void nx_bench_dump(void) {
+    static int done = 0; if (done || !g_bench_tick) return; done = 1;
+    u64 tot = armTicksToNs(armGetSystemTick() - g_bench_tick) / 1000000ULL;
+    u64 sd  = armTicksToNs(g_t_sdread)  / 1000000ULL;
+    u64 dyn = armTicksToNs(g_t_dynarec) / 1000000ULL;
+    long long other = (long long)tot - (long long)sd - (long long)dyn;
+    char tb[184];
+    snprintf(tb, sizeof tb,
+      "nx_bench: breakdown total=%llums sdread=%llums(%lluKiB,%llurd) dynarec=%llums(%llublk) other=%lldms [thread-agg]",
+      (unsigned long long)tot, (unsigned long long)sd,
+      (unsigned long long)(g_n_sdread_bytes / 1024ULL), (unsigned long long)g_n_sdread_ops,
+      (unsigned long long)dyn, (unsigned long long)g_n_blocks, other);
+    rlog(tb);
+}
 void nx_guest_output(int fd, const void *buf, size_t len) {
     if (!buf || !len) return;
     if (fd == 1 && g_bench_tick) {
@@ -496,6 +521,7 @@ int main(int argc, char **argv) {
         code = emulate(emu, elf);
         { u64 ms = armTicksToNs(armGetSystemTick() - g_bench_tick) / 1000000ULL;
           char tb[72]; snprintf(tb, sizeof tb, "nx_bench: guest total +%llu ms", (unsigned long long)ms); rlog(tb); }
+        nx_bench_dump();   // fallback for normal-exit guests (the exit_group(231) handler calls it too)
         kout("\nguest exited: %d\n", code);
         { char b[48]; snprintf(b, sizeof b, "nx_main: guest exited %d\n", code); kdbg(b); }
         { char b[64]; snprintf(b, sizeof b, "guest exited=%d", code); rlog(b); }
