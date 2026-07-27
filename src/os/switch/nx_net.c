@@ -657,6 +657,99 @@ int nx_net_ioctl(int fd, unsigned long l_req, void* arg) {
 // a POSITIVE EOPNOTSUPP (not -1) for those, which a caller checking `< 0` reads as success.
 enum { NX_L_F_GETFD = 1, NX_L_F_SETFD = 2, NX_L_F_GETFL = 3, NX_L_F_SETFL = 4 };
 
+// ---- poll ----------------------------------------------------------------------------------------
+
+// Poll bits. Eight of the ten are numerically identical in both ABIs (IN/PRI/OUT/ERR/HUP/NVAL/RDNORM/
+// RDBAND = 0x001..0x080); the top two collide dangerously and must never pass through:
+//   Linux POLLWRNORM 0x100 == BSD POLLWRBAND 0x100     (asking to write would request out-of-band!)
+//   Linux POLLWRBAND 0x200 == nothing in BSD
+// BSD has no separate POLLWRNORM at all — it is an alias of POLLOUT.
+enum {
+    NX_POLL_SHARED     = 0x0FF,   // IN|PRI|OUT|ERR|HUP|NVAL|RDNORM|RDBAND — same value both sides
+    L_POLLOUT          = 0x004,
+    L_POLLNVAL         = 0x020,
+    L_POLLWRNORM       = 0x100,
+    L_POLLWRBAND       = 0x200,
+    B_POLLOUT          = 0x004,
+    B_POLLWRBAND       = 0x100,
+};
+
+typedef struct { int fd; short events; short revents; } nx_pollfd;   // identical layout in both ABIs
+
+static short pollev_l2b(short l) {
+    short b = (short)(l & NX_POLL_SHARED);
+    if (l & L_POLLWRNORM) b |= B_POLLOUT;       // NOT a pass-through: 0x100 means WRBAND to BSD
+    if (l & L_POLLWRBAND) b |= B_POLLWRBAND;
+    return b;
+}
+
+static short pollev_b2l(short b, short l_events) {
+    short l = (short)(b & NX_POLL_SHARED);
+    if (b & B_POLLWRBAND) l |= L_POLLWRBAND;
+    // Linux reports POLLWRNORM alongside POLLOUT on a writable socket; mirror it only when the caller
+    // asked, so revents stays a subset of events (plus the always-reported ERR/HUP/NVAL).
+    if ((b & B_POLLOUT) && (l_events & L_POLLWRNORM)) l |= L_POLLWRNORM;
+    return l;
+}
+
+enum { NX_POLL_STACK_FDS = 64 };   // sockets polled without a heap allocation; beyond this, malloc
+
+// Score the SOCKET entries of a Linux pollfd array via libnx, leaving every other entry untouched.
+// Returns the number of socket entries with a non-zero revents, and sets *out_has_socket.
+//
+// libnx's poll() cannot be handed the guest's array directly for two reasons: it hard-FAILS the whole
+// call with ENOTSOCK on the first non-socket fd it sees (so a mixed set must be compacted to sockets
+// only), and its pollfd bit values differ from the guest's (above). A compact sub-array plus an index
+// map solves both.
+int nx_net_poll(void* l_pfds, unsigned long n, int timeout_ms, int* out_has_socket) {
+    nx_pollfd* pf = (nx_pollfd*)l_pfds;
+    if (out_has_socket) *out_has_socket = 0;
+    if (!g_net_ok || !pf || !n) return 0;
+
+    int stack_idx[NX_POLL_STACK_FDS];
+    nx_pollfd stack_sub[NX_POLL_STACK_FDS];
+    int* idx = stack_idx;
+    nx_pollfd* sub = stack_sub;
+    int* heap_idx = NULL;
+    nx_pollfd* heap_sub = NULL;
+    if (n > NX_POLL_STACK_FDS) {
+        heap_idx = (int*)malloc(n * sizeof *heap_idx);
+        heap_sub = (nx_pollfd*)malloc(n * sizeof *heap_sub);
+        if (!heap_idx || !heap_sub) { free(heap_idx); free(heap_sub); errno = ENOMEM; return -1; }
+        idx = heap_idx; sub = heap_sub;
+    }
+
+    unsigned nsub = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        if (pf[i].fd < 0 || !nx_net_is_socket(pf[i].fd)) continue;
+        idx[nsub] = (int)i;
+        sub[nsub].fd      = pf[i].fd;
+        sub[nsub].events  = pollev_l2b(pf[i].events);
+        sub[nsub].revents = 0;
+        nsub++;
+    }
+    if (out_has_socket) *out_has_socket = nsub != 0;
+
+    int ready = 0;
+    if (nsub) {
+        int r = nx_bsd_poll(sub, nsub, timeout_ms);
+        if (r < 0) {
+            // A failed poll must not look like "nothing ready forever" — mark the sockets POLLNVAL so
+            // the caller's loop terminates instead of spinning on a set it can never satisfy.
+            netlog("nx_net: poll(n=%u) failed e=%d rc=0x%x\n", nsub, errno, socketGetLastResult());
+            for (unsigned k = 0; k < nsub; k++) { pf[idx[k]].revents = L_POLLNVAL; ready++; }
+        } else {
+            for (unsigned k = 0; k < nsub; k++) {
+                short l = pollev_b2l(sub[k].revents, pf[idx[k]].events);
+                pf[idx[k]].revents = l;
+                if (l) ready++;
+            }
+        }
+    }
+    free(heap_idx); free(heap_sub);
+    return ready;
+}
+
 long nx_net_fcntl(int fd, int cmd, long arg) {
     switch (cmd) {
         case NX_L_F_GETFD: return 0;

@@ -1246,14 +1246,49 @@ static short vfd_ready(vfd_t* v, short events) {
     return re & (events | 0x010 | 0x020 | 0x008);                        // HUP/NVAL/ERR always reported
 }
 
+// Poll a set that may mix THREE kinds of fd, each of which learns about readiness differently:
+//  - vfds (pipes/socketpairs/epoll): the in-process scoreboard, woken by a g_cv broadcast.
+//  - plain real fds (SD files): always ready — a read on a file does not block on Horizon.
+//  - bsd sockets (M2.8): only libnx can answer, and NOTHING about them touches g_cv.
+//
+// The socket case is why this is not just the old loop with an extra branch. Before M2.8 every
+// non-vfd set has_real, which reports the fd ready for whatever was asked AND forces an immediate
+// return; a socket scored that way would be permanently "ready", turning any Wine select loop into a
+// 100% CPU spin. So has_real is narrowed to plain files only, and a set containing sockets waits in
+// SHORT SLICES instead of indefinitely — a socket becoming readable can never broadcast g_cv, so the
+// only way to notice it is to look again.
+//
+// Slicing rather than blocking inside libnx's poll() is deliberate: a blocking bsdPoll would hold the
+// wakeup latency of every OTHER fd in the set hostage to the socket timeout, delaying every wineserver
+// condvar wakeup by up to a full slice and regressing usock/cmd-echo. Sockets pay the added latency
+// (network round-trips dwarf it); vfds keep their immediate condvar wakeup.
+enum { NX_POLL_SLICE_MS = 20 };   // re-scan cadence when the set contains a socket
+
 int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
-    int has_real = 0;
+    // A positive timeout becomes an ABSOLUTE deadline ONCE: the slice loop re-scans many times and
+    // must not restart the countdown on each pass (that would make a 50 ms poll never time out).
+    struct timespec deadline = {0, 0};
+    if (timeout_ms > 0) {
+        struct timeval tv; gettimeofday(&tv, NULL);
+        long usec = tv.tv_usec + (timeout_ms % 1000) * 1000;
+        deadline.tv_sec  = tv.tv_sec + timeout_ms / 1000 + usec / 1000000;
+        deadline.tv_nsec = (usec % 1000000) * 1000;
+    }
     for (;;) {
+        // Socket pass FIRST and OUTSIDE g_mx: it is a bsd:u IPC round trip, and holding the vfd mutex
+        // across it would stall every pipe/socketpair op in the process (the wineserver's included).
+        // Doing it before the lock also means the locked section below runs straight into the
+        // cond_wait with no window for a vfd state change to be missed.
+        int has_sock = 0;
+        int ready = nx_net_poll(pf, n, 0 /*non-blocking scan*/, &has_sock);
+        if (ready < 0) ready = 0;
+
         pthread_mutex_lock(&g_mx);
-        int ready = 0;
+        int has_real = 0;
         for (unsigned long i = 0; i < n; i++) {
+            if (pf[i].fd < 0) { pf[i].revents = 0; continue; }
+            if (nx_net_is_socket(pf[i].fd)) continue;   // already scored above — do not clear it
             pf[i].revents = 0;
-            if (pf[i].fd < 0) continue;
             if (!nx_vfd_is(pf[i].fd)) {
                 // real newlib fd: no host poll on Horizon — report it ready for whatever was
                 // asked (a read on a real file won't block anyway)
@@ -1266,25 +1301,106 @@ int nx_poll(l_pollfd* pf, unsigned long n, int timeout_ms) {
             if (pf[i].revents) ready++;
         }
         if (ready || timeout_ms == 0 || has_real) { pthread_mutex_unlock(&g_mx); return ready; }
-        if (timeout_ms < 0) {
+
+        if (timeout_ms < 0 && !has_sock) {
             { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
               if (on) { char b[128]; int m = snprintf(b, sizeof b, "nx_vfd: POLLBLK pid=%d n=%lu fd0=%d fd1=%d\n",
                   nx_guest_pid(), n, n>0?pf[0].fd:-1, n>1?pf[1].fd:-1); svcOutputDebugString(b, m); } }
             pthread_cond_wait(&g_cv, &g_mx);
             pthread_mutex_unlock(&g_mx);
         } else {
-            struct timeval tv; gettimeofday(&tv, NULL);
-            long usec = tv.tv_usec + (timeout_ms % 1000) * 1000;
-            struct timespec ts = { tv.tv_sec + timeout_ms / 1000 + usec / 1000000,
-                                   (usec % 1000000) * 1000 };
+            struct timespec ts;
+            int at_deadline;
+            if (has_sock) {
+                // Wait until the earlier of (the caller's deadline, one slice from now). An infinite
+                // timeout with a socket in the set has no deadline — it just keeps slicing.
+                struct timeval tv; gettimeofday(&tv, NULL);
+                long usec = tv.tv_usec + (NX_POLL_SLICE_MS % 1000) * 1000;
+                ts.tv_sec  = tv.tv_sec + NX_POLL_SLICE_MS / 1000 + usec / 1000000;
+                ts.tv_nsec = (usec % 1000000) * 1000;
+                at_deadline = timeout_ms > 0 && (deadline.tv_sec < ts.tv_sec ||
+                    (deadline.tv_sec == ts.tv_sec && deadline.tv_nsec <= ts.tv_nsec));
+                if (at_deadline) ts = deadline;
+            } else {
+                // No socket in the set: sleep the WHOLE remaining timeout on the condvar exactly as
+                // before M2.8. Slicing a socket-free poll would add a spurious wakeup every 20 ms to
+                // the wineserver's hot path for nothing.
+                ts = deadline;
+                at_deadline = 1;
+            }
             int w = pthread_cond_timedwait(&g_cv, &g_mx, &ts);
             pthread_mutex_unlock(&g_mx);
-            if (w == ETIMEDOUT) {
-                // one final scoreboard pass so a race right at the deadline isn't lost
-                timeout_ms = 0;
-            }
-        }
+            // Only the CALLER's deadline ends the poll; a slice expiry just means "look again".
+            if (w == ETIMEDOUT && at_deadline) timeout_ms = 0;   // one final pass so a race at the
+        }                                                        // deadline isn't lost
     }
+}
+
+// ---- select --------------------------------------------------------------------------------------
+
+// x86-64 NR 23. box64's shim defines no __NR_select, so its scwrap entry compiles out and the big
+// switch calls libnx's select() directly — which runs every fd through _socketGetFd and fails the
+// WHOLE call with ENOTSOCK the moment it meets a file. Route it through nx_poll instead, so a select
+// over files, sockets and vfds together behaves.
+//
+// Linux fd_set is a bitmap of `long` words, so it can only hold fds below FD_SETSIZE (1024) — which is
+// precisely why M2.8 gives sockets real newlib fds instead of vfd numbers: FD_SET() on a vfd
+// (>=0x40000000) would write ~128 MB past the end of the set. A vfd reaching here is already a guest
+// bug, but it is scored anyway since nx_poll can.
+enum { NX_FD_SETSIZE = 1024, NX_FD_BITS_PER_WORD = 64, NX_SELECT_MAX_FDS = 128 };
+
+typedef struct { unsigned long w[NX_FD_SETSIZE / NX_FD_BITS_PER_WORD]; } l_fd_set;
+
+static int fdset_test(const l_fd_set* s, int fd) {
+    return s && (s->w[fd / NX_FD_BITS_PER_WORD] >> (fd % NX_FD_BITS_PER_WORD)) & 1UL;
+}
+static void fdset_set(l_fd_set* s, int fd) {
+    if (s) s->w[fd / NX_FD_BITS_PER_WORD] |= 1UL << (fd % NX_FD_BITS_PER_WORD);
+}
+
+int nx_select(int nfds, void* rd, void* wr, void* ex, void* timeout) {
+    struct kx_timeval { long sec, usec; };
+    const struct kx_timeval* tv = (const struct kx_timeval*)timeout;
+    int timeout_ms = tv ? (int)(tv->sec * 1000 + tv->usec / 1000) : -1;
+    if (nfds < 0 || nfds > NX_FD_SETSIZE) { errno = EINVAL; return -1; }
+
+    l_pollfd pf[NX_SELECT_MAX_FDS];
+    int map[NX_SELECT_MAX_FDS];
+    int n = 0;
+    for (int fd = 0; fd < nfds && n < NX_SELECT_MAX_FDS; fd++) {
+        short ev = 0;
+        if (fdset_test((const l_fd_set*)rd, fd)) ev |= 0x001;            // POLLIN
+        if (fdset_test((const l_fd_set*)wr, fd)) ev |= 0x004;            // POLLOUT
+        if (fdset_test((const l_fd_set*)ex, fd)) ev |= 0x002;            // POLLPRI
+        if (!ev) continue;
+        pf[n].fd = fd; pf[n].events = ev; pf[n].revents = 0;
+        map[n] = fd; n++;
+    }
+    if (!n) {   // no fds selected: select() degenerates to a sleep
+        if (timeout_ms > 0) svcSleepThread((u64)timeout_ms * 1000000ULL);
+        return 0;
+    }
+    int r = nx_poll(pf, (unsigned long)n, timeout_ms);
+    if (r < 0) return -1;
+
+    // Rebuild the sets from revents. POLLERR/POLLHUP make an fd both readable and writable in select's
+    // model (that is how a caller learns about them at all — select has no error bit of its own).
+    l_fd_set out_rd, out_wr, out_ex;
+    memset(&out_rd, 0, sizeof out_rd); memset(&out_wr, 0, sizeof out_wr); memset(&out_ex, 0, sizeof out_ex);
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        short re = pf[i].revents;
+        if (!re) continue;
+        int hit = 0;
+        if (rd && (re & (0x001 | 0x010 | 0x008))) { fdset_set(&out_rd, map[i]); hit = 1; }   // IN|HUP|ERR
+        if (wr && (re & (0x004 | 0x008)))         { fdset_set(&out_wr, map[i]); hit = 1; }   // OUT|ERR
+        if (ex && (re & 0x002))                   { fdset_set(&out_ex, map[i]); hit = 1; }   // PRI
+        count += hit;
+    }
+    if (rd) memcpy(rd, &out_rd, sizeof out_rd);
+    if (wr) memcpy(wr, &out_wr, sizeof out_wr);
+    if (ex) memcpy(ex, &out_ex, sizeof out_ex);
+    return count;
 }
 
 // ---- epoll (vfd) ---------------------------------------------------------------------------------
@@ -1562,7 +1678,7 @@ int nx_rename_guest(const char* a, const char* b) {
 
 int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                    unsigned long a4, unsigned long a5, unsigned long a6, long* ret) {
-    (void)a5; (void)a6;
+    (void)a6;
     long r = -1;
     switch (s) {
         case 0:   // read
@@ -1587,6 +1703,10 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             break;
         case 7:   // poll
             r = nx_poll((l_pollfd*)a1, (unsigned long)a2, (int)a3);
+            break;
+        case 23:  // select — see nx_select(). Without this the big switch calls libnx's select(),
+                  // which ENOTSOCKs the whole call on the first non-socket fd in the set.
+            r = nx_select((int)a1, (void*)a2, (void*)a3, (void*)a4, (void*)a5);
             break;
         case 48:  // shutdown — half-close a vfd socketpair so the PEER sees EOF. box64's scwrap has no
                   // entry for shutdown, so without this it hit the big-switch default -> ENOSYS, which

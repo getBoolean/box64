@@ -79,6 +79,11 @@ int  nx_net_shutdown(int fd, int how);
 int  nx_net_ioctl(int fd, unsigned long l_req, void* arg);
 long nx_net_fcntl(int fd, int cmd, long arg);
 
+// Score ONLY the socket entries of a Linux pollfd array, leaving the rest untouched, and report
+// whether the set contained any. Returns the number of socket entries that came back ready.
+// nx_poll() (nx_vfd.c) calls this for the socket half of a mixed vfd/file/socket set.
+int  nx_net_poll(void* l_pfds, unsigned long n, int timeout_ms, int* out_has_socket);
+
 // O_NONBLOCK is the one fcntl flag Horizon's bsd supports, and it is spelled differently in all three
 // ABIs involved (Linux 0x800, newlib 0x4000, BSD 0x20000000) — so it gets dedicated accessors that
 // every entry point (socket/accept4 type flags, fcntl F_SETFL, ioctl FIONBIO) funnels through.

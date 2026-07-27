@@ -1326,6 +1326,14 @@ long syscall(long number, ...) {
             if (nx_vfd_is((int)a0)) return nx_vfd_flock((int)a0, (int)a1);
             return 0;
         case 59: return nx_pipe2((int*)a0, (int)a1);             // pipe2
+        case 72: {  // pselect6(nfds, rd, wr, ex, timespec*, sigmask) -> nx_select (sigmask ignored,
+            // as ppoll's is). glibc's select() emits THIS on modern kernels, not legacy select(23).
+            struct kx_ts { long s, ns; } *ts = (struct kx_ts*)a4;
+            struct kx_tv { long s, us; } tv;
+            extern int nx_select(int, void*, void*, void*, void*);
+            if (ts) { tv.s = ts->s; tv.us = ts->ns / 1000; }
+            return nx_select((int)a0, (void*)a1, (void*)a2, (void*)a3, ts ? &tv : NULL);
+        }
         case 73: {  // ppoll(fds, n, timespec*, sigmask) -> nx_poll
             struct kx_ts { long s, ns; } *ts = (struct kx_ts*)a2;
             int ms = ts ? (int)(ts->s * 1000 + ts->ns / 1000000) : -1;
