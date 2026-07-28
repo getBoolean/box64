@@ -1510,7 +1510,37 @@ long syscall(long number, ...) {
             }
             return total;
         }
-        case 135: return 0;                          // rt_sigprocmask -> accept (no signals yet)
+        case 135: {  // rt_sigprocmask(how, set, oldset, sigsetsize)
+            // A REAL mask, because Wine's SIGUSR1 protocol is built on it: it blocks SIGUSR1 across
+            // every wineserver request/reply exchange (server_block_set, dlls/ntdll/unix/server.c)
+            // precisely so usr1_handler -> wait_suspend can safely issue a nested server request.
+            // Accepting-and-ignoring this call let box64 deliver mid-request, which put a second
+            // request on the wire and desynchronised the reply stream — the ws2_32:afd hang.
+            enum { LINUX_SIG_BLOCK = 0, LINUX_SIG_UNBLOCK = 1, LINUX_SIG_SETMASK = 2 };
+            extern uint64_t nx_sigmask_get(void);
+            extern void     nx_sigmask_set(uint64_t);
+            extern int      nx_signal_deliver_pending(void);
+            int how = (int)a0;
+            const uint64_t* set = (const uint64_t*)a1;
+            uint64_t* oldset = (uint64_t*)a2;
+            uint64_t previous = nx_sigmask_get();
+            if (oldset) *oldset = previous;
+            if (set) {
+                uint64_t wanted = *set, updated = previous;
+                switch (how) {
+                    case LINUX_SIG_BLOCK:   updated =  previous | wanted; break;
+                    case LINUX_SIG_UNBLOCK: updated =  previous & ~wanted; break;
+                    case LINUX_SIG_SETMASK: updated =  wanted; break;
+                    default: return -EINVAL;
+                }
+                nx_sigmask_set(updated);
+                // Lowering the mask must deliver what was waiting on it, the way a kernel does the
+                // moment a signal is unblocked — otherwise a queued signal waits for the next
+                // unrelated blocking call, which is where the latency Wine cannot tolerate creeps in.
+                if (previous & ~updated) nx_signal_deliver_pending();
+            }
+            return 0;
+        }
         case 178: return nx_gettid();                // gettid
         case 172: return nx_guest_pid();             // getpid (per guest INSTANCE — M2.5)
         case 124: svcSleepThread(0); return 0;       // sched_yield

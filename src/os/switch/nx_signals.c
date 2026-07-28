@@ -845,6 +845,31 @@ void my_sigactionhandler_oldcode(x64emu_t* emu, int32_t sig, int simple, x64_sig
 // itself is delivered synchronously (or queued if we are inside a box64 critical section).
 extern int nx_gettid(void);
 extern int nx_guest_pid(void);
+// ---- the per-thread blocked-signal mask -----------------------------------------------------------
+// This is ordinary POSIX, and Wine's whole SIGUSR1 protocol is built on it: every request/reply
+// exchange on the per-thread wineserver connection runs with SIGUSR1 BLOCKED
+// (server_block_set, dlls/ntdll/unix/server.c:1477; applied around wine_server_call at :280 and
+// server_select at :634), exactly so that usr1_handler -> wait_suspend can safely issue a NEW server
+// request. Without a mask box64 delivered mid-request, the handler wrote a second request onto a
+// connection that already had one outstanding, and every later reply came back off by one — the
+// ws2_32:afd hang. The mask is what partitions the delivery points correctly: request-in-flight is
+// blocked, and wait_select_reply (where server_select has already restored the mask and parked in a
+// read on the wait pipe) is not.
+//
+// Each guest thread runs on its own host thread, so TLS is the whole implementation.
+static __thread uint64_t g_blocked_mask = 0;
+
+// sa_mask per signal, captured at sigaction time. Process-wide like my_context->signals (and it
+// inherits that table's known limitation: the client and the in-process wineserver share it).
+static uint64_t g_sa_mask[MAX_SIGNAL + 1];
+
+// SIGKILL and SIGSTOP can never be blocked (POSIX); silently dropping them from the set is what
+// Linux does rather than failing the call.
+#define NX_SIG_BIT(sig)      (1ULL << ((sig) - 1))
+#define NX_SIG_UNBLOCKABLE   (NX_SIG_BIT(SIGKILL) | NX_SIG_BIT(SIGSTOP))
+
+uint64_t nx_sigmask_get(void) { return g_blocked_mask; }
+void     nx_sigmask_set(uint64_t mask) { g_blocked_mask = mask & ~NX_SIG_UNBLOCKABLE; }
 static void nx_deliver_self(x64emu_t* emu, int sig)
 {
     if(!emu)
@@ -918,6 +943,12 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
         memcpy(s_ymm, emu->ymm, sizeof(s_ymm));
         s_mxcsr = emu->mxcsr;
     }
+    // POSIX: a handler runs with sa_mask PLUS the signal itself blocked, restored on return. Wine
+    // depends on this — usr1_handler does a full wineserver round-trip, and its sa_mask
+    // (server_block_set) is what stops a second SIGUSR1 landing inside that exchange and
+    // desynchronising the request/reply stream.
+    uint64_t s_mask = g_blocked_mask;
+    g_blocked_mask = (s_mask | g_sa_mask[sig] | NX_SIG_BIT(sig)) & ~NX_SIG_UNBLOCKABLE;
     int exits = 0;
     uint64_t hret;
     if(my_context->is_sigaction[sig]) {
@@ -935,6 +966,7 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     // exit()/exit_group(), the exit propagates here as emu->exit (=> *exits). We must terminate NOW —
     // returning would restore the pre-signal regs and resume the (already-exited) guest into garbage
     // (glibc then trips its stack canary -> "stack smashing detected"). hret carries the exit code.
+    g_blocked_mask = s_mask;          // handler returned: restore the caller's mask
     if(exits) {
         char b[64]; snprintf(b, sizeof b, "guest exited=%d (in signal handler)", (int)hret); nx_result_log(b);
         exit((int)hret);
@@ -1042,12 +1074,15 @@ static int nx_signal_queue(int gpid, int tid, int sig)
 // atomic load), so it can sit on the syscall boundary.
 // Cheap "is a directed signal waiting for me?" probe, so a blocking wait can decide whether to drop
 // its lock and deliver. One atomic load in the common (nothing pending) case.
+
 int nx_signal_pending_self(void)
 {
     int tid = nx_gettid(), gpid = nx_guest_pid();
     for (int i = 0; i < NX_SIGTHREAD_MAX; i++)
         if (atomic_load(&g_sigthreads[i].tid) == tid && g_sigthreads[i].gpid == gpid)
-            return atomic_load(&g_sigthreads[i].pending) != 0;
+            // Only signals this thread can actually take right now count as pending: a blocked one
+            // must STAY queued, not wake a wait that would then refuse to deliver it.
+            return (atomic_load(&g_sigthreads[i].pending) & ~g_blocked_mask) != 0;
     return 0;
 }
 
@@ -1081,36 +1116,28 @@ void nx_signal_check_pending(x64emu_t* emu)
 // Returns 1 if a handler actually ran, 0 otherwise — the caller uses that to decide whether to
 // interrupt its wait, so it must NOT report an interruption it did not cause.
 //
-// Delivery is OPT-IN (KX_SIG_DIRECTED=1), and Wine's own source says why rather than just
-// measurement. The SIGUSR1 the wineserver sends a client thread comes from queue_apc()
-// (server/thread.c): it is sent only when the target is NOT already in an interruptible server wait
-// (`!is_in_apc_wait`), and the server calls wake_thread() immediately afterwards either way. So for a
-// thread parked in a server wait — which is every thread we can actually reach — the WAKEUP already
-// does the work and the signal is redundant belt-and-braces for a thread spinning in guest code.
-//
-// Running it anyway is not merely unnecessary, it is harmful: usr1_handler -> wait_suspend() issues
-// its own server_select and blocks for a resume, and a per-thread server connection carries one
-// request at a time. Delivering while the thread has a request in flight puts two on the wire and
-// both sides wait forever. A/B-proven on one binary: delivery off -> ws2_32:afd 1187 tests / 75
-// failures; delivery on -> hang at afd.c:131, identically for all three delivery points tried
-// (syscall boundary, inside-the-wait-then-resume, inside-the-wait-then-EINTR).
-//
-// The machinery itself is correct and exercised — with the gate on, 5 queued / 5 delivered / 0 ESRCH
-// — so it is here for a guest that genuinely needs directed signals, and for the day box64-nx can
-// interrupt a guest thread asynchronously (the real gap: a kernel signals at an arbitrary
-// instruction, we can only act at points we choose, and every point we can choose is "request in
-// flight").
+// DEFAULT-ON since 2026-07-28, once the per-thread signal MASK made it safe (see the mask block
+// above). It was opt-in before that because delivering without a mask landed the handler in the
+// middle of a wineserver request/reply exchange and desynchronised the stream — which was long
+// mis-diagnosed as "no delivery point is safe". With the mask, Wine's own invariant does the
+// partitioning: SIGUSR1 is blocked across every server call and unblocked in wait_select_reply.
+// Measured on ws2_32:afd: HANG -> 35 failures, 3/3 identical runs (delivery OFF scored 39).
+// KX_NO_SIG_DIRECTED=1 restores the old drop-on-the-floor behaviour for A/B.
 int nx_signal_deliver_pending(void)
 {
     static int deliver = -1;
-    if (deliver < 0) deliver = getenv("KX_SIG_DIRECTED") ? 1 : 0;
+    if (deliver < 0) deliver = getenv("KX_NO_SIG_DIRECTED") ? 0 : 1;
     x64emu_t* emu = NULL;
     int ran = 0;
     int tid = nx_gettid(), gpid = nx_guest_pid();
     for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
         if (atomic_load(&g_sigthreads[i].tid) != tid || g_sigthreads[i].gpid != gpid) continue;
-        uint64_t bits = atomic_exchange(&g_sigthreads[i].pending, 0);
+        // Take ONLY what this thread is allowed to run right now. A blocked signal stays pending and
+        // is delivered when the mask drops, exactly as a kernel would — clearing it here (as an
+        // unconditional exchange did) would silently lose it.
+        uint64_t bits = atomic_load(&g_sigthreads[i].pending) & ~g_blocked_mask;
         if (!bits) return 0;
+        atomic_fetch_and(&g_sigthreads[i].pending, ~bits);
         if (!deliver) {
             static int warned = 0;
             if (!warned) { warned = 1;
@@ -1280,6 +1307,11 @@ int EXPORT my_sigaction(x64emu_t* emu, int signum, const x64_sigaction_t *act, x
         }
         my_context->restorer[signum] = (act->sa_flags&X64_SA_RESTORER)?(uintptr_t)act->sa_restorer:0;
         my_context->onstack[signum] = (act->sa_flags&X64_SA_ONSTACK)?1:0;
+        // Keep sa_mask: it is what makes a Wine handler safe to run. usr1_handler is installed with
+        // sa_mask = server_block_set (dlls/ntdll/unix/signal_x86_64.c:2466), so the wineserver
+        // round-trip it performs cannot itself be interrupted by another SIGUSR1. box64's context
+        // stores the handler but not the mask, so it is kept alongside, here.
+        g_sa_mask[signum] = act->sa_mask;
     }
     if(oldact) {
         memset(oldact, 0, sizeof(*oldact));
@@ -1330,6 +1362,11 @@ int EXPORT my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigactio
         }
         my_context->restorer[signum] = (act->sa_flags&X64_SA_RESTORER)?(uintptr_t)act->sa_restorer:0;
         my_context->onstack[signum] = (act->sa_flags&X64_SA_ONSTACK)?1:0;
+        // Keep sa_mask: it is what makes a Wine handler safe to run. usr1_handler is installed with
+        // sa_mask = server_block_set (dlls/ntdll/unix/signal_x86_64.c:2466), so the wineserver
+        // round-trip it performs cannot itself be interrupted by another SIGUSR1. box64's context
+        // stores the handler but not the mask, so it is kept alongside, here.
+        g_sa_mask[signum] = act->sa_mask;
     }
     if(oldact) {
         memset(oldact, 0, sizeof(*oldact));
