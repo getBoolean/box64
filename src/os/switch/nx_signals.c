@@ -1049,11 +1049,33 @@ void nx_signal_check_pending(x64emu_t* emu)
         nx_sigthread_register(emu);
         g_sigthread_registered = 1;
     }
+    // RUNNING a queued handler is OPT-IN (KX_SIG_DIRECTED=1) and here is why. Targeting is now correct
+    // — a directed signal reaches the right thread in the right guest instance instead of crashing the
+    // wrong one — but ACTUALLY running Wine's usr1_handler at this safe point deadlocks ws2_32:afd:
+    // the handler does a full wineserver round-trip, and reaching it from inside the syscall dispatcher
+    // re-enters the client/server protocol while the interrupted call is still in flight. With delivery
+    // inert, afd runs 1187 tests on Ryujinx and 1186 on hardware; with it live, afd hangs.
+    //
+    // So the default is "queue, then drop with a log": strictly better than before (no more running
+    // another instance's handler on the wrong TCB) and no worse than the behaviour every green result
+    // was measured against. Finishing this needs a safe point that is not inside the syscall path, plus
+    // interruptible waits — an EINTR-from-the-vfd-wait attempt completed delivery 5/5 but made afd
+    // nondeterministic (hang or exit 1), so it is not the answer on its own.
+    static int deliver = -1;
+    if (deliver < 0) deliver = getenv("KX_SIG_DIRECTED") ? 1 : 0;
     int tid = nx_gettid(), gpid = nx_guest_pid();
     for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
         if (atomic_load(&g_sigthreads[i].tid) != tid || g_sigthreads[i].gpid != gpid) continue;
         uint64_t bits = atomic_exchange(&g_sigthreads[i].pending, 0);
         if (!bits) return;
+        if (!deliver) {
+            static int warned = 0;
+            if (!warned) { warned = 1;
+                printf_log(LOG_NONE, "nx_sig: queued 0x%llx for tid=%d gpid=%d NOT delivered "
+                           "(KX_SIG_DIRECTED=1 to enable; see nx_signals.c)\n",
+                           (unsigned long long)bits, tid, gpid); }
+            return;
+        }
         // Never fall back to thread_get_emu(): on a thread without one it ALLOCATES a fresh emu on a
         // small scratch stack and would run the guest handler there. Dropping the signal is bad;
         // running it on a synthetic emu is worse.
