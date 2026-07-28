@@ -973,26 +973,40 @@ static nx_sigthread_t g_sigthreads[NX_SIGTHREAD_MAX];
 extern int nx_gettid(void);
 extern int nx_guest_pid(void);
 
-// Called by a thread about to run guest code, and again as it exits.
-void nx_sigthread_register(void)
+// Registration is LAZY — done on this thread's first syscall (nx_signal_check_pending), not at thread
+// start. That is not a shortcut, it is the only ordering that works: `thread_set_emu()` runs inside
+// box64's clone_fn_syscall, i.e. AFTER the clone trampoline would have registered, so a register call
+// there always saw a NULL emu and silently did nothing. Registering off the emu the syscall dispatcher
+// already hands us removes the dependency entirely.
+//
+// Getting this wrong is not benign: an unregistered thread makes nx_signal_queue return ESRCH, and
+// Wine's server/ptrace.c latches `unix_tid = -1` on ESRCH — permanently marking the thread dead, after
+// which it silently drops that thread's APCs and suspends instead of erroring.
+void nx_sigthread_register(x64emu_t* emu)
 {
-    int tid = nx_gettid();
-    x64emu_t* emu = thread_get_emu_no_create();
     if (!emu) return;
-    for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
-        int expected = 0;
-        if (atomic_compare_exchange_strong(&g_sigthreads[i].tid, &expected, tid)) {
-            g_sigthreads[i].gpid = nx_guest_pid();
-            g_sigthreads[i].emu  = emu;
-            atomic_store(&g_sigthreads[i].pending, 0);
-            return;
-        }
-        // Re-registration of the same (tid,gpid) — refresh the emu rather than burning a second slot.
-        if (atomic_load(&g_sigthreads[i].tid) == tid && g_sigthreads[i].gpid == nx_guest_pid()) {
+    int tid = nx_gettid(), gpid = nx_guest_pid();
+    // Pass 1: already registered? (A second slot for the same thread would leak — every lookup takes
+    // the first match, so unregister would free the new one and strand the old.)
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++)
+        if (atomic_load(&g_sigthreads[i].tid) == tid && g_sigthreads[i].gpid == gpid) {
             g_sigthreads[i].emu = emu;
             return;
         }
+    // Pass 2: claim a free slot. Fill gpid/emu/pending BEFORE publishing tid — tid is what a sender
+    // matches on, so publishing it first lets a concurrent nx_signal_queue match this slot while still
+    // reading the previous occupant's gpid.
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
+        if (atomic_load(&g_sigthreads[i].tid) != 0) continue;
+        g_sigthreads[i].gpid = gpid;
+        g_sigthreads[i].emu  = emu;
+        atomic_store(&g_sigthreads[i].pending, 0);
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&g_sigthreads[i].tid, &expected, tid))
+            return;
     }
+    printf_log(LOG_NONE, "nx_sig: thread registry FULL (%d) — tid=%d gpid=%d will look dead to senders\n",
+               NX_SIGTHREAD_MAX, tid, gpid);
 }
 
 void nx_sigthread_unregister(void)
@@ -1026,17 +1040,48 @@ static int nx_signal_queue(int gpid, int tid, int sig)
 
 // Safe point: run any signal another thread queued for us, on OUR emu. Cheap when idle (one relaxed
 // atomic load), so it can sit on the syscall boundary.
+static __thread int g_sigthread_registered = 0;
+
 void nx_signal_check_pending(x64emu_t* emu)
 {
+    if (!g_sigthread_registered) {          // first syscall on this thread: join the registry
+        if (!emu) return;
+        nx_sigthread_register(emu);
+        g_sigthread_registered = 1;
+    }
     int tid = nx_gettid(), gpid = nx_guest_pid();
     for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
         if (atomic_load(&g_sigthreads[i].tid) != tid || g_sigthreads[i].gpid != gpid) continue;
         uint64_t bits = atomic_exchange(&g_sigthreads[i].pending, 0);
         if (!bits) return;
+        // Never fall back to thread_get_emu(): on a thread without one it ALLOCATES a fresh emu on a
+        // small scratch stack and would run the guest handler there. Dropping the signal is bad;
+        // running it on a synthetic emu is worse.
         if (!emu) emu = g_sigthreads[i].emu;
+        if (!emu) {
+            printf_log(LOG_NONE, "nx_sig: pending 0x%llx for tid=%d gpid=%d but no emu — dropped\n",
+                       (unsigned long long)bits, tid, gpid);
+            return;
+        }
         for (int sig = 1; sig <= MAX_SIGNAL && bits; sig++)
             if (bits & (1ULL << (sig - 1))) {
                 bits &= ~(1ULL << (sig - 1));
+                // A QUEUED signal with no handler is dropped, not acted on. nx_deliver_self treats
+                // SIG_DFL as "terminate" and abort()s — correct for a synchronous raise(), but for a
+                // directed signal that would tear down the whole Horizon process (both guest
+                // instances) from an arbitrary thread at an arbitrary syscall boundary. In practice a
+                // queued signal with no handler means OUR plumbing aimed it wrong, and killing
+                // everything makes that undebuggable.
+                uintptr_t disposition = my_context->signals[sig];
+                if (disposition == 0 || disposition == 1) {
+                    static int warned[MAX_SIGNAL + 1];
+                    if (!warned[sig]) {
+                        warned[sig] = 1;
+                        printf_log(LOG_NONE, "nx_sig: queued sig=%d for tid=%d gpid=%d has %s — dropped\n",
+                                   sig, tid, gpid, disposition ? "SIG_IGN" : "SIG_DFL");
+                    }
+                    continue;
+                }
                 nx_deliver_self(emu, sig);
             }
         return;

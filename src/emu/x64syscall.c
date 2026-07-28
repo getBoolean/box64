@@ -529,14 +529,6 @@ static void nx_diag_enosys(long s, unsigned long a1) {
 
 void EXPORT x64Syscall(x64emu_t *emu)
 {
-#ifdef __SWITCH__
-    // Directed-signal safe point. A signal another thread sent us (tkill/tgkill) has to run on OUR
-    // emu/TCB/stack, so the sender only queues it; here — at a syscall boundary, where the guest is in
-    // a well-defined state — is where we actually run it. One relaxed atomic load when nothing is
-    // pending. Re-entrancy is safe: the pending mask is taken with an atomic exchange, so a handler
-    // that itself makes syscalls finds it empty.
-    nx_signal_check_pending(emu);
-#endif
     // check if it's a wine process, then filter the syscall (simulate SECCMP)
     // Wine uses SUD (syscall user dispatch) since 11.5, bypass this hack if SUD is effective
     if(box64_wine && !box64_is32bits && (!emu || !emu->sud_enabled)) {
@@ -555,6 +547,18 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     RESET_FLAGS(emu);
     uint32_t s = R_EAX; // EAX? (syscalls only go up to 547 anyways)
 #ifdef __SWITCH__
+    // Directed-signal safe point. A signal another thread sent us (tkill/tgkill) has to run on OUR
+    // emu/TCB/stack, so the sender only queues it; here — at a syscall boundary, where the guest is in
+    // a well-defined state — is where we actually run it. One relaxed atomic load when nothing is
+    // pending. Re-entrancy is safe: the pending mask is taken with an atomic exchange, so a handler
+    // that itself makes syscalls finds it empty.
+    //
+    // It lives HERE and not in x64Syscall() because the arm64 dynarec emits a direct call to
+    // x64Syscall_linux whenever `!box64_wine` (dynarec_arm64_0f.c), and box64_wine is always 0 for
+    // box64-nx — core.c only sets it for basename wine/wine64/…, and we always pass `box64-guest`.
+    // The same gotcha already bites wine_prereserve (see CLAUDE.md). In x64Syscall() this check was
+    // dead code on the canonical dynarec build.
+    nx_signal_check_pending(emu);
     { extern void nx_applet_keepalive(void); nx_applet_keepalive(); }   // keep our layer foregrounded (main thread, throttled)
     if (kx_sctrace) { extern int nx_guest_pid(void); int pid = nx_guest_pid();
         static int cap[256]; int idx = pid & 0xff;              // PER-PID cap: client & server don't share

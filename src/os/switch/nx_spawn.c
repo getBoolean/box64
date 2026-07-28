@@ -173,7 +173,7 @@ static void* spawn_thread(void* arg) {
     // The wineserver is its own guest instance (own pid), and its main thread is a tkill/tgkill target
     // like any other — register it in the directed-signal registry (nx_signals.c), which is keyed on
     // (tid, gpid) so the two instances' thread ids cannot collide.
-    { extern void nx_sigthread_register(void); nx_sigthread_register(); }
+    { extern void nx_sigthread_register(x64emu_t*); nx_sigthread_register(emu); }
     DynaRun(emu);
     { extern void nx_sigthread_unregister(void); nx_sigthread_unregister(); }
     dec_active_emu_workers();
