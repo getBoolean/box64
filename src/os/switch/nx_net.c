@@ -735,6 +735,8 @@ enum { NX_MSG_BOUNCE_MAX = 64 * 1024 };   // datagram ceiling; larger multi-iov 
 // transfer-memory block) and broke the EXACT-FIT case at afd.c:1739-1741 that already worked.
 enum { NX_DGRAM_TRUNC_HEADROOM = 2 * 1024 };
 
+static int nx_net_is_datagram(int fd);   // defined with recvmsg below
+
 long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
     if (nx_guest_buf_bad(linux_message, sizeof(linux_msghdr))) { errno = EFAULT; return -1; }
     const linux_msghdr* message = (const linux_msghdr*)linux_message;
@@ -748,16 +750,25 @@ long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
 
     size_t total = 0;
     for (size_t i = 0; i < message->iov_count; i++) total += message->iov[i].length;
-    if (total > NX_MSG_BOUNCE_MAX) { errno = EMSGSIZE; return -1; }
+    // A scatter send larger than the bounce is only an ERROR on a message-boundary socket, where the
+    // datagram cannot be split. On a STREAM a partial send is completely legal — POSIX says send what
+    // fits and report the count — and failing it with EMSGSIZE instead breaks any writev-style caller
+    // above 64 KiB. Wine's try_send issues exactly this shape for a multi-buffer WSASend.
+    if (total > NX_MSG_BOUNCE_MAX) {
+        if (nx_net_is_datagram(fd)) { errno = EMSGSIZE; return -1; }
+        total = NX_MSG_BOUNCE_MAX;
+    }
     uint8_t* packed = (uint8_t*)malloc(total ? total : 1);
     if (!packed) { errno = ENOMEM; return -1; }
     size_t offset = 0;
-    for (size_t i = 0; i < message->iov_count; i++) {
-        if (nx_guest_buf_bad(message->iov[i].base, message->iov[i].length)) {
+    for (size_t i = 0; i < message->iov_count && offset < total; i++) {
+        size_t chunk = message->iov[i].length;
+        if (chunk > total - offset) chunk = total - offset;   // last iovec clipped by the bounce
+        if (nx_guest_buf_bad(message->iov[i].base, chunk)) {
             free(packed); errno = EFAULT; return -1;
         }
-        memcpy(packed + offset, message->iov[i].base, message->iov[i].length);
-        offset += message->iov[i].length;
+        memcpy(packed + offset, message->iov[i].base, chunk);
+        offset += chunk;
     }
     // packed is OURS (host malloc), so use the raw form -- the checked one would EFAULT on it.
     long sent = nx_net_sendto_raw(fd, packed, total, linux_flags, message->name, message->name_length);
