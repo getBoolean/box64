@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -1430,7 +1431,11 @@ int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
 enum {
     NX_FD_SET_SIZE      = 1024,   // Linux FD_SETSIZE — the bitmap's capacity in fds
     NX_FD_BITS_PER_WORD = 64,
-    NX_SELECT_MAX_FDS   = 128,    // how many SELECTED fds one call can carry (see the cap note below)
+    NX_FD_BYTES_PER_WORD = NX_FD_BITS_PER_WORD / 8,
+    NX_SELECT_STACK_MAX = 128,    // selected fds scored without touching the heap; more spill to malloc
+    NX_MSEC_PER_SEC     = 1000,
+    NX_USEC_PER_MSEC    = 1000,
+    NX_USEC_PER_SEC     = 1000000,
 };
 
 typedef struct { unsigned long words[NX_FD_SET_SIZE / NX_FD_BITS_PER_WORD]; } linux_fd_set;
@@ -1442,39 +1447,118 @@ static void fd_set_add(linux_fd_set* set, int fd) {
     if (set) set->words[fd / NX_FD_BITS_PER_WORD] |= 1UL << (fd % NX_FD_BITS_PER_WORD);
 }
 
-int nx_select(int highest_fd_plus_one, void* read_set, void* write_set, void* except_set, void* timeout) {
-    struct linux_timeval { long seconds, microseconds; };
-    const struct linux_timeval* deadline = (const struct linux_timeval*)timeout;
-    int timeout_ms = deadline ? (int)(deadline->seconds * 1000 + deadline->microseconds / 1000) : -1;
-    if (highest_fd_plus_one < 0 || highest_fd_plus_one > NX_FD_SET_SIZE) { errno = EINVAL; return -1; }
+struct linux_timeval { long seconds, microseconds; };
 
-    l_pollfd pollfds[NX_SELECT_MAX_FDS];
-    int      selected_fd[NX_SELECT_MAX_FDS];
-    int      selected_count = 0;
-    for (int fd = 0; fd < highest_fd_plus_one && selected_count < NX_SELECT_MAX_FDS; fd++) {
+// Linux only ever touches the words covering fds [0, nfds) — never the caller's whole fd_set. Sizing
+// the validation and the write-back the same way keeps a caller that allocated only what it needs
+// (legal: it declared nfds) from being smashed by a blind 128-byte memcpy.
+static size_t fd_set_bytes_used(int highest_fd_plus_one) {
+    return (size_t)((highest_fd_plus_one + NX_FD_BITS_PER_WORD - 1) / NX_FD_BITS_PER_WORD)
+           * NX_FD_BYTES_PER_WORD;
+}
+
+// Convert select()'s timeval to a poll() millisecond count, rejecting exactly what Linux rejects.
+// Returns 0 on success, -1 with errno set on a malformed timeval.
+//
+// The accept/reject split was MEASURED against glibc+Linux (tests/m2/m2.5-wineserver/selectfd.c
+// section 4), not assumed: a NEGATIVE field is EINVAL, but tv_usec >= 1000000 is perfectly legal and
+// carries into tv_sec. Rejecting the carry would break any caller that passes an un-normalised
+// timeval — and the first draft of this function did exactly that.
+static int select_timeout_ms(const struct linux_timeval* tv, int* out_ms) {
+    if (!tv) { *out_ms = -1; return 0; }                       // NULL timeout = block indefinitely
+    long seconds = tv->seconds, microseconds = tv->microseconds;
+    if (seconds < 0 || microseconds < 0) {
+        // A negative tv_sec used to fall through the (int) cast as a negative millisecond count,
+        // which nx_poll reads as INFINITE — turning a caller's bounded wait into a permanent block.
+        // (Linux rejects a negative tv_sec even when a large tv_usec would carry it positive.)
+        errno = EINVAL;
+        return -1;
+    }
+    // Clamp instead of overflowing. seconds * 1000 wrapped for any tv_sec past ~24.8 days, landing on
+    // an arbitrary short timeout or (worse) a negative one, i.e. infinite again. Both terms are
+    // range-checked BEFORE the addition so the sum itself cannot overflow.
+    const long max_seconds = (long)(INT_MAX / NX_MSEC_PER_SEC);
+    long carry_seconds = microseconds / NX_USEC_PER_SEC;
+    if (seconds >= max_seconds || carry_seconds >= max_seconds ||
+        seconds + carry_seconds >= max_seconds) { *out_ms = INT_MAX; return 0; }
+    seconds += carry_seconds;
+    microseconds %= NX_USEC_PER_SEC;
+    int ms = (int)(seconds * NX_MSEC_PER_SEC + microseconds / NX_USEC_PER_MSEC);
+    // Round a non-zero sub-millisecond timeout UP to 1 ms. Truncating it to 0 turns "sleep briefly"
+    // into "poll and return immediately", and Wine's ntdll uses select(0,NULL,NULL,NULL,tv) as its
+    // ONLY sleep primitive (dlls/ntdll/unix/sync.c) — so truncating there is a busy-spin, not a
+    // rounding error. Sleeping marginally too long is always safe; never sleeping is not.
+    if (!ms && (seconds || microseconds)) ms = 1;
+    *out_ms = ms;
+    return 0;
+}
+
+int nx_select(int highest_fd_plus_one, void* read_set, void* write_set, void* except_set, void* timeout) {
+    if (highest_fd_plus_one < 0 || highest_fd_plus_one > NX_FD_SET_SIZE) { errno = EINVAL; return -1; }
+    int timeout_ms;
+    if (select_timeout_ms((const struct linux_timeval*)timeout, &timeout_ms) < 0) return -1;
+
+    // Validate the guest pointers before dereferencing them, as every nx_net_* entry point does.
+    // A bad fd_set pointer must be EFAULT, not a host fault inside the emulator.
+    //
+    // The fd_set pointers are always raw syscall arguments, so they are always guest-owned. The
+    // TIMEOUT is not: the pselect6 entry point (nx_posix.c case 72) converts the guest's timespec
+    // into a timeval on the HOST stack and passes that, which no guest-page check can accept.
+    // Each caller therefore validates its own timeout, where the provenance is known.
+    size_t set_bytes = fd_set_bytes_used(highest_fd_plus_one);
+    if ((read_set   && nx_vfd_buf_bad(read_set,   set_bytes)) ||
+        (write_set  && nx_vfd_buf_bad(write_set,  set_bytes)) ||
+        (except_set && nx_vfd_buf_bad(except_set, set_bytes))) { errno = EFAULT; return -1; }
+
+    // Two passes: count the selected fds, then score exactly that many. The old single pass stopped
+    // at a fixed 128 and returned a confident answer computed from the prefix — a silent wrong
+    // result, not a degraded one. (Its truncation warning also false-fired whenever a call selected
+    // exactly 128 fds and nothing was actually dropped.)
+    int selected_count = 0;
+    for (int fd = 0; fd < highest_fd_plus_one; fd++)
+        if (fd_set_test((const linux_fd_set*)read_set,   fd) ||
+            fd_set_test((const linux_fd_set*)write_set,  fd) ||
+            fd_set_test((const linux_fd_set*)except_set, fd)) selected_count++;
+
+    if (!selected_count) {   // no fds selected: select() degenerates to a sleep
+        if (timeout_ms > 0) svcSleepThread((u64)timeout_ms * 1000000ULL);
+        return 0;
+    }
+
+    l_pollfd stack_pollfds[NX_SELECT_STACK_MAX];
+    int      stack_selected_fd[NX_SELECT_STACK_MAX];
+    l_pollfd* pollfds     = stack_pollfds;
+    int*      selected_fd = stack_selected_fd;
+    void*     heap_pollfds = NULL;
+    void*     heap_selected_fd = NULL;
+    if (selected_count > NX_SELECT_STACK_MAX) {
+        heap_pollfds     = malloc((size_t)selected_count * sizeof *pollfds);
+        heap_selected_fd = malloc((size_t)selected_count * sizeof *selected_fd);
+        if (!heap_pollfds || !heap_selected_fd) {
+            free(heap_pollfds); free(heap_selected_fd);
+            errno = ENOMEM;
+            return -1;
+        }
+        pollfds     = (l_pollfd*)heap_pollfds;
+        selected_fd = (int*)heap_selected_fd;
+    }
+
+    int filled = 0;
+    for (int fd = 0; fd < highest_fd_plus_one && filled < selected_count; fd++) {
         short events = 0;
         if (fd_set_test((const linux_fd_set*)read_set,   fd)) events |= NX_POLL_IN;
         if (fd_set_test((const linux_fd_set*)write_set,  fd)) events |= NX_POLL_OUT;
         if (fd_set_test((const linux_fd_set*)except_set, fd)) events |= NX_POLL_PRIORITY;
         if (!events) continue;
-        pollfds[selected_count].fd      = fd;
-        pollfds[selected_count].events  = events;
-        pollfds[selected_count].revents = 0;
-        selected_fd[selected_count]     = fd;
-        selected_count++;
+        pollfds[filled].fd      = fd;
+        pollfds[filled].events  = events;
+        pollfds[filled].revents = 0;
+        selected_fd[filled]     = fd;
+        filled++;
     }
-    if (selected_count == NX_SELECT_MAX_FDS)
-        // Never truncate silently: a caller watching more than NX_SELECT_MAX_FDS fds would get a
-        // correct-looking answer computed from a subset. Leave a breadcrumb so a mysterious missed
-        // wakeup is traceable to this cap rather than to the poll logic.
-        vlog("nx_vfd: select truncated at %d fds (nfds=%d) pid=%d\n",
-             NX_SELECT_MAX_FDS, highest_fd_plus_one, nx_guest_pid());
-    if (!selected_count) {   // no fds selected: select() degenerates to a sleep
-        if (timeout_ms > 0) svcSleepThread((u64)timeout_ms * 1000000ULL);
-        return 0;
-    }
-    int ready_count = nx_poll(pollfds, (unsigned long)selected_count, timeout_ms);
-    if (ready_count < 0) return -1;
+
+    int ready_count = nx_poll(pollfds, (unsigned long)filled, timeout_ms);
+    if (ready_count < 0) { free(heap_pollfds); free(heap_selected_fd); return -1; }
 
     // Rebuild the sets from revents. POLLERR/POLLHUP make an fd both readable and writable in select's
     // model (that is how a caller learns about them at all — select has no error bit of its own).
@@ -1482,23 +1566,25 @@ int nx_select(int highest_fd_plus_one, void* read_set, void* write_set, void* ex
     memset(&ready_read,   0, sizeof ready_read);
     memset(&ready_write,  0, sizeof ready_write);
     memset(&ready_except, 0, sizeof ready_except);
-    int result_count = 0;
-    for (int i = 0; i < selected_count; i++) {
+    // select() returns the number of READY BITS, not the number of ready fds: an fd that is both
+    // readable and writable contributes 2. Counting fds made a caller looping `while (n--)` over the
+    // set bits stop early and leave ready fds unserviced.
+    int ready_bits = 0;
+    for (int i = 0; i < filled; i++) {
         short revents = pollfds[i].revents;
         if (!revents) continue;
-        int counted = 0;
         if (read_set   && (revents & (NX_POLL_IN | NX_POLL_HANGUP | NX_POLL_ERROR)))
-            { fd_set_add(&ready_read,   selected_fd[i]); counted = 1; }
+            { fd_set_add(&ready_read,   selected_fd[i]); ready_bits++; }
         if (write_set  && (revents & (NX_POLL_OUT | NX_POLL_ERROR)))
-            { fd_set_add(&ready_write,  selected_fd[i]); counted = 1; }
+            { fd_set_add(&ready_write,  selected_fd[i]); ready_bits++; }
         if (except_set && (revents & NX_POLL_PRIORITY))
-            { fd_set_add(&ready_except, selected_fd[i]); counted = 1; }
-        result_count += counted;
+            { fd_set_add(&ready_except, selected_fd[i]); ready_bits++; }
     }
-    if (read_set)   memcpy(read_set,   &ready_read,   sizeof ready_read);
-    if (write_set)  memcpy(write_set,  &ready_write,  sizeof ready_write);
-    if (except_set) memcpy(except_set, &ready_except, sizeof ready_except);
-    return result_count;
+    free(heap_pollfds); free(heap_selected_fd);
+    if (read_set)   memcpy(read_set,   &ready_read,   set_bytes);
+    if (write_set)  memcpy(write_set,  &ready_write,  set_bytes);
+    if (except_set) memcpy(except_set, &ready_except, set_bytes);
+    return ready_bits;
 }
 
 // ---- epoll (vfd) ---------------------------------------------------------------------------------
@@ -1835,6 +1921,9 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             break;
         case 23:  // select — see nx_select(). Without this the big switch calls libnx's select(),
                   // which ENOTSOCKs the whole call on the first non-socket fd in the set.
+            // The timeval here IS a guest pointer (a raw syscall argument), unlike the host-stack
+            // one pselect6 synthesises — so it is validated here rather than inside nx_select.
+            if (a5 && nx_vfd_buf_bad((void*)a5, sizeof(struct linux_timeval))) { errno = EFAULT; r = -1; break; }
             r = nx_select((int)a1, (void*)a2, (void*)a3, (void*)a4, (void*)a5);
             break;
         case 48:  // shutdown — half-close a vfd socketpair so the PEER sees EOF. box64's scwrap has no

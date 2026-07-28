@@ -1353,8 +1353,18 @@ long syscall(long number, ...) {
             struct linux_timeval as_timeval;
             extern int nx_select(int, void*, void*, void*, void*);
             if (timeout) {
+                // Validate the GUEST timespec before dereferencing it. nx_select cannot do this for
+                // us: what it receives is the host-stack timeval synthesised just below, which no
+                // guest-page check would accept.
+                extern int nx_guest_buf_bad(const void*, size_t);
+                if (nx_guest_buf_bad(timeout, sizeof *timeout)) { errno = EFAULT; return -1; }
+                // Round the ns->us conversion UP for a non-zero timeout. Truncating a sub-microsecond
+                // wait to 0 turns "sleep briefly" into "return immediately", which is a busy-spin for
+                // a caller looping on it — the same defect nx_select fixes for sub-millisecond values.
+                const long NANOSECONDS_PER_MICROSECOND = 1000;
                 as_timeval.seconds      = timeout->seconds;
-                as_timeval.microseconds = timeout->nanoseconds / 1000;
+                as_timeval.microseconds = timeout->nanoseconds / NANOSECONDS_PER_MICROSECOND;
+                if (!as_timeval.microseconds && timeout->nanoseconds > 0) as_timeval.microseconds = 1;
             }
             return nx_select((int)a0, (void*)a1, (void*)a2, (void*)a3, timeout ? &as_timeval : NULL);
         }
