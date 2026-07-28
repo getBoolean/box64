@@ -41,6 +41,12 @@ extern int  nx_translate_path(const char* p, char* out, size_t outn);
 extern char* nx_cwd_buf(void);   // nx_posix.c — per-instance guest cwd
 extern int  nx_guest_pid(void);
 extern int  nx_gettid(void);     // nx_posix.c — guest thread id (for per-thread IPC tracing)
+// nx_signals.c — directed-signal delivery. A blocking wait is the ONLY safe place to run a queued
+// guest handler: the syscall boundary can have a wineserver request in flight, and a handler's own
+// round-trip there desynchronises the request/reply pairing. Declared here rather than via signals.h,
+// which needs x64emu_t and the emu headers this file deliberately does not pull in.
+extern int  nx_signal_pending_self(void);
+extern int  nx_signal_deliver_pending(void);   // 1 = a handler ran (caller should report EINTR)
 void nx_guest_output(int fd, const void *buf, size_t len);   // nx_main.c
 
 static void vlog(const char* fmt, ...) {
@@ -843,6 +849,26 @@ long nx_vfd_read(int fd, void* buf, size_t n) {
           if (on) vlog("nx_vfd: RDBLK pid=%d tid=%d fd=%d kind=%d peer=%d n=%zu\n",
                        nx_guest_pid(), nx_gettid(), fd, (int)v->kind, v->peer, n); }
         pthread_cond_wait(&g_cv, &g_mx);
+        // Deliver here, then ABORT this read with EINTR. Both halves are required.
+        //
+        // Blocking in this read means a wineserver request is IN FLIGHT — the reply has not arrived.
+        // Wine's usr1_handler calls wait_suspend(), which issues its OWN server_select and blocks
+        // until the server resumes it. A per-thread server connection carries one request at a time,
+        // so letting the handler run while resuming this read leaves two outstanding: the server sees
+        // a second request before answering the first, and both sides wait forever (measured: client
+        // parked in RDBLK n=16 while the server ran on for another 23 s).
+        //
+        // A real kernel does not leave the outer call pending either — the signal interrupts it, and
+        // Wine's caller re-issues. So drop g_mx (the handler re-enters this layer), run the handler,
+        // and return EINTR so that retry actually happens.
+        // EINTR only when a handler ACTUALLY ran: with delivery gated off the pending bit is still
+        // cleared, and reporting an interruption we did not cause is its own (nondeterministic) bug.
+        if (nx_signal_pending_self()) {
+            pthread_mutex_unlock(&g_mx);
+            int ran = nx_signal_deliver_pending();
+            if (ran) { errno = EINTR; return -1; }
+            pthread_mutex_lock(&g_mx);
+        }
     }
 }
 
@@ -1350,6 +1376,7 @@ int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
                   svcOutputDebugString(line, length); } }
             pthread_cond_wait(&g_cv, &g_mx);
             pthread_mutex_unlock(&g_mx);
+            if (nx_signal_pending_self() && nx_signal_deliver_pending()) { errno = EINTR; return -1; }  // see nx_vfd_read
         } else {
             struct timespec wake_at;
             int wake_is_deadline;
@@ -1372,6 +1399,7 @@ int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
             }
             int wait_result = pthread_cond_timedwait(&g_cv, &g_mx, &wake_at);
             pthread_mutex_unlock(&g_mx);
+            if (nx_signal_pending_self() && nx_signal_deliver_pending()) { errno = EINTR; return -1; }  // see nx_vfd_read
             // Only the CALLER's deadline ends the poll; a slice expiry just means "look again".
             // Setting timeout_ms to 0 gives one final scoreboard pass, so a readiness change racing
             // the deadline is not lost.

@@ -1040,8 +1040,32 @@ static int nx_signal_queue(int gpid, int tid, int sig)
 
 // Safe point: run any signal another thread queued for us, on OUR emu. Cheap when idle (one relaxed
 // atomic load), so it can sit on the syscall boundary.
+// Cheap "is a directed signal waiting for me?" probe, so a blocking wait can decide whether to drop
+// its lock and deliver. One atomic load in the common (nothing pending) case.
+int nx_signal_pending_self(void)
+{
+    int tid = nx_gettid(), gpid = nx_guest_pid();
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++)
+        if (atomic_load(&g_sigthreads[i].tid) == tid && g_sigthreads[i].gpid == gpid)
+            return atomic_load(&g_sigthreads[i].pending) != 0;
+    return 0;
+}
+
 static __thread int g_sigthread_registered = 0;
 
+// Syscall boundary: REGISTRATION ONLY. Deliberately does not deliver.
+//
+// Running a queued handler here is what deadlocked ws2_32:afd. A Wine signal handler
+// (usr1_handler -> wait_suspend) does a full wineserver round-trip, and the syscall boundary is
+// exactly where the thread may already have a request IN FLIGHT — it has written a request and not
+// yet read its reply. Injecting a nested request there desynchronises the strictly-paired
+// request/reply protocol, and the client then blocks forever on a reply that no longer matches.
+// Measured: the client parked in `nx_vfd: RDBLK … n=16` while the wineserver ran on happily for
+// another 23 s (its registry save is a red herring — the client froze first).
+//
+// Delivery happens in nx_signal_deliver_pending() instead, called from the BLOCKING WAITS, which is
+// where a real kernel would interrupt the thread and where Wine's design expects a suspend signal to
+// land: parked, with no half-finished request outstanding.
 void nx_signal_check_pending(x64emu_t* emu)
 {
     if (!g_sigthread_registered) {          // first syscall on this thread: join the registry
@@ -1049,32 +1073,51 @@ void nx_signal_check_pending(x64emu_t* emu)
         nx_sigthread_register(emu);
         g_sigthread_registered = 1;
     }
-    // RUNNING a queued handler is OPT-IN (KX_SIG_DIRECTED=1) and here is why. Targeting is now correct
-    // — a directed signal reaches the right thread in the right guest instance instead of crashing the
-    // wrong one — but ACTUALLY running Wine's usr1_handler at this safe point deadlocks ws2_32:afd:
-    // the handler does a full wineserver round-trip, and reaching it from inside the syscall dispatcher
-    // re-enters the client/server protocol while the interrupted call is still in flight. With delivery
-    // inert, afd runs 1187 tests on Ryujinx and 1186 on hardware; with it live, afd hangs.
-    //
-    // So the default is "queue, then drop with a log": strictly better than before (no more running
-    // another instance's handler on the wrong TCB) and no worse than the behaviour every green result
-    // was measured against. Finishing this needs a safe point that is not inside the syscall path, plus
-    // interruptible waits — an EINTR-from-the-vfd-wait attempt completed delivery 5/5 but made afd
-    // nondeterministic (hang or exit 1), so it is not the answer on its own.
+}
+
+// Run whatever another thread queued for us. MUST be called with no subsystem lock held (the handler
+// re-enters the vfd layer for its server round-trip), and only from a point where the guest has no
+// half-completed operation outstanding — i.e. from inside a blocking wait.
+// Returns 1 if a handler actually ran, 0 otherwise — the caller uses that to decide whether to
+// interrupt its wait, so it must NOT report an interruption it did not cause.
+//
+// Delivery is OPT-IN (KX_SIG_DIRECTED=1), and Wine's own source says why rather than just
+// measurement. The SIGUSR1 the wineserver sends a client thread comes from queue_apc()
+// (server/thread.c): it is sent only when the target is NOT already in an interruptible server wait
+// (`!is_in_apc_wait`), and the server calls wake_thread() immediately afterwards either way. So for a
+// thread parked in a server wait — which is every thread we can actually reach — the WAKEUP already
+// does the work and the signal is redundant belt-and-braces for a thread spinning in guest code.
+//
+// Running it anyway is not merely unnecessary, it is harmful: usr1_handler -> wait_suspend() issues
+// its own server_select and blocks for a resume, and a per-thread server connection carries one
+// request at a time. Delivering while the thread has a request in flight puts two on the wire and
+// both sides wait forever. A/B-proven on one binary: delivery off -> ws2_32:afd 1187 tests / 75
+// failures; delivery on -> hang at afd.c:131, identically for all three delivery points tried
+// (syscall boundary, inside-the-wait-then-resume, inside-the-wait-then-EINTR).
+//
+// The machinery itself is correct and exercised — with the gate on, 5 queued / 5 delivered / 0 ESRCH
+// — so it is here for a guest that genuinely needs directed signals, and for the day box64-nx can
+// interrupt a guest thread asynchronously (the real gap: a kernel signals at an arbitrary
+// instruction, we can only act at points we choose, and every point we can choose is "request in
+// flight").
+int nx_signal_deliver_pending(void)
+{
     static int deliver = -1;
     if (deliver < 0) deliver = getenv("KX_SIG_DIRECTED") ? 1 : 0;
+    x64emu_t* emu = NULL;
+    int ran = 0;
     int tid = nx_gettid(), gpid = nx_guest_pid();
     for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
         if (atomic_load(&g_sigthreads[i].tid) != tid || g_sigthreads[i].gpid != gpid) continue;
         uint64_t bits = atomic_exchange(&g_sigthreads[i].pending, 0);
-        if (!bits) return;
+        if (!bits) return 0;
         if (!deliver) {
             static int warned = 0;
             if (!warned) { warned = 1;
                 printf_log(LOG_NONE, "nx_sig: queued 0x%llx for tid=%d gpid=%d NOT delivered "
-                           "(KX_SIG_DIRECTED=1 to enable; see nx_signals.c)\n",
+                           "(KX_SIG_DIRECTED=1 to enable; the server's wake_thread covers it)\n",
                            (unsigned long long)bits, tid, gpid); }
-            return;
+            return 0;
         }
         // Never fall back to thread_get_emu(): on a thread without one it ALLOCATES a fresh emu on a
         // small scratch stack and would run the guest handler there. Dropping the signal is bad;
@@ -1083,7 +1126,7 @@ void nx_signal_check_pending(x64emu_t* emu)
         if (!emu) {
             printf_log(LOG_NONE, "nx_sig: pending 0x%llx for tid=%d gpid=%d but no emu — dropped\n",
                        (unsigned long long)bits, tid, gpid);
-            return;
+            return 0;
         }
         for (int sig = 1; sig <= MAX_SIGNAL && bits; sig++)
             if (bits & (1ULL << (sig - 1))) {
@@ -1105,9 +1148,11 @@ void nx_signal_check_pending(x64emu_t* emu)
                     continue;
                 }
                 nx_deliver_self(emu, sig);
+                ran = 1;
             }
-        return;
+        return ran;
     }
+    return 0;
 }
 
 int my_kill(x64emu_t* emu, int pid, int sig)

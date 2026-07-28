@@ -98,8 +98,12 @@ int my_raise(x64emu_t* emu, int sig);
 // Registry hooks (nx_posix.c clone trampoline + nx_main.c for the main thread).
 void nx_sigthread_register(x64emu_t* emu);
 void nx_sigthread_unregister(void);
-// Safe point: deliver anything another thread queued for us. Cheap when idle.
+// Syscall boundary: registration only (cheap when idle). Does NOT deliver -- see nx_signals.c.
 void nx_signal_check_pending(x64emu_t* emu);
+// Run queued signals. Call ONLY from a blocking wait, with no subsystem lock held.
+int  nx_signal_deliver_pending(void);
+// True if a directed signal is queued for THIS thread (cheap probe for blocking waits).
+int  nx_signal_pending_self(void);
 #endif
 
 #endif //__SIGNALS_H__
