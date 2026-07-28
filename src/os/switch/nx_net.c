@@ -1176,6 +1176,13 @@ int nx_net_poll(void* linux_pollfds, unsigned long count, int timeout_ms, int* o
             for (unsigned k = 0; k < socket_count; k++) {
                 short linux_revents = poll_revents_bsd_to_linux(socket_fds[k].revents,
                                                                 guest_fds[index_map[k]].events);
+                // KX_NET_LOG: what the STACK actually said, before and after translation. Wine derives
+                // AFD_POLL_WRITE straight from POLLOUT (server/sock.c), so a socket whose send buffer
+                // is full but that still polls writable is visible right here.
+                net_log("nx_net: poll fd=%d ask=0x%x bsd_rev=0x%x -> lin_rev=0x%x\n",
+                        socket_fds[k].fd, (unsigned)(unsigned short)guest_fds[index_map[k]].events,
+                        (unsigned)(unsigned short)socket_fds[k].revents,
+                        (unsigned)(unsigned short)linux_revents);
                 guest_fds[index_map[k]].revents = linux_revents;
                 if (linux_revents) ready_count++;
             }
