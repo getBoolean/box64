@@ -808,6 +808,16 @@ int nx_vfd_close(int fd) {
     return 0;
 }
 
+// Wake every thread parked in a vfd wait (pipe/socketpair read, poll, select, epoll_wait). Used by the
+// directed-signal path (nx_signals.c): a thread queued a signal for another thread, and the target may
+// be blocked here rather than at a syscall boundary where it would notice on its own. The waiters
+// re-check their own condition after waking, so a spurious broadcast is harmless.
+void nx_vfd_wake_all(void) {
+    pthread_mutex_lock(&g_mx);
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_mx);
+}
+
 long nx_vfd_read(int fd, void* buf, size_t n) {
     if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
     if (V(fd)->kind == VK_SINK) { (void)buf; (void)n; return 0; }   // discard sink: always EOF

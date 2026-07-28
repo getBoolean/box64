@@ -87,11 +87,19 @@ void init_signal_helper(box64context_t* context);
 void fini_signal_helper(void);
 
 #ifdef __SWITCH__
-// box64-nx: synchronous self-directed signal delivery (kill/tgkill/raise routed
-// straight into the guest's own handler; Horizon has no host signal delivery).
+// box64-nx: guest signal delivery (Horizon has no host signal delivery, so kill/tkill/tgkill/raise
+// are routed straight into the guest's own handler). Self-directed delivery is SYNCHRONOUS; tkill and
+// tgkill naming another thread are DIRECTED — queued on that thread and run by it at its next safe
+// point, because a handler must execute on its target's own emu/TCB/stack.
 int my_kill(x64emu_t* emu, int pid, int sig);
+int my_tkill(x64emu_t* emu, int tid, int sig);
 int my_tgkill(x64emu_t* emu, int tgid, int tid, int sig);
 int my_raise(x64emu_t* emu, int sig);
+// Registry hooks (nx_posix.c clone trampoline + nx_main.c for the main thread).
+void nx_sigthread_register(void);
+void nx_sigthread_unregister(void);
+// Safe point: deliver anything another thread queued for us. Cheap when idle.
+void nx_signal_check_pending(x64emu_t* emu);
 #endif
 
 #endif //__SIGNALS_H__

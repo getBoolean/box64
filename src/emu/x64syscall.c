@@ -529,6 +529,14 @@ static void nx_diag_enosys(long s, unsigned long a1) {
 
 void EXPORT x64Syscall(x64emu_t *emu)
 {
+#ifdef __SWITCH__
+    // Directed-signal safe point. A signal another thread sent us (tkill/tgkill) has to run on OUR
+    // emu/TCB/stack, so the sender only queues it; here — at a syscall boundary, where the guest is in
+    // a well-defined state — is where we actually run it. One relaxed atomic load when nothing is
+    // pending. Re-entrancy is safe: the pending mask is taken with an atomic exchange, so a handler
+    // that itself makes syscalls finds it empty.
+    nx_signal_check_pending(emu);
+#endif
     // check if it's a wine process, then filter the syscall (simulate SECCMP)
     // Wine uses SUD (syscall user dispatch) since 11.5, bypass this hack if SUD is effective
     if(box64_wine && !box64_is32bits && (!emu || !emu->sud_enabled)) {
@@ -624,12 +632,15 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
     // fallback fires and reaches our clone() (nx_posix.c). (Host vs Linux errno numbers differ on
     // newlib generally; this is the one case that must match for threads. See KurokoNX TODO.)
     if (s == 435) { S_RAX = -38; return; }   // clone3 -> -ENOSYS(Linux) -> glibc falls back to clone(56)
-    // Self-directed signals (kill/tkill/tgkill) must reach the guest handler via our synchronous delivery
-    // core (my_kill/my_tgkill -> nx_deliver_self), NOT the host syscall wrapper: syscallwrap[] routes
-    // 62/200/234 to host syscall() -> ENOSYS, so a guest abort()/raise()/assert() would never run its
-    // handler. Intercept here, before the wrapper dispatch. (Single process: any pid/tid resolves to self.)
+    // Signals (kill/tkill/tgkill) must reach the guest handler via our delivery core, NOT the host
+    // syscall wrapper: syscallwrap[] routes 62/200/234 to host syscall() -> ENOSYS, so a guest
+    // abort()/raise()/assert() would never run its handler. Intercept here, before the wrapper dispatch.
+    // tkill/tgkill name a SPECIFIC thread and are DIRECTED (nx_signals.c): self stays synchronous,
+    // another thread gets it queued and runs it at its own next safe point. Wine's send_thread_signal
+    // (NtSuspendThread / NtGetContextThread) depends on that — delivering on the caller instead ran the
+    // handler on a thread with no TEB and crashed ntdll.
     if (s == 62)  { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // kill(pid,sig)
-    if (s == 200) { S_RAX = my_kill(emu, (int)R_RDI, (int)R_RSI); return; }                 // tkill(tid,sig)
+    if (s == 200) { S_RAX = my_tkill(emu, (int)R_RDI, (int)R_RSI); return; }                // tkill(tid,sig)
     if (s == 234) { S_RAX = my_tgkill(emu, (int)R_RDI, (int)R_RSI, (int)R_RDX); return; }   // tgkill(tgid,tid,sig)
     if (s == 61) { // wait4(pid, status*, options, rusage)
         // ntdll:exception: the in-process wineserver's set_thread_context(DEBUG_REGISTERS) does

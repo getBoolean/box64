@@ -1662,6 +1662,9 @@ static void* nx_clone_trampoline(void* p) {
     nx_clone_t* c = (nx_clone_t*)p;
     g_nx_self = c;                          // publish tid/ctid before running the guest
     { extern void nx_set_guest_pid(int); nx_set_guest_pid(c->gpid); }   // same guest "process"
+    // Join the directed-signal registry so tkill/tgkill can find this thread (nx_signals.c). Must be
+    // AFTER g_nx_self/gpid are published — the slot is keyed on (tid, gpid).
+    { extern void nx_sigthread_register(void); nx_sigthread_register(); }
     c->fn(c->arg);                          // clone_fn_syscall: DynaRun the guest, FreeX64Emu, then return
                                             // here (on __SWITCH__ it returns instead of _exit; x64syscall.c)
     if (c->ctid) {                          // CLONE_CHILD_CLEARTID: zero the tid + wake pthread_join
@@ -1674,6 +1677,9 @@ static void* nx_clone_trampoline(void* p) {
     { extern void nx_exc_thread_exit(void); nx_exc_thread_exit(); }   // release any exception slots this
                                             // thread still holds (M2.6 pool, release site 3 — safe here: the
                                             // exiting thread is off every slot stack once c->fn returned)
+    // Leave the directed-signal registry BEFORE the record is freed: a sender must get ESRCH for a
+    // dead thread rather than queue onto a slot whose emu has already been torn down.
+    { extern void nx_sigthread_unregister(void); nx_sigthread_unregister(); }
     free(c);
     g_nx_self = NULL;
     if (reap_enabled()) nx_reap_enqueue(pthread_self());   // JOINABLE: a later clone() joins us -> frees the slot

@@ -170,7 +170,12 @@ static void* spawn_thread(void* arg) {
     // for / skips freeing my_context while the wineserver is still executing dynarec. Otherwise it frees
     // my_context under us and the next internalDBGetBlock -> mutex_lock(&my_context->mutex_dyndump) faults.
     inc_active_emu_workers();
+    // The wineserver is its own guest instance (own pid), and its main thread is a tkill/tgkill target
+    // like any other — register it in the directed-signal registry (nx_signals.c), which is keyed on
+    // (tid, gpid) so the two instances' thread ids cannot collide.
+    { extern void nx_sigthread_register(void); nx_sigthread_register(); }
     DynaRun(emu);
+    { extern void nx_sigthread_unregister(void); nx_sigthread_unregister(); }
     dec_active_emu_workers();
     slog("nx_spawn: wineserver exited eax=%d\n", GetEAX(emu));
     return NULL;

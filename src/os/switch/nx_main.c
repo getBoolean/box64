@@ -523,6 +523,10 @@ int main(int argc, char **argv) {
                                              : "nx_spawn: wineserver not listening (continuing anyway)");
             }
         }
+        // Join the directed-signal registry as tid 1 before running guest code: Wine's main thread is a
+        // legitimate tkill/tgkill target (nx_signals.c), and only threads created via clone() register
+        // themselves in the trampoline.
+        { extern void nx_sigthread_register(void); nx_sigthread_register(); }
         g_bench_tick = armGetSystemTick();     // benchmark reference: emulate start (see nx_guest_output)
         code = emulate(emu, elf);
         { u64 ms = armTicksToNs(armGetSystemTick() - g_bench_tick) / 1000000ULL;

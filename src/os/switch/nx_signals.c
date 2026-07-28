@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
@@ -842,6 +843,8 @@ void my_sigactionhandler_oldcode(x64emu_t* emu, int32_t sig, int simple, x64_sig
 // ----- self-directed delivery: kill/tgkill/raise route straight into the guest handler -----
 // Horizon is a single guest process with no host signal delivery, so a guest kill/raise at
 // itself is delivered synchronously (or queued if we are inside a box64 critical section).
+extern int nx_gettid(void);
+extern int nx_guest_pid(void);
 static void nx_deliver_self(x64emu_t* emu, int sig)
 {
     if(!emu)
@@ -853,8 +856,11 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     uintptr_t h = my_context->signals[sig];
     { static int siglog = -1; if (siglog < 0) siglog = getenv("KX_SIGLOG") ? 1 : 0;
       if (siglog) {
-          printf_log(LOG_NONE, "nx_sig: deliver self sig=%d rip=%p handler=0x%lx\n",
-                     sig, (void*)R_RIP, (unsigned long)h);
+          // tid/gpid/FS identify WHICH thread is about to run the handler, and FS is what the guest's
+          // own pthread_getspecific() reads — the two facts needed when a handler finds its TLS empty.
+          printf_log(LOG_NONE, "nx_sig: deliver self sig=%d tid=%d gpid=%d fs=0x%lx rip=%p handler=0x%lx\n",
+                     sig, nx_gettid(), nx_guest_pid(), (unsigned long)emu->segs_offs[_FS],
+                     (void*)R_RIP, (unsigned long)h);
           if (sig == 6) {   // SIGABRT (abort/stack-smash): dump the guest stack so the smashed frame's
               uintptr_t rsp = R_RSP;   // return-address chain (raise<-abort<-__fortify_fail<-smashed) is visible
               uintptr_t fsb = emu->segs_offs[_FS], gsb = emu->segs_offs[_GS];
@@ -942,9 +948,106 @@ static void nx_deliver_self(x64emu_t* emu, int sig)
     emu->eflags = s_eflags;
 }
 
+// ---- directed (cross-thread) signal delivery -----------------------------------------------------
+//
+// tkill/tgkill name a SPECIFIC thread, and Wine relies on that: send_thread_signal() is how
+// NtSuspendThread and NtGetContextThread interrupt another thread. Delivering on the CALLER instead
+// (which is what this did before 2026-07-27) runs the handler on the wrong thread, where Wine's
+// NtCurrentTeb() — pthread_getspecific(teb_key), not a segment register — returns NULL, and the
+// handler dereferences it (crash at ntdll.so+0x420b7; it blocked the whole ws2_32 rung).
+//
+// A signal must run on the TARGET's own emu/TCB/stack, so it cannot be delivered by the sender.
+// Instead the sender queues it and the target runs it at its next safe point (nx_signal_check_pending,
+// called from the syscall boundary and from the blocking wait loops). That is cooperative rather than
+// preemptive: a target spinning in pure guest code with no syscalls will not notice. Wine's threads
+// are constantly in server round-trips and futex waits, so in practice the latency is one syscall.
+enum { NX_SIGTHREAD_MAX = 256 };
+typedef struct {
+    _Atomic int      tid;      // 0 = free slot
+    int              gpid;     // guest instance (client vs the in-process wineserver)
+    x64emu_t*        emu;
+    _Atomic uint64_t pending;  // bit (sig-1) set by ANOTHER thread
+} nx_sigthread_t;
+static nx_sigthread_t g_sigthreads[NX_SIGTHREAD_MAX];
+
+extern int nx_gettid(void);
+extern int nx_guest_pid(void);
+
+// Called by a thread about to run guest code, and again as it exits.
+void nx_sigthread_register(void)
+{
+    int tid = nx_gettid();
+    x64emu_t* emu = thread_get_emu_no_create();
+    if (!emu) return;
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&g_sigthreads[i].tid, &expected, tid)) {
+            g_sigthreads[i].gpid = nx_guest_pid();
+            g_sigthreads[i].emu  = emu;
+            atomic_store(&g_sigthreads[i].pending, 0);
+            return;
+        }
+        // Re-registration of the same (tid,gpid) — refresh the emu rather than burning a second slot.
+        if (atomic_load(&g_sigthreads[i].tid) == tid && g_sigthreads[i].gpid == nx_guest_pid()) {
+            g_sigthreads[i].emu = emu;
+            return;
+        }
+    }
+}
+
+void nx_sigthread_unregister(void)
+{
+    int tid = nx_gettid(), gpid = nx_guest_pid();
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++)
+        if (atomic_load(&g_sigthreads[i].tid) == tid && g_sigthreads[i].gpid == gpid) {
+            g_sigthreads[i].emu = NULL;
+            atomic_store(&g_sigthreads[i].pending, 0);
+            atomic_store(&g_sigthreads[i].tid, 0);
+            return;
+        }
+}
+
+// Queue `sig` on another thread. Returns 0, or -1/ESRCH if that thread is not (or no longer) live.
+// `gpid` selects the guest INSTANCE: the wineserver signals the client's threads, and both instances
+// number their main thread 1, so the tid alone is ambiguous.
+static int nx_signal_queue(int gpid, int tid, int sig)
+{
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
+        if (atomic_load(&g_sigthreads[i].tid) != tid || g_sigthreads[i].gpid != gpid) continue;
+        atomic_fetch_or(&g_sigthreads[i].pending, 1ULL << (sig - 1));
+        // Wake it if it is parked in a vfd wait (pipe/socketpair/poll/select). A futex wait is woken
+        // by whoever owns that futex; a target in pure guest code notices at its next syscall.
+        { extern void nx_vfd_wake_all(void); nx_vfd_wake_all(); }
+        return 0;
+    }
+    errno = ESRCH;
+    return -1;
+}
+
+// Safe point: run any signal another thread queued for us, on OUR emu. Cheap when idle (one relaxed
+// atomic load), so it can sit on the syscall boundary.
+void nx_signal_check_pending(x64emu_t* emu)
+{
+    int tid = nx_gettid(), gpid = nx_guest_pid();
+    for (int i = 0; i < NX_SIGTHREAD_MAX; i++) {
+        if (atomic_load(&g_sigthreads[i].tid) != tid || g_sigthreads[i].gpid != gpid) continue;
+        uint64_t bits = atomic_exchange(&g_sigthreads[i].pending, 0);
+        if (!bits) return;
+        if (!emu) emu = g_sigthreads[i].emu;
+        for (int sig = 1; sig <= MAX_SIGNAL && bits; sig++)
+            if (bits & (1ULL << (sig - 1))) {
+                bits &= ~(1ULL << (sig - 1));
+                nx_deliver_self(emu, sig);
+            }
+        return;
+    }
+}
+
 int my_kill(x64emu_t* emu, int pid, int sig)
 {
     (void)pid;  // single guest process: any target resolves to "self"
+    { static int sl=-1; if(sl<0) sl=getenv("KX_SIGLOG")?1:0;
+      if(sl) printf_log(LOG_NONE, "nx_sig: kill(pid=%d,sig=%d) from tid=%d gpid=%d\n", pid, sig, nx_gettid(), nx_guest_pid()); }
     if(sig<0 || sig>MAX_SIGNAL) {
         errno = EINVAL;
         return -1;
@@ -955,21 +1058,51 @@ int my_kill(x64emu_t* emu, int pid, int sig)
     return 0;
 }
 
+// tkill(tid, sig) — no thread group in the call, so the target is in the CALLER's instance.
+int my_tkill(x64emu_t* emu, int tid, int sig)
+{
+    return my_tgkill(emu, nx_guest_pid(), tid, sig);
+}
+
 int my_tgkill(x64emu_t* emu, int tgid, int tid, int sig)
 {
-    (void)tgid; (void)tid;
     if(sig<0 || sig>MAX_SIGNAL) {
         errno = EINVAL;
         return -1;
     }
+    static int siglog = -1;
+    if (siglog < 0) siglog = getenv("KX_SIGLOG") ? 1 : 0;
+    if (siglog) printf_log(LOG_NONE, "nx_sig: tgkill(tgid=%d,tid=%d,sig=%d) from tid=%d gpid=%d\n",
+                           tgid, tid, sig, nx_gettid(), nx_guest_pid());
     if(sig==0)
         return 0;
-    nx_deliver_self(emu, sig);
+    // tgid selects the guest INSTANCE, and it is load-bearing rather than decoration: the in-process
+    // wineserver (gpid 2) signals the CLIENT's threads (gpid 100) with
+    // tgkill(thread->unix_pid, thread->unix_tid, sig), and BOTH instances number their main thread 1.
+    // Matching on tid alone made the wineserver deliver to ITSELF and run the client's ntdll handler,
+    // where Wine's NtCurrentTeb() is legitimately NULL — the crash that blocked the whole ws2_32 rung.
+    if(tgid <= 0) tgid = nx_guest_pid();
+    // Self stays SYNCHRONOUS: glibc raise() is tgkill(getpid(), gettid(), sig) and its callers expect
+    // the handler to have run by the time it returns.
+    if(tid <= 0 || (tgid == nx_guest_pid() && tid == nx_gettid())) {
+        nx_deliver_self(emu, sig);
+        return 0;
+    }
+    if (siglog) printf_log(LOG_NONE, "nx_sig: queue sig=%d for gpid=%d tid=%d (from gpid=%d tid=%d)\n",
+                           sig, tgid, tid, nx_guest_pid(), nx_gettid());
+    if(nx_signal_queue(tgid, tid, sig) < 0) {
+        // No such live thread. ESRCH is the honest answer and is what Wine checks for when a thread
+        // has already exited — do NOT fall back to self-delivery, which is the bug this replaced.
+        if (siglog) printf_log(LOG_NONE, "nx_sig: gpid=%d tid=%d not live -> ESRCH\n", tgid, tid);
+        return -1;
+    }
     return 0;
 }
 
 int my_raise(x64emu_t* emu, int sig)
 {
+    { static int sl=-1; if(sl<0) sl=getenv("KX_SIGLOG")?1:0;
+      if(sl) printf_log(LOG_NONE, "nx_sig: raise(sig=%d) from tid=%d gpid=%d\n", sig, nx_gettid(), nx_guest_pid()); }
     if(sig<0 || sig>MAX_SIGNAL) {
         errno = EINVAL;
         return -1;
