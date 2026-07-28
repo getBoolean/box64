@@ -727,6 +727,14 @@ typedef struct {
 // MUST leave as one packet — looping sendto() per iovec would fragment one message into several.
 enum { NX_MSG_BOUNCE_MAX = 64 * 1024 };   // datagram ceiling; larger multi-iov sends report EMSGSIZE
 
+// Slack added to a datagram receive so an oversized datagram can be SEEN rather than refused.
+// It has to be enough to hold the overflow, because a stack that rejects the short buffer DISCARDS
+// the datagram (measured: Ryujinx returns EMSGSIZE and a non-blocking re-read finds nothing) — the
+// bytes are gone, so there is no recovering them afterwards. It also must not be huge: asking for
+// the full 64 KiB ceiling changes libnx's behaviour (it marshals a socket read through a fixed
+// transfer-memory block) and broke the EXACT-FIT case at afd.c:1739-1741 that already worked.
+enum { NX_DGRAM_TRUNC_HEADROOM = 2 * 1024 };
+
 long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
     if (nx_guest_buf_bad(linux_message, sizeof(linux_msghdr))) { errno = EFAULT; return -1; }
     const linux_msghdr* message = (const linux_msghdr*)linux_message;
@@ -759,12 +767,37 @@ long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
     return sent;
 }
 
+// Is this a message-boundary socket? Only a DATAGRAM socket can "truncate" — a short read on a
+// stream is just a short read, and the rest stays queued.
+static int nx_net_is_datagram(int fd) {
+    int type = 0;
+    unsigned type_length = sizeof type;
+    if (nx_bsd_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) != 0) return 0;
+    return type == SOCK_DGRAM;
+}
+
 long nx_net_recvmsg(int fd, void* linux_message, int linux_flags) {
     if (nx_guest_buf_bad(linux_message, sizeof(linux_msghdr))) { errno = EFAULT; return -1; }
     linux_msghdr* message = (linux_msghdr*)linux_message;
     message->control_length = 0;   // no ancillary data is ever produced on an INET socket
     if (message->iov_count == 0) { message->flags = 0; return 0; }
-    if (message->iov_count == 1) {
+
+    size_t total = 0;
+    for (size_t i = 0; i < message->iov_count; i++) total += message->iov[i].length;
+
+    // Linux recvmsg on a DATAGRAM socket that does not fit copies what it can, sets MSG_TRUNC in
+    // msg_flags, and returns the COPIED count. Wine reads exactly that bit
+    // (dlls/ntdll/unix/socket.c:756) to choose STATUS_BUFFER_OVERFLOW over STATUS_SUCCESS, and has no
+    // other way to learn a datagram was truncated. NEITHER stack gives it to us: Ryujinx fails the
+    // call with EMSGSIZE — and Wine's error path never writes *size, so io.Information is returned
+    // UNINITIALISED (sock_recv, socket.c:886/891) — while FreeBSD truncates SILENTLY, so Wine reports
+    // plain success for a short read. Receiving into a bounce LARGER than the caller's buffers is what
+    // makes the truncation observable at all, so datagrams always take the bounce path.
+    int is_datagram = nx_net_is_datagram(fd);
+
+    if (!is_datagram && message->iov_count == 1) {
+        // Stream, single iovec: nothing to detect and nothing to scatter — read straight into the
+        // guest buffer and skip the bounce entirely.
         unsigned name_capacity = message->name_length;
         long received = nx_net_recvfrom(fd, message->iov[0].base, message->iov[0].length, linux_flags,
                                         message->name, message->name ? &name_capacity : NULL);
@@ -774,30 +807,68 @@ long nx_net_recvmsg(int fd, void* linux_message, int linux_flags) {
         }
         return received;
     }
+
     // Multi-iovec: receive the whole datagram once into a bounce buffer, then scatter. Reading per
     // iovec would consume one datagram per call and drop the remainder of each.
-    size_t total = 0;
-    for (size_t i = 0; i < message->iov_count; i++) total += message->iov[i].length;
-    if (total > NX_MSG_BOUNCE_MAX) total = NX_MSG_BOUNCE_MAX;
-    uint8_t* packed = (uint8_t*)malloc(total ? total : 1);
+    // For a datagram, ask for exactly ONE byte more than the caller can hold: that is all it takes to
+    // learn the datagram did not fit, and Linux returns the copied count anyway. Requesting a large
+    // fixed bounce instead is actively harmful — libnx marshals a socket read through a fixed
+    // transfer-memory block, so an oversized request changes the stack's behaviour and broke the
+    // EXACT-FIT case (afd.c:1739-1741) that already worked.
+    //
+    // The one caller that needs the true length is one that passed MSG_TRUNC, which asks for it
+    // explicitly; only that path pays for the big bounce.
+    size_t bounce_length = total;
+    if (is_datagram)
+        bounce_length = (linux_flags & LINUX_MSG_TRUNC) ? NX_MSG_BOUNCE_MAX
+                                                        : total + NX_DGRAM_TRUNC_HEADROOM;
+    if (bounce_length > NX_MSG_BOUNCE_MAX) bounce_length = NX_MSG_BOUNCE_MAX;
+    uint8_t* packed = (uint8_t*)malloc(bounce_length ? bounce_length : 1);
     if (!packed) { errno = ENOMEM; return -1; }
     unsigned name_capacity = message->name_length;
     // packed is OURS (host malloc) -- raw form, see nx_net_sendto_raw.
-    long received = nx_net_recvfrom_raw(fd, packed, total, linux_flags,
+    long received = nx_net_recvfrom_raw(fd, packed, bounce_length, linux_flags,
                                         message->name, message->name ? &name_capacity : NULL);
+    // A stack may refuse the short buffer outright instead of truncating (Ryujinx answers EMSGSIZE
+    // where FreeBSD truncates silently). Linux NEVER surfaces EMSGSIZE to a recvmsg caller, and
+    // Wine's error path leaves io.Information uninitialised, so retry once with a full-datagram
+    // bounce. The retry is forced NON-BLOCKING: if the failed call already consumed the datagram
+    // there is nothing left to read, and the honest answer is the original error rather than a hang.
+    if (received < 0 && is_datagram && errno == EMSGSIZE && bounce_length < NX_MSG_BOUNCE_MAX) {
+        uint8_t* bigger = (uint8_t*)realloc(packed, NX_MSG_BOUNCE_MAX);
+        if (bigger) {
+            packed = bigger;
+            name_capacity = message->name_length;
+            long retried = nx_net_recvfrom_raw(fd, packed, NX_MSG_BOUNCE_MAX,
+                                               linux_flags | LINUX_MSG_DONTWAIT,
+                                               message->name, message->name ? &name_capacity : NULL);
+            if (retried >= 0) received = retried;
+            else errno = EMSGSIZE;      // datagram already gone: report what the stack first said
+        }
+    }
+    { static int log_enabled = -1; if (log_enabled < 0) log_enabled = getenv("KX_NET_LOG") ? 1 : 0;
+      if (log_enabled) net_log("nx_net: recvmsg fd=%d dgram=%d iovs=%zu total=%zu bounce=%zu -> %ld e=%d\n",
+                                  fd, is_datagram, message->iov_count, total, bounce_length,
+                                  received, received < 0 ? errno : 0); }
     if (received < 0) { int saved_errno = errno; free(packed); errno = saved_errno; return -1; }
+
+    size_t copied = (size_t)received;
+    int truncated = 0;
+    if (copied > total) { copied = total; truncated = 1; }
     size_t offset = 0;
-    for (size_t i = 0; i < message->iov_count && offset < (size_t)received; i++) {
+    for (size_t i = 0; i < message->iov_count && offset < copied; i++) {
         size_t chunk = message->iov[i].length;
-        if (chunk > (size_t)received - offset) chunk = (size_t)received - offset;
+        if (chunk > copied - offset) chunk = copied - offset;
         if (nx_guest_buf_bad(message->iov[i].base, chunk)) { free(packed); errno = EFAULT; return -1; }
         memcpy(message->iov[i].base, packed + offset, chunk);
         offset += chunk;
     }
     free(packed);
     message->name_length = message->name ? name_capacity : 0;
-    message->flags       = 0;
-    return received;
+    message->flags       = truncated ? LINUX_MSG_TRUNC : 0;
+    // Linux returns the COPIED count, except when the caller passed MSG_TRUNC, which asks for the
+    // real datagram length instead.
+    return (linux_flags & LINUX_MSG_TRUNC) ? received : (long)copied;
 }
 
 // ---- socket options ------------------------------------------------------------------------------
