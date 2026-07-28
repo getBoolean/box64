@@ -1355,6 +1355,14 @@ int nx_poll(l_pollfd* pollfds, unsigned long count, int timeout_ms) {
                 }
                 // real newlib fd: no host poll on Horizon — report it ready for whatever was
                 // asked (a read on a real file won't block anyway)
+                //
+                // KX_REQLOG: this branch is ALWAYS-READY, so anything that lands here wrongly makes
+                // every poll on it complete instantly. That is the signature behind ws2_32:afd's
+                // "expected STATUS_TIMEOUT, got 0" failures (afd.c:1069/1095/1193/1222) — a socket
+                // that nx_net_is_socket() failed to recognise would be scored here.
+                { static int on = -1; if (on < 0) on = getenv("KX_REQLOG") ? 1 : 0;
+                  if (on) vlog("nx_vfd: POLL-ALWAYSREADY pid=%d fd=%d ev=%#x\n",
+                               nx_guest_pid(), pollfds[i].fd, (unsigned)pollfds[i].events); }
                 has_plain_file = 1;
                 pollfds[i].revents = pollfds[i].events & (NX_POLL_IN | NX_POLL_OUT);
                 if (pollfds[i].revents) ready_count++;
