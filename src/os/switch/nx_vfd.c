@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/iosupport.h>   // devoptab / __alloc_handle / __get_handle — real fd numbers for vfds
 
 #include "custommem.h"   // getProtection — validate guest buffers before deref (EFAULT, not a fault)
 #include "nx_fsfunnel.h" // SD I/O funnel: nx_fs_* wrappers + the nx_dent_t snapshot type
@@ -112,7 +113,9 @@ static shobj_t g_sh[NX_SHOBJ_MAX];
 
 typedef struct {
     vkind_t  kind;
-    int      refs;
+    int      refs;                // LEGACY numbering only — how many owners share this fd NUMBER.
+                                  // Under LOWFD each vfd has a real newlib handle and newlib's own
+                                  // refcount does this job, so the field is untouched there.
     int      nonblock;
     unsigned ino;                 // synthetic identity for fstat
     // VK_DIR
@@ -205,11 +208,98 @@ void nx_regtmp_forget(int fd) {
         if (g_regtmp[i].fd == fd && g_regtmp[i].pid == pid) { g_regtmp[i] = g_regtmp[--g_regtmp_n]; return; }
 }
 
-static inline int  is_vfd(int fd)  { return fd >= NX_VFD_BASE && fd < NX_VFD_BASE + NX_VFD_MAX; }
-static inline vfd_t* V(int fd)     { return &g_v[fd - NX_VFD_BASE]; }
+// ---- fd numbering --------------------------------------------------------------------------------
+// Two numbering schemes coexist in one binary so the change can be A/B'd on hardware over FTP.
+//
+// LEGACY: a vfd IS its number, NX_VFD_BASE + slot. Simple, and it can never collide with a newlib
+// fd — but 0x40000000 is far above FD_SETSIZE, so no fd_set can carry a pipe (glibc's FD_SET()
+// writes ~128 MB past the end of the set), and dup2() cannot pin a vfd to a chosen number, so a
+// guest shell cannot do `2>&1` and posix_spawn file-actions cannot work.
+//
+// LOWFD (default): the vfd layer registers its own devoptab and allocates a REAL newlib fd per vfd,
+// keeping the slot index in the handle's fileStruct. Numbers come from newlib's 1024-entry table
+// (lowest free first), so they fit an fd_set — and newlib refcounts the handle, which gives
+// dup()/dup2() correct POSIX aliasing for free. This is the same mechanism nx_net_is_socket()
+// already relies on for libnx's "soc" device.
+//
+// The one cost: a vfd now consumes a newlib handle, where legacy numbering consumed none. Worst case
+// is NX_VFD_MAX (256) of newlib's 1024, and Wine's own fds come out of the same pool — so a handle
+// exhaustion that used to hit only real files can now be reached by pipes and sockets too. Every
+// publish site rolls its slot back on failure rather than stranding it.
+//
+// KX_NO_VFD_LOWFD=1 restores the legacy numbering for A/B.
+static int kxvfd_close_r(struct _reent* r, void* fileStruct);
+int nx_vfd_close(int fd);                  // the slot teardown closes queued SCM_RIGHTS fds
+static const devoptab_t g_kxvfd_devoptab = {
+    .name       = "kxvfd",
+    .structSize = sizeof(int),        // the g_v slot index this fd refers to
+    .close_r    = kxvfd_close_r,
+};
+enum { KXVFD_DEVICE_NONE = -1 };
+static int g_kxvfd_device = KXVFD_DEVICE_NONE;
+static int g_lowfd_mode   = 0;
+static pthread_once_t g_kxvfd_once = PTHREAD_ONCE_INIT;
+
+static void kxvfd_init(void) {
+    if (getenv("KX_NO_VFD_LOWFD")) return;           // legacy numbering for A/B
+    int device = AddDevice(&g_kxvfd_devoptab);
+    if (device < 0) return;                          // no free devoptab slot: stay legacy rather than fail
+    g_kxvfd_device = device;
+    g_lowfd_mode   = 1;
+}
+// Safe to call unlocked and from any thread — is_vfd() runs on every fd-taking syscall.
+static inline int lowfd_mode(void) { pthread_once(&g_kxvfd_once, kxvfd_init); return g_lowfd_mode; }
+
+enum { VFD_SLOT_NONE = -1 };
+
+// The one place a guest fd number is turned into a g_v index. Returns VFD_SLOT_NONE if the fd is
+// not a vfd at all, which is what makes is_vfd() a pure function of the fd.
+static inline int vfd_slot_of(int fd) {
+    if (fd < 0) return VFD_SLOT_NONE;
+    if (lowfd_mode()) {
+        __handle* handle = __get_handle(fd);
+        if (!handle || (int)handle->device != g_kxvfd_device) return VFD_SLOT_NONE;
+        return *(int*)handle->fileStruct;
+    }
+    if (fd < NX_VFD_BASE || fd >= NX_VFD_BASE + NX_VFD_MAX) return VFD_SLOT_NONE;
+    return fd - NX_VFD_BASE;
+}
+
+static inline int  is_vfd(int fd)  { return vfd_slot_of(fd) != VFD_SLOT_NONE; }
+static inline vfd_t* V(int fd)     { return &g_v[vfd_slot_of(fd)]; }
 static inline size_t rused(vfd_t* v){ return v->wr - v->rd; }
 
-int nx_vfd_is(int fd) { return is_vfd(fd) && g_v[fd - NX_VFD_BASE].kind != VK_FREE; }
+int nx_vfd_is(int fd) {
+    int slot = vfd_slot_of(fd);
+    return slot != VFD_SLOT_NONE && g_v[slot].kind != VK_FREE;
+}
+
+// Give a slot a guest-visible fd number. Deliberately NOT done in slot_alloc(): nx_connect creates
+// a peer slot that sits on a listener's backlog and may never be accepted, so slots and fds have
+// independent lifetimes and a slot must be publishable exactly once, when it is handed to the guest.
+// Returns -1 with errno set (ENFILE/ENOMEM from __alloc_handle) if no handle is available.
+static int vfd_publish(int slot) {
+    if (!lowfd_mode()) return NX_VFD_BASE + slot;
+    int fd = __alloc_handle(g_kxvfd_device);
+    if (fd < 0) return -1;
+    *(int*)__get_handle(fd)->fileStruct = slot;
+    return fd;
+}
+
+// Publish a freshly-initialised slot, returning it to the pool if no handle is available. Call with
+// g_mx held. Without the rollback an exhausted handle table would strand slots permanently, turning
+// a recoverable ENFILE into a slow leak of the 256-slot pool.
+static int vfd_publish_or_free(int slot) {
+    int fd = vfd_publish(slot);
+    if (fd < 0) {
+        int saved_errno = errno;
+        free(g_v[slot].buf);
+        memset(&g_v[slot], 0, sizeof g_v[slot]);
+        g_v[slot].kind = VK_FREE;
+        errno = saved_errno;
+    }
+    return fd;
+}
 
 // v2 data-op guard (Phase A): true only for a REAL SD-file fd, so the data funnel skips std fds, vfds
 // (>=NX_VFD_BASE), stdout/err tee-dup targets, and reg*.tmp discard fds (all handled on the caller thread).
@@ -246,8 +336,9 @@ int nx_vfd_open_dir(const char* guest, const char* host) {
     v->kind = VK_DIR;
     snprintf(v->host,  sizeof v->host,  "%s", host);
     snprintf(v->guest, sizeof v->guest, "%s", guest ? guest : host);
+    int fd = vfd_publish_or_free(i);
     pthread_mutex_unlock(&g_mx);
-    return NX_VFD_BASE + i;
+    return fd;
 }
 
 // A write-discard sink vfd. The wineserver's periodic registry flush writes each branch to a
@@ -264,8 +355,9 @@ int nx_vfd_open_sink(void) {
     int i = slot_alloc();
     if (i < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
     g_v[i].kind = VK_SINK;
+    int fd = vfd_publish_or_free(i);
     pthread_mutex_unlock(&g_mx);
-    return NX_VFD_BASE + i;
+    return fd;
 }
 
 const char* nx_vfd_dir_host(int fd)  { return nx_vfd_is(fd) ? V(fd)->host  : NULL; }
@@ -392,10 +484,13 @@ int nx_vfd_open_shared(const char* guestpath, int is_lock) {
     g_v[i].kind  = is_lock ? VK_LOCK : VK_SHMEM;
     g_v[i].shobj = si;
     g_v[i].fpos  = 0;
+    int fd = vfd_publish_or_free(i);
+    if (fd < 0 && g_sh[si].refs > 0) g_sh[si].refs--;   // undo the shobj_get reference
     pthread_mutex_unlock(&g_mx);
+    if (fd < 0) return -1;
     vlog("nx_vfd: open %s '%s' -> vfd=%d pid=%d\n", is_lock ? "LOCK" : "SHMEM",
-         guestpath, NX_VFD_BASE + i, nx_guest_pid());
-    return NX_VFD_BASE + i;
+         guestpath, fd, nx_guest_pid());
+    return fd;
 }
 
 // flock(fd, op): LOCK_SH=1, LOCK_EX=2, LOCK_UN=8, LOCK_NB=4. Wine's server holds LOCK_EX on the lock
@@ -613,9 +708,11 @@ int nx_tmpfs_openat(const char* p, int flags, mode_t mode) {
     g_v[vi].shobj = idx;
     g_v[vi].fpos  = 0;
     snprintf(g_v[vi].guest, sizeof g_v[vi].guest, "%s", p);   // dir path for getdents; else diagnostics
+    int fd = vfd_publish_or_free(vi);
+    if (fd < 0) tn_release(idx);            // undo the node ref taken just above
     pthread_mutex_unlock(&g_tmpfs_mx);
     pthread_mutex_unlock(&g_mx);
-    return NX_VFD_BASE + vi;
+    return fd;
 }
 int nx_tmpfs_stat(const char* p, struct stat* st) {
     pthread_mutex_lock(&g_tmpfs_mx);
@@ -776,11 +873,14 @@ static int nx_tmpfs_fill_dents(vfd_t* v) {
 
 // ---- close / read / write ----------------------------------------------------------------------
 
-int nx_vfd_close(int fd) {
-    if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+// Tear down a slot and return it to the pool. Keyed on the SLOT, never on an fd: newlib's _close_r
+// clears handles[fd] BEFORE invoking close_r, so V(fd) would already fail by the time the teardown
+// runs. Idempotent — a slot already VK_FREE is left alone.
+static void vfd_slot_free(int slot) {
+    if (slot < 0 || slot >= NX_VFD_MAX) return;
     pthread_mutex_lock(&g_mx);
-    vfd_t* v = V(fd);
-    if (--v->refs > 0) { pthread_mutex_unlock(&g_mx); return 0; }
+    vfd_t* v = &g_v[slot];
+    if (v->kind == VK_FREE) { pthread_mutex_unlock(&g_mx); return; }
     if ((v->kind == VK_LOCK || v->kind == VK_SHMEM) && v->shobj >= 0) {
         shobj_t* o = &g_sh[v->shobj];
         if (v->kind == VK_LOCK && o->lock_owner == nx_guest_pid()) o->lock_owner = 0;
@@ -793,8 +893,16 @@ int nx_vfd_close(int fd) {
     if ((v->kind == VK_PIPE || v->kind == VK_SOCK) && v->peer >= 0 && g_v[v->peer].kind != VK_FREE)
         g_v[v->peer].peer = -1;              // peer sees EOF/EPIPE
     if (v->kind == VK_LISTEN)
-        for (int i = 0; i < v->backlog_n; i++)
-            if (g_v[v->backlog[i]].kind != VK_FREE) { g_v[v->backlog[i]].refs = 0; g_v[v->backlog[i]].kind = VK_FREE; }
+        // Un-accepted backlog entries have a SLOT but no fd (nx_accept4 is what publishes one), so
+        // there is no handle to release — free them directly, including any ring the connector
+        // already wrote into.
+        for (int i = 0; i < v->backlog_n; i++) {
+            vfd_t* pending = &g_v[v->backlog[i]];
+            if (pending->kind == VK_FREE) continue;
+            free(pending->buf);
+            memset(pending, 0, sizeof *pending);
+            pending->kind = VK_FREE;
+        }
     free(v->buf);
     if (v->kind == VK_EPOLL) free(v->epset);
     // Unclaimed passed fds: drop our reference. A queued REAL fd is a dup() this layer made in
@@ -812,6 +920,27 @@ int nx_vfd_close(int fd) {
     v->kind = VK_FREE;
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mx);
+}
+
+// newlib calls this once the LAST fd naming a vfd is closed (its handle refcount hit 0), which is
+// what makes dup()/dup2() on a vfd correct without any refcounting of our own.
+static int kxvfd_close_r(struct _reent* r, void* fileStruct) {
+    (void)r;
+    vfd_slot_free(*(int*)fileStruct);
+    return 0;
+}
+
+int nx_vfd_close(int fd) {
+    if (!nx_vfd_is(fd)) { errno = EBADF; return -1; }
+    // LOWFD: newlib owns the fd and its refcount; the teardown runs from kxvfd_close_r at zero.
+    // Never call __release_handle here — it frees the handle WITHOUT consulting the refcount, so it
+    // would pull the object out from under any dup() still naming it.
+    if (lowfd_mode()) return close(fd);
+    pthread_mutex_lock(&g_mx);
+    vfd_t* v = V(fd);
+    if (--v->refs > 0) { pthread_mutex_unlock(&g_mx); return 0; }
+    pthread_mutex_unlock(&g_mx);
+    vfd_slot_free(fd - NX_VFD_BASE);
     return 0;
 }
 
@@ -980,8 +1109,26 @@ static int make_pair(vkind_t kind, int fds[2], int nonblock) {
     g_v[a].peer = b;    g_v[b].peer = a;
     g_v[a].nonblock = g_v[b].nonblock = nonblock;
     g_v[a].pid = g_v[b].pid = nx_guest_pid();
+    // Publish both ends or neither: a half-created pair would hand the guest one usable fd whose
+    // peer slot is stranded, which reads as a pipe that never sees EOF.
+    int fd_a = vfd_publish_or_free(a);
+    if (fd_a < 0) {                       // a is already back in the pool; b never got a handle
+        int saved_errno = errno;
+        g_v[b].kind = VK_FREE;
+        pthread_mutex_unlock(&g_mx);
+        errno = saved_errno;
+        return -1;
+    }
+    int fd_b = vfd_publish_or_free(b);
+    if (fd_b < 0) {                       // b is already back in the pool; a is published, so close it
+        int saved_errno = errno;
+        pthread_mutex_unlock(&g_mx);
+        nx_vfd_close(fd_a);
+        errno = saved_errno;
+        return -1;
+    }
     pthread_mutex_unlock(&g_mx);
-    fds[0] = NX_VFD_BASE + a; fds[1] = NX_VFD_BASE + b;
+    fds[0] = fd_a; fds[1] = fd_b;
     vlog("nx_vfd: pair kind=%d [%d,%d] pid=%d\n", (int)kind, fds[0], fds[1], nx_guest_pid());
     return 0;
 }
@@ -1001,8 +1148,9 @@ int nx_socket(int domain, int type, int protocol) {
     g_v[i].kind = VK_SOCK;
     g_v[i].nonblock = (type & 0x800) ? 1 : 0;   // SOCK_NONBLOCK
     g_v[i].pid = nx_guest_pid();
+    int fd = vfd_publish_or_free(i);
     pthread_mutex_unlock(&g_mx);
-    return NX_VFD_BASE + i;
+    return fd;
 }
 
 int nx_socketpair(int domain, int type, int protocol, int sv[2]) {
@@ -1102,7 +1250,9 @@ int nx_connect(int fd, const void* addr, unsigned alen) {
     if (si < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
     vfd_t* c = V(fd); vfd_t* s = &g_v[si];
     s->kind = VK_SOCK; s->pid = g_v[li].pid;
-    s->peer = fd - NX_VFD_BASE; c->peer = si;
+    // The new slot is NOT published here: it goes onto the listener's backlog and only becomes a
+    // guest fd if and when accept() takes it.
+    s->peer = vfd_slot_of(fd); c->peer = si;
     snprintf(s->bpath, sizeof s->bpath, "%s", want);
     g_v[li].backlog[g_v[li].backlog_n++] = si;
     pthread_cond_broadcast(&g_cv);
@@ -1122,9 +1272,24 @@ int nx_accept4(int fd, void* addr, unsigned* alen, int flags) {
     int si = l->backlog[0];
     memmove(l->backlog, l->backlog + 1, --l->backlog_n * sizeof(int));
     g_v[si].nonblock = (flags & 0x800) ? 1 : 0;
+    // This is where a backlog slot becomes a guest fd. If no handle is available the connection is
+    // lost either way, so tear the slot down rather than strand it — but tell the peer first, or it
+    // waits forever on a socket nobody will ever read.
+    int accepted_fd = vfd_publish(si);
+    if (accepted_fd < 0) {
+        int saved_errno = errno;
+        if (g_v[si].peer >= 0 && g_v[g_v[si].peer].kind != VK_FREE) g_v[g_v[si].peer].peer = -1;
+        free(g_v[si].buf);
+        memset(&g_v[si], 0, sizeof g_v[si]);
+        g_v[si].kind = VK_FREE;
+        pthread_cond_broadcast(&g_cv);
+        pthread_mutex_unlock(&g_mx);
+        errno = saved_errno;
+        return -1;
+    }
     pthread_mutex_unlock(&g_mx);
     if (addr && alen && *alen >= 2) { memset(addr, 0, *alen); *(uint16_t*)addr = 1; *alen = 2; }
-    return NX_VFD_BASE + si;
+    return accepted_fd;
 }
 
 // ---- sendmsg / recvmsg + SCM_RIGHTS --------------------------------------------------------------
@@ -1169,10 +1334,19 @@ long nx_sendmsg(int fd, const l_msghdr* msg, int flags) {
                 const int* fda = (const int*)(c + sizeof(l_cmsghdr));
                 for (int i = 0; i < nfd && p->fdq_n < FDQ_MAX; i++) {
                     int passfd = fda[i];
-                    if (nx_vfd_is(passfd)) g_v[passfd - NX_VFD_BASE].refs++;   // survive sender close
-                    else { int d = dup(passfd);
-                           if (d >= 0) { tee_mark(d, passfd); nx_net_shadow_dup(passfd, d); passfd = d; }
-                           else vlog("nx_vfd: dup(%d) fail e=%d\n", passfd, errno); }
+                    if (!lowfd_mode() && nx_vfd_is(passfd)) {
+                        // Legacy numbering has no alias fds, so the queued entry IS the sender's
+                        // number — bump the object's refcount so it survives the sender's close.
+                        g_v[vfd_slot_of(passfd)].refs++;
+                    } else {
+                        // A real dup() is correct for BOTH kinds here: newlib aliases the handle and
+                        // refcounts it, so a passed vfd outlives the sender's close on its own.
+                        int d = dup(passfd);
+                        if (d >= 0) {
+                            if (!nx_vfd_is(passfd)) { tee_mark(d, passfd); nx_net_shadow_dup(passfd, d); }
+                            passfd = d;
+                        } else vlog("nx_vfd: dup(%d) fail e=%d\n", passfd, errno);
+                    }
                     p->fdq[p->fdq_n].fd = passfd;
                     p->fdq[p->fdq_n].at = p->wr;   // END of this message (iov already written above)
                     p->fdq_n++;
@@ -1607,8 +1781,9 @@ int nx_epoll_create(void) {
     int i = slot_alloc();
     if (i < 0) { pthread_mutex_unlock(&g_mx); errno = EMFILE; return -1; }
     g_v[i].kind = VK_EPOLL;
+    int fd = vfd_publish_or_free(i);
     pthread_mutex_unlock(&g_mx);
-    return NX_VFD_BASE + i;
+    return fd;
 }
 
 int nx_epoll_ctl(int epfd, int op, int fd, void* uev) {
@@ -1914,6 +2089,11 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
                 if (nx_net_is_socket((int)a1)) { r = close((int)a1); break; }
                 return 0;                                      // ordinary real fd: let box64 close it
             }
+            // Under LOWFD numbering a vfd holds an ordinary newlib fd NUMBER, which newlib will hand
+            // out again after this close. Any fd-keyed side table still holding that number would
+            // then apply to an unrelated fd, so clear them here as the real-fd path already does.
+            nx_tee_forget((int)a1);
+            nx_regtmp_forget((int)a1);
             r = nx_vfd_close((int)a1);
             break;
         case 7:   // poll
@@ -1979,23 +2159,31 @@ int nx_x64_precase(long s, unsigned long a1, unsigned long a2, unsigned long a3,
             r = nx_vfd_flock((int)a1, (int)a2);
             break;
         case 32:  // dup — the wineserver dups the stored unix fd into every get_handle_fd reply.
-            if (nx_vfd_is((int)a1)) {
+            if (!lowfd_mode() && nx_vfd_is((int)a1)) {
                 pthread_mutex_lock(&g_mx);
                 V((int)a1)->refs++;          // no alias slots: same number, one more owner. POSIX
                 pthread_mutex_unlock(&g_mx); // wants a fresh number, but wine only stores/closes it.
                 r = (long)a1;
             } else {
+                // LOWFD: a vfd is a real newlib fd, so dup() gives a genuinely fresh number aliasing
+                // the same handle — POSIX behaviour, with the refcount doing the lifetime work.
+                int was_vfd = nx_vfd_is((int)a1);
                 r = dup((int)a1);
-                if (r >= 0) { tee_mark((int)r, (int)a1); nx_net_shadow_dup((int)a1, (int)r); }
+                if (r >= 0 && !was_vfd) { tee_mark((int)r, (int)a1); nx_net_shadow_dup((int)a1, (int)r); }
             }
             break;
-        case 33:  // dup2 (real fds only; a vfd can't be pinned to an arbitrary number)
-            if (nx_vfd_is((int)a1) || nx_vfd_is((int)a2)) {
+        case 33:  // dup2
+            if (!lowfd_mode() && (nx_vfd_is((int)a1) || nx_vfd_is((int)a2))) {
+                // Legacy numbering cannot pin a vfd to an arbitrary number: the number IS the object.
                 vlog("nx_vfd: dup2(%d,%d) with vfd UNSUPPORTED\n", (int)a1, (int)a2);
                 errno = EBADF; r = -1; break;
             }
-            r = dup2((int)a1, (int)a2);
-            if (r >= 0) { tee_mark((int)r, (int)a1); nx_net_shadow_dup((int)a1, (int)r); }
+            {   // LOWFD: newlib's dup2 closes the target properly (via kxvfd_close_r if it was a vfd)
+                // and aliases the source, so `2>&1` and posix_spawn file-actions work on a pipe.
+                int was_vfd = nx_vfd_is((int)a1);
+                r = dup2((int)a1, (int)a2);
+                if (r >= 0 && !was_vfd) { tee_mark((int)r, (int)a1); nx_net_shadow_dup((int)a1, (int)r); }
+            }
             break;
         case 77:  // ftruncate (vfd SHMEM only)
             if (!nx_vfd_is((int)a1)) return 0;
