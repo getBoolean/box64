@@ -219,13 +219,13 @@ void nx_net_init(void) {
         // to a DNS + modest-TCP profile so the cost of enabling networking can be A/B'd against a Wine
         // run without a rebuild.
         const SocketInitConfig* config = socketGetDefaultInitConfig();
-        SocketInitConfig small_config;
+        SocketInitConfig tuned_config;
         if (getenv("KX_NET_SMALLBUF")) {
-            small_config = *config;
-            small_config.tcp_tx_buf_size     = small_config.tcp_rx_buf_size     = NX_NET_SMALL_TCP_BUFFER;
-            small_config.tcp_tx_buf_max_size = small_config.tcp_rx_buf_max_size = NX_NET_SMALL_TCP_BUFFER_MAX;
-            small_config.sb_efficiency       = NX_NET_SMALL_BUFFER_COUNT;
-            config = &small_config;
+            tuned_config = *config;
+            tuned_config.tcp_tx_buf_size     = tuned_config.tcp_rx_buf_size     = NX_NET_SMALL_TCP_BUFFER;
+            tuned_config.tcp_tx_buf_max_size = tuned_config.tcp_rx_buf_max_size = NX_NET_SMALL_TCP_BUFFER_MAX;
+            tuned_config.sb_efficiency       = NX_NET_SMALL_BUFFER_COUNT;
+            config = &tuned_config;
         }
         Result socket_result = socketInitialize(config);
         if (R_FAILED(socket_result)) {
@@ -1168,6 +1168,8 @@ enum {
     LINUX_POLLNVAL      = 0x020,
     LINUX_POLLWRNORM    = 0x100,
     LINUX_POLLWRBAND    = 0x200,
+    BSD_POLLPRI         = 0x002,
+    BSD_POLLERR         = 0x008,
     BSD_POLLOUT         = 0x004,
     BSD_POLLWRBAND      = 0x100,
 };
@@ -1179,6 +1181,34 @@ static short poll_events_linux_to_bsd(short linux_events) {
     if (linux_events & LINUX_POLLWRNORM) bsd_events |= BSD_POLLOUT;   // NOT a pass-through: 0x100
     if (linux_events & LINUX_POLLWRBAND) bsd_events |= BSD_POLLWRBAND;   //  means WRBAND to BSD
     return bsd_events;
+}
+
+// Some stacks report the select() EXCEPTFDS condition — urgent data pending — as POLLERR where Linux
+// reports POLLPRI. Measured on Ryujinx (tests/m2/m2.8-net/loopback.c section 6): with an OOB byte
+// pending, poll returns 0x8, and it clears again once the byte is consumed. Passing that through is
+// wrong twice over:
+//
+//   * Wine derives AFD_POLL_OOB from POLLPRI (server/sock.c:1064-1065), so OOB is never reported and
+//     an OOB poll just times out; it also derives AFD_POLL_CONNECT_ERR from POLLERR (:1072-1073), so
+//     the guest is told the connection errored when nothing is wrong.
+//   * Far worse than any test line: a POLLERR on a CONNECTED socket makes wineserver set
+//     sock->aborted (server/sock.c:1402-1408), after which sock_get_poll_events returns -1 FOREVER
+//     (:1510-1511) and that socket is permanently dropped from the server's poll set. One stray OOB
+//     byte silently kills async I/O on the socket for the rest of the process's life.
+//
+// SO_ERROR is the honest discriminator: a genuine error sets it, the urgent-data condition does not.
+// Real hardware reports POLLPRI properly and only raises POLLERR for real errors, so this never fires
+// there. KX_NO_NET_OOB_REMAP=1 restores the raw pass-through for A/B.
+static short poll_fixup_oob_error(int fd, short bsd_revents) {
+    static int remap = -1;
+    if (remap < 0) remap = getenv("KX_NO_NET_OOB_REMAP") ? 0 : 1;
+    if (!remap || !(bsd_revents & BSD_POLLERR)) return bsd_revents;
+    int pending_error = 0;
+    unsigned error_length = sizeof pending_error;
+    if (nx_bsd_getsockopt(fd, SOL_SOCKET, SO_ERROR, &pending_error, &error_length) != 0)
+        return bsd_revents;                       // cannot tell: leave the stack's answer alone
+    if (pending_error) return bsd_revents;        // a real error — POLLERR is the truth
+    return (short)((bsd_revents & ~BSD_POLLERR) | BSD_POLLPRI);
 }
 
 static short poll_revents_bsd_to_linux(short bsd_revents, short linux_events) {
@@ -1245,7 +1275,8 @@ int nx_net_poll(void* linux_pollfds, unsigned long count, int timeout_ms, int* o
             }
         } else {
             for (unsigned k = 0; k < socket_count; k++) {
-                short linux_revents = poll_revents_bsd_to_linux(socket_fds[k].revents,
+                short fixed_revents = poll_fixup_oob_error(socket_fds[k].fd, socket_fds[k].revents);
+                short linux_revents = poll_revents_bsd_to_linux(fixed_revents,
                                                                 guest_fds[index_map[k]].events);
                 // KX_NET_LOG: what the STACK actually said, before and after translation. Wine derives
                 // AFD_POLL_WRITE straight from POLLOUT (server/sock.c), so a socket whose send buffer
