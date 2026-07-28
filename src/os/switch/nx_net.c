@@ -496,13 +496,23 @@ static int nonblock_emu_pre(int fd, short linux_events) {
     return -1;
 }
 
+// How many times a socket may claim readiness and then still fail the operation before this backs
+// off. A couple of spurious wakes are normal; a steady stream of them is a stack that lies.
+enum { NX_NB_SPINS_BEFORE_BACKOFF = 4, NX_NB_BACKOFF_NS = 1000000ULL /* 1 ms */ };
+
 // Returns 1 if the operation should be retried after waiting. `operation_errno` is errno as the stack
-// left it.
-static int nonblock_emu_retry(int fd, short linux_events, int operation_errno) {
+// left it; `attempts` counts consecutive retries for one logical call and must be caller-owned (this
+// runs on any guest thread, so a static counter would be shared across sockets and threads alike).
+static int nonblock_emu_retry(int fd, short linux_events, int operation_errno, int* attempts) {
     if (!nonblock_is_emulated(fd) || nonblock_shadow_get(fd)) return 0;    // not emulating blocking
     if (operation_errno != EAGAIN && operation_errno != EWOULDBLOCK) return 0;
-    // Wait indefinitely — that IS blocking semantics. A poll error (rather than a timeout) must not
-    // spin: fall through and let the caller return the original EAGAIN.
+    // A stack can report readiness and STILL fail the operation — a spurious wake, or another thread
+    // consuming the datagram between the poll and the call. Retrying is correct (that is what
+    // blocking means), but retrying at full speed would burn a core forever on a stack whose poll
+    // always says "ready", so back off once readiness has been claimed a few times without
+    // delivering. Waiting indefinitely below is the normal path; a poll ERROR (rather than a
+    // timeout) returns 0 so the caller reports the original EAGAIN instead of looping.
+    if (++*attempts > NX_NB_SPINS_BEFORE_BACKOFF) svcSleepThread(NX_NB_BACKOFF_NS);
     return nonblock_poll_one(fd, linux_events, -1) > 0;
 }
 
@@ -569,11 +579,12 @@ int nx_net_accept4(int fd, void* linux_address, unsigned* linux_capacity, int li
     uint8_t bsd_address[NX_SOCKADDR_MAX];
     unsigned bsd_length = sizeof bsd_address;
     int accepted_fd;
+    int attempts = 0;
     for (;;) {
         if (nonblock_emu_pre(fd, NX_NB_POLL_IN) < 0) return -1;   // POLLIN on a listener = a pending connection
         bsd_length = sizeof bsd_address;
         accepted_fd = nx_bsd_accept(fd, bsd_address, &bsd_length);
-        if (accepted_fd >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_IN, errno)) break;
+        if (accepted_fd >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_IN, errno, &attempts)) break;
     }
     if (accepted_fd < 0) return -1;
     nonblock_shadow_set(accepted_fd, 0);   // accepted sockets start blocking, per POSIX
@@ -641,12 +652,13 @@ long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
         if (!wire_length) { errno = EAFNOSUPPORT; return -1; }
     }
     int bsd_flags = msg_flags_linux_to_bsd(linux_flags);
+    int attempts = 0;
     for (;;) {
         if (nonblock_emu_pre(fd, NX_NB_POLL_OUT) < 0) return -1;
         long sent = wire_length
             ? (long)nx_bsd_sendto(fd, buffer, length, bsd_flags, bsd_address, wire_length)
             : (long)nx_bsd_send(fd, buffer, length, bsd_flags);
-        if (sent >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_OUT, errno)) return sent;
+        if (sent >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_OUT, errno, &attempts)) return sent;
     }
 }
 
@@ -659,13 +671,14 @@ long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
     if (want_address && nx_guest_buf_bad(linux_address, *linux_capacity)) { errno = EFAULT; return -1; }
     int bsd_flags = msg_flags_linux_to_bsd(linux_flags);
     long received;
+    int attempts = 0;
     for (;;) {
         if (nonblock_emu_pre(fd, NX_NB_POLL_IN) < 0) return -1;
         bsd_length = sizeof bsd_address;   // libnx overwrites this; reset before every attempt
         received = want_address
             ? (long)nx_bsd_recvfrom(fd, buffer, length, bsd_flags, bsd_address, &bsd_length)
             : (long)nx_bsd_recv(fd, buffer, length, bsd_flags);
-        if (received >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_IN, errno)) break;
+        if (received >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_IN, errno, &attempts)) break;
     }
     if (received < 0) return -1;
     if (want_address && bsd_length >= 2)
