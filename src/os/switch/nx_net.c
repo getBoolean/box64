@@ -641,9 +641,15 @@ static int msg_flags_linux_to_bsd(int linux_flags) {
     return bsd_flags;
 }
 
-long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
-                   const void* linux_address, unsigned linux_address_length) {
-    if (nx_guest_buf_bad(buffer, length)) { errno = EFAULT; return -1; }
+// _raw: the data buffer is NOT validated as guest memory, because the caller may legitimately be
+// passing one of OURS. nx_guest_buf_bad() asks box64's guest page table (getProtection), and a
+// host malloc — e.g. the scatter/gather bounce buffer in sendmsg/recvmsg — is not in it, so routing
+// those through the checked entry point rejected every multi-buffer socket op with EFAULT. Wine
+// surfaces EFAULT as STATUS_ACCESS_VIOLATION, which is what ws2_32:afd's IOCTL_AFD_RECV scatter
+// tests were failing with (io.Status 0xc0000005, out_params left at the test's 0xcccccccc fill).
+// The sockaddr IS still guest-supplied and is still checked.
+static long nx_net_sendto_raw(int fd, const void* buffer, size_t length, int linux_flags,
+                              const void* linux_address, unsigned linux_address_length) {
     uint8_t bsd_address[NX_SOCKADDR_MAX];
     unsigned wire_length = 0;
     if (linux_address && linux_address_length) {
@@ -662,9 +668,16 @@ long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
     }
 }
 
-long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
-                     void* linux_address, unsigned* linux_capacity) {
+// Guest-facing entry point: the buffer came from the guest, so it is validated.
+long nx_net_sendto(int fd, const void* buffer, size_t length, int linux_flags,
+                   const void* linux_address, unsigned linux_address_length) {
     if (nx_guest_buf_bad(buffer, length)) { errno = EFAULT; return -1; }
+    return nx_net_sendto_raw(fd, buffer, length, linux_flags, linux_address, linux_address_length);
+}
+
+// _raw: data buffer NOT guest-validated — see nx_net_sendto_raw for why.
+static long nx_net_recvfrom_raw(int fd, void* buffer, size_t length, int linux_flags,
+                                void* linux_address, unsigned* linux_capacity) {
     uint8_t bsd_address[NX_SOCKADDR_MAX];
     unsigned bsd_length = sizeof bsd_address;
     int want_address = (linux_address && linux_capacity && *linux_capacity);
@@ -685,6 +698,13 @@ long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
         sockaddr_bsd_to_linux(bsd_address, bsd_length, linux_address, linux_capacity);
     else if (linux_capacity) *linux_capacity = 0;
     return received;
+}
+
+// Guest-facing entry point: the buffer came from the guest, so it is validated.
+long nx_net_recvfrom(int fd, void* buffer, size_t length, int linux_flags,
+                     void* linux_address, unsigned* linux_capacity) {
+    if (nx_guest_buf_bad(buffer, length)) { errno = EFAULT; return -1; }
+    return nx_net_recvfrom_raw(fd, buffer, length, linux_flags, linux_address, linux_capacity);
 }
 
 // Linux x86-64 layouts, mirroring the declarations in nx_vfd.c (the vfd layer owns the AF_UNIX side of
@@ -731,7 +751,8 @@ long nx_net_sendmsg(int fd, const void* linux_message, int linux_flags) {
         memcpy(packed + offset, message->iov[i].base, message->iov[i].length);
         offset += message->iov[i].length;
     }
-    long sent = nx_net_sendto(fd, packed, total, linux_flags, message->name, message->name_length);
+    // packed is OURS (host malloc), so use the raw form -- the checked one would EFAULT on it.
+    long sent = nx_net_sendto_raw(fd, packed, total, linux_flags, message->name, message->name_length);
     int saved_errno = errno;
     free(packed);
     errno = saved_errno;
@@ -761,8 +782,9 @@ long nx_net_recvmsg(int fd, void* linux_message, int linux_flags) {
     uint8_t* packed = (uint8_t*)malloc(total ? total : 1);
     if (!packed) { errno = ENOMEM; return -1; }
     unsigned name_capacity = message->name_length;
-    long received = nx_net_recvfrom(fd, packed, total, linux_flags,
-                                    message->name, message->name ? &name_capacity : NULL);
+    // packed is OURS (host malloc) -- raw form, see nx_net_sendto_raw.
+    long received = nx_net_recvfrom_raw(fd, packed, total, linux_flags,
+                                        message->name, message->name ? &name_capacity : NULL);
     if (received < 0) { int saved_errno = errno; free(packed); errno = saved_errno; return -1; }
     size_t offset = 0;
     for (size_t i = 0; i < message->iov_count && offset < (size_t)received; i++) {
