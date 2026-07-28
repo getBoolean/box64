@@ -371,8 +371,21 @@ enum { NX_NONBLOCK_TRACK_MAX = 1024 };
 
 // `wanted` = what the GUEST asked for. `emulated` = the stack refused to apply it, so the socket's
 // real state is the OPPOSITE of `wanted` and this layer has to synthesize the difference.
-typedef struct { uint8_t wanted; uint8_t emulated; } nonblock_state_t;
+// `connect_seen` = a connect() has already been issued on this fd, so a later success is the
+// COMPLETION of that attempt rather than a fresh one. See nx_net_connect.
+typedef struct { uint8_t wanted; uint8_t emulated; uint8_t connect_seen; } nonblock_state_t;
 static nonblock_state_t g_nonblock_shadow[NX_NONBLOCK_TRACK_MAX];
+
+static void connect_seen_reset(int fd) {
+    if (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) g_nonblock_shadow[fd].connect_seen = 0;
+}
+// Returns the PREVIOUS value and marks the fd as attempted.
+static int connect_seen_mark(int fd) {
+    if (fd < 0 || fd >= NX_NONBLOCK_TRACK_MAX) return 1;   // untracked: never claim a first attempt
+    int previous = g_nonblock_shadow[fd].connect_seen;
+    g_nonblock_shadow[fd].connect_seen = 1;
+    return previous;
+}
 
 static void nonblock_shadow_set(int fd, int enable) {
     if (fd >= 0 && fd < NX_NONBLOCK_TRACK_MAX) {
@@ -537,6 +550,7 @@ int nx_net_socket(int linux_domain, int linux_type, int linux_protocol) {
         return -1;
     }
     nonblock_shadow_set(fd, 0);   // fresh socket: blocking, and clears any stale entry for this fd
+    connect_seen_reset(fd);       // fd numbers are recycled — never inherit a previous socket's attempt
     // SOCK_NONBLOCK/SOCK_CLOEXEC are encoded in the type word on Linux (0x800/0x80000) and
     // differently on BSD (0x20000000/0x10000000). Rather than depend on Horizon's bsd honoring the
     // type-word encoding at all, apply non-blocking afterwards through the fcntl path that is known to
@@ -557,12 +571,46 @@ int nx_net_bind(int fd, const void* linux_address, unsigned linux_length) {
     return result;
 }
 
+static int nx_net_is_datagram(int fd);   // defined with recvmsg below
+
 int nx_net_connect(int fd, const void* linux_address, unsigned linux_length) {
     if (nx_guest_buf_bad(linux_address, linux_length)) { errno = EFAULT; return -1; }
     uint8_t bsd_address[NX_SOCKADDR_MAX];
     unsigned wire_length = sockaddr_linux_to_bsd(linux_address, linux_length, bsd_address);
     if (!wire_length) { errno = EAFNOSUPPORT; return -1; }
     int result = nx_bsd_connect(fd, bsd_address, wire_length);
+    // Which connects complete SYNCHRONOUSLY, and on which kind of socket? Horizon returns 0 where
+    // Linux returns EINPROGRESS (HW-measured, loopback.c section 7), and Wine's server has a
+    // barely-exercised early-return branch for that case (server/sock.c:2619) which skips queueing
+    // the connect event — the cause of afd's missing FD_CONNECT on hardware. Reporting EINPROGRESS
+    // unconditionally hangs Ryujinx, so the predicate has to be measured rather than guessed.
+    int retry_of_pending = connect_seen_mark(fd);
+    { static int log_enabled = -1; if (log_enabled < 0) log_enabled = getenv("KX_NET_LOG") ? 1 : 0;
+      if (log_enabled) net_log("nx_net: connect fd=%d -> %d e=%d nonblock_wanted=%d emulated=%d retry=%d\n",
+                               fd, result, result ? errno : 0,
+                               nonblock_shadow_get(fd), nonblock_is_emulated(fd), retry_of_pending); }
+    // A FIRST non-blocking connect that succeeds instantly must still report EINPROGRESS, because
+    // that is what Linux does even on loopback, where the handshake is already complete. Horizon
+    // completes it synchronously and returns 0 — and that difference is not cosmetic: Wine's server
+    // has a separate, barely-exercised branch for an immediate success (server/sock.c:2619) which
+    // sets SOCK_CONNECTED and RETURNS EARLY, skipping the async path that queues the connect event.
+    // On Linux that branch is effectively dead for a non-blocking socket; on Horizon it was the only
+    // branch taken, which is why ws2_32:afd loses FD_CONNECT (1832/1850/1949) and AFD_POLL_CONNECT
+    // (1919/2045) on real hardware while passing on Ryujinx. HW-measured, loopback.c section 7.
+    //
+    // ONLY on the first attempt. A caller that got EINPROGRESS RETRIES the connect to discover
+    // completion, and that retry legitimately returns 0 — measured on Ryujinx, where one fd produced
+    // 13 EINPROGRESS answers and 4 zeroes with identical socket flags. Re-reporting EINPROGRESS there
+    // tells the caller "still pending" forever, which hung ws2_32:afd outright when this was first
+    // attempted without the distinction.
+    // And never on a DATAGRAM socket: connect() there only fixes the default peer, it is not a
+    // handshake, so it always completes at once and there is no later completion for a caller to
+    // wait on. Telling Wine EINPROGRESS about it makes the server wait forever.
+    if (result == 0 && !retry_of_pending && nonblock_shadow_get(fd) && !nx_net_is_datagram(fd)) {
+        static int emulate = -1;
+        if (emulate < 0) emulate = getenv("KX_NO_CONNECT_INPROGRESS") ? 0 : 1;
+        if (emulate) { errno = EINPROGRESS; return -1; }
+    }
     // EINPROGRESS on a non-blocking connect is the NORMAL path (it is how both Wine's ws2_32 and
     // glibc's resolver connect), so do not log it as a failure.
     if (result < 0 && errno != EINPROGRESS)
