@@ -696,6 +696,10 @@ static int msg_flags_linux_to_bsd(int linux_flags) {
 // surfaces EFAULT as STATUS_ACCESS_VIOLATION, which is what ws2_32:afd's IOCTL_AFD_RECV scatter
 // tests were failing with (io.Status 0xc0000005, out_params left at the test's 0xcccccccc fill).
 // The sockaddr IS still guest-supplied and is still checked.
+// Trace threshold for KX_NET_LOG send logging: the question worth answering is how a BULK fill loop
+// terminates, and protocol chatter at a few bytes a time would drown it.
+enum { NX_SEND_TRACE_MIN = 64 * 1024 };
+
 static long nx_net_sendto_raw(int fd, const void* buffer, size_t length, int linux_flags,
                               const void* linux_address, unsigned linux_address_length) {
     uint8_t bsd_address[NX_SOCKADDR_MAX];
@@ -712,6 +716,15 @@ static long nx_net_sendto_raw(int fd, const void* buffer, size_t length, int lin
         long sent = wire_length
             ? (long)nx_bsd_sendto(fd, buffer, length, bsd_flags, bsd_address, wire_length)
             : (long)nx_bsd_send(fd, buffer, length, bsd_flags);
+        // The data path had NO instrumentation, so how much a guest send actually moved had never been
+        // measured on either vehicle — and that number is what decides whether a caller's
+        // `while (send(...) == len)` fill loop wedges the connection or falls straight out of it.
+        // Adding it immediately answered the ws2_32:afd AFD_POLL_WRITE question (see the porting log):
+        // one call, -1/EFAULT, nothing queued. Large sends only; per-byte chatter would bury it.
+        { static int log_enabled = -1; if (log_enabled < 0) log_enabled = getenv("KX_NET_LOG") ? 1 : 0;
+          if (log_enabled && length >= NX_SEND_TRACE_MIN)
+              net_log("nx_net: send fd=%d buf=%p len=%zu -> %ld e=%d\n",
+                      fd, buffer, length, sent, sent < 0 ? errno : 0); }
         if (sent >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_OUT, errno, &attempts)) return sent;
     }
 }
