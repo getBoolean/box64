@@ -1227,6 +1227,7 @@ enum {
     LINUX_POLLNVAL      = 0x020,
     LINUX_POLLWRNORM    = 0x100,
     LINUX_POLLWRBAND    = 0x200,
+    LINUX_POLLPRI       = 0x002,   // same value both ABIs; named for the side it is tested on
     BSD_POLLPRI         = 0x002,
     BSD_POLLERR         = 0x008,
     BSD_POLLOUT         = 0x004,
@@ -1258,7 +1259,7 @@ static short poll_events_linux_to_bsd(short linux_events) {
 // SO_ERROR is the honest discriminator: a genuine error sets it, the urgent-data condition does not.
 // Real hardware reports POLLPRI properly and only raises POLLERR for real errors, so this never fires
 // there. KX_NO_NET_OOB_REMAP=1 restores the raw pass-through for A/B.
-static short poll_fixup_oob_error(int fd, short bsd_revents) {
+static short poll_fixup_oob_error(int fd, short bsd_revents, short linux_events) {
     static int remap = -1;
     if (remap < 0) remap = getenv("KX_NO_NET_OOB_REMAP") ? 0 : 1;
     if (!remap || !(bsd_revents & BSD_POLLERR)) return bsd_revents;
@@ -1267,7 +1268,22 @@ static short poll_fixup_oob_error(int fd, short bsd_revents) {
     if (nx_bsd_getsockopt(fd, SOL_SOCKET, SO_ERROR, &pending_error, &error_length) != 0)
         return bsd_revents;                       // cannot tell: leave the stack's answer alone
     if (pending_error) return bsd_revents;        // a real error — POLLERR is the truth
-    return (short)((bsd_revents & ~BSD_POLLERR) | BSD_POLLPRI);
+    // Two SEPARATE corrections, and they are separate on purpose (measured: conflating them costs
+    // afd.c:1693/1695).
+    //
+    // (a) ALWAYS clear the false POLLERR. That is the load-bearing half: a POLLERR on a connected
+    //     socket makes wineserver set sock->aborted (server/sock.c:1402-1408), after which
+    //     sock_get_poll_events returns -1 forever (:1510-1511) and the socket is dropped from the
+    //     server's poll set permanently. Suppressing it is what fixed the async peer-close-EOF
+    //     completions, and gating this half behind "did you ask for POLLPRI" broke them again.
+    //
+    // (b) Only ADD POLLPRI if the caller asked for it. POLLERR is delivered regardless of the
+    //     requested set, POLLPRI is not, so handing POLLPRI to a caller that never requested it
+    //     invents a bit — Wine reads it as AFD_POLL_OOB (server/sock.c:1064-1065). Measured during
+    //     ws2_32:afd: 278 polls arrived with events==0 and the stack answering POLLERR.
+    short corrected = (short)(bsd_revents & ~BSD_POLLERR);
+    if (linux_events & LINUX_POLLPRI) corrected |= BSD_POLLPRI;
+    return corrected;
 }
 
 static short poll_revents_bsd_to_linux(short bsd_revents, short linux_events) {
@@ -1334,7 +1350,8 @@ int nx_net_poll(void* linux_pollfds, unsigned long count, int timeout_ms, int* o
             }
         } else {
             for (unsigned k = 0; k < socket_count; k++) {
-                short fixed_revents = poll_fixup_oob_error(socket_fds[k].fd, socket_fds[k].revents);
+                short fixed_revents = poll_fixup_oob_error(socket_fds[k].fd, socket_fds[k].revents,
+                                                                 guest_fds[index_map[k]].events);
                 short linux_revents = poll_revents_bsd_to_linux(fixed_revents,
                                                                 guest_fds[index_map[k]].events);
                 // KX_NET_LOG: what the STACK actually said, before and after translation. Wine derives
