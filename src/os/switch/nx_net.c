@@ -700,6 +700,12 @@ static int msg_flags_linux_to_bsd(int linux_flags) {
 // terminates, and protocol chatter at a few bytes a time would drown it.
 enum { NX_SEND_TRACE_MIN = 64 * 1024 };
 
+// Staging size for the EFAULT bounce below. Big enough that a bulk send reaches the socket in few
+// hops, small enough not to matter if a guest sends megabytes.
+enum { NX_SEND_BOUNCE_CHUNK = 64 * 1024 };
+
+static int nx_net_is_datagram(int fd);   // defined with recvmsg below
+
 static long nx_net_sendto_raw(int fd, const void* buffer, size_t length, int linux_flags,
                               const void* linux_address, unsigned linux_address_length) {
     uint8_t bsd_address[NX_SOCKADDR_MAX];
@@ -711,6 +717,7 @@ static long nx_net_sendto_raw(int fd, const void* buffer, size_t length, int lin
     }
     int bsd_flags = msg_flags_linux_to_bsd(linux_flags);
     int attempts = 0;
+    int bounced = 0;
     for (;;) {
         if (nonblock_emu_pre(fd, NX_NB_POLL_OUT) < 0) return -1;
         long sent = wire_length
@@ -725,6 +732,47 @@ static long nx_net_sendto_raw(int fd, const void* buffer, size_t length, int lin
           if (log_enabled && length >= NX_SEND_TRACE_MIN)
               net_log("nx_net: send fd=%d buf=%p len=%zu -> %ld e=%d\n",
                       fd, buffer, length, sent, sent < 0 ? errno : 0); }
+        // EFAULT means the stack could not READ the caller's buffer, not that the buffer is invalid:
+        // Horizon's service IPC cannot touch a CodeMemory-backed low-VA mapping, and Wine's PE-side
+        // heap lives in exactly one. Measured: ws2_32:afd's `while (send(s, buf, 1 MiB, 0) == 1 MiB)`
+        // got -1/EFAULT on its FIRST call and exited having queued nothing, leaving the socket empty
+        // and still writable when the test asserted AFD_POLL_WRITE had cleared (afd.c:367/420/426/437).
+        //
+        // Copy through the ordinary heap and retry — the same remedy nx_vfd/nx_virtmem already apply
+        // to reads into these regions. Reacting to the actual EFAULT beats predicting the region:
+        // an earlier attempt keyed on nx_lowva_covered() never fired at all, because that test wants
+        // the whole range inside one tracked chunk.
+        //
+        // A STREAM is chunked and kept going, because the caller asked to send `length` and a
+        // Linux send() copies as much as the socket buffer will take — stopping after one chunk would
+        // report backpressure that does not exist. A DATAGRAM gets exactly one bounced attempt: it is
+        // an atomic message, so chunking it would fabricate extra packets.
+        if (sent < 0 && errno == EFAULT && !bounced && length) {
+            bounced = 1;
+            int is_datagram = nx_net_is_datagram(fd);
+            size_t chunk_max = length > NX_SEND_BOUNCE_CHUNK ? NX_SEND_BOUNCE_CHUNK : length;
+            uint8_t* staging = (uint8_t*)malloc(chunk_max);
+            if (!staging) { errno = EFAULT; return -1; }
+            size_t total = 0;
+            for (;;) {
+                size_t chunk = length - total;
+                if (chunk > chunk_max) chunk = chunk_max;
+                memcpy(staging, (const uint8_t*)buffer + total, chunk);   // CPU can read it; IPC cannot
+                long piece = wire_length
+                    ? (long)nx_bsd_sendto(fd, staging, chunk, bsd_flags, bsd_address, wire_length)
+                    : (long)nx_bsd_send(fd, staging, chunk, bsd_flags);
+                if (piece <= 0) break;                    // EAGAIN/error: report what already went
+                total += (size_t)piece;
+                if (is_datagram || (size_t)piece < chunk || total >= length) break;
+            }
+            free(staging);
+            { static int log_enabled = -1; if (log_enabled < 0) log_enabled = getenv("KX_NET_LOG") ? 1 : 0;
+              if (log_enabled && length >= NX_SEND_TRACE_MIN)
+                  net_log("nx_net: send BOUNCED fd=%d len=%zu -> %zu\n", fd, length, total); }
+            if (total) return (long)total;
+            errno = EFAULT;
+            return -1;
+        }
         if (sent >= 0 || !nonblock_emu_retry(fd, NX_NB_POLL_OUT, errno, &attempts)) return sent;
     }
 }
